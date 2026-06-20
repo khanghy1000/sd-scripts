@@ -538,8 +538,8 @@ def sample_images(
                 return
 
     logger.info(f"Generating sample images at step {steps}")
-    if not os.path.isfile(args.sample_prompts) and sample_prompts_te_outputs is None:
-        logger.error(f"No prompt file: {args.sample_prompts}")
+    if sample_prompts_te_outputs is None and (args.sample_prompts is None or not os.path.isfile(args.sample_prompts)):
+        logger.warning(f"No prompt file: {args.sample_prompts} — skipping sample generation")
         return
 
     # Unwrap models

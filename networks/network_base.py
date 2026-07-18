@@ -101,6 +101,20 @@ def _parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, Union[int, floa
     return pairs
 
 
+# Top-level model component prefixes whose parameters are NOT "hidden"
+# layers (embeddings, input/output projections, timestep conditioning).
+# Checked against ``original_name`` which is the dotted path into the
+# root model (e.g. ``time_embedding.linear_1``).
+_NON_HIDDEN_NAME_PREFIXES = (
+    'time_embedding', 'time_in', 'timestep_embedding',
+    'vector_in', 'guidance_in',
+    'img_in', 'txt_in',
+    'conv_in', 'conv_out',
+    'final_layer',
+    'x_embedder', 'pos_embedder', 'patch_embed', 'context_embedder',
+)
+
+
 def tag_lora_module_params(lora_module):
     """Tag a LoRA/OFT module's ``nn.Parameter`` objects with optimizer-relevant
     attributes so that Advanced_Optimizers can identify each parameter's role.
@@ -111,17 +125,26 @@ def tag_lora_module_params(lora_module):
     * ``_is_oft``         — OFT skew-symmetric blocks
     * ``_is_lora_A``      — LoRA down/A factor
     * ``_is_lora_B``      — LoRA up/B factor
-    * ``is_hidden``       — generic 2D hidden-layer weight
+    * ``is_hidden``       — 2D hidden-layer weight (determined via
+      ``original_name`` heuristic)
     * ``is_vector``       — logically-vector parameter (multi-dim)
 
-    Only attributes that can be accurately determined from the module's
-    parameter structure are set.
+    ``is_hidden`` is determined by checking ``original_name`` (the dotted
+    path into the root model) against ``_NON_HIDDEN_NAME_PREFIXES`` — a set
+    of known top-level component prefixes for embeddings, input/output
+    projections, and timestep conditioning layers.
 
     Args:
         lora_module: A ``torch.nn.Module`` representing a single adapter
             module (e.g. ``LoRAModule``, ``OFTModule``).
     """
     import torch.nn as nn
+
+    # Determine if this module targets a hidden layer by checking
+    # original_name against known non-hidden top-level components.
+    original_name = getattr(lora_module, 'original_name', None) or ''
+    is_hidden = not any(original_name.startswith(pfx)
+                        for pfx in _NON_HIDDEN_NAME_PREFIXES)
 
     # --- OFT blocks ---
     oft_blocks = getattr(lora_module, 'oft_blocks', None)
@@ -150,15 +173,15 @@ def tag_lora_module_params(lora_module):
             w = sub.weight
             if isinstance(w, nn.Parameter):
                 setattr(w, tag, True)
-                w.is_hidden = True
+                w.is_hidden = is_hidden
         # ModuleList (split-dims in lora_flux.py / lora_lumina.py)
         if isinstance(sub, nn.ModuleList):
             for mod in sub:
                 if hasattr(mod, 'weight') and isinstance(mod.weight, nn.Parameter):
                     setattr(mod.weight, tag, True)
-                    mod.weight.is_hidden = True
+                    mod.weight.is_hidden = is_hidden
 
-    # --- Fallback: tag all remaining 2D trainable params as is_hidden ---
+    # --- Fallback: tag all remaining 2D trainable params ---
     for p in lora_module.parameters(recurse=False):
         if not isinstance(p, nn.Parameter):
             continue
@@ -168,7 +191,7 @@ def tag_lora_module_params(lora_module):
             continue
         if getattr(p, '_is_lora_A', False) or getattr(p, '_is_lora_B', False):
             continue
-        p.is_hidden = True
+        p.is_hidden = is_hidden
 
 
 def _tag_all_network_params(network):

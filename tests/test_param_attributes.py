@@ -202,5 +202,57 @@ class TestFallbackHidden:
                     )
 
 
+# ---------------------------------------------------------------------------
+# 8. is_hidden heuristic via original_name
+# ---------------------------------------------------------------------------
+
+class TestIsHiddenHeuristic:
+    def test_hidden_defaults_true(self):
+        """Modules with no original_name default to is_hidden=True."""
+        mod = FakeLoRAModule().to(DEVICE)
+        tag_lora_module_params(mod)
+        assert getattr(mod.lora_down.weight, "is_hidden", False) is True
+
+    def test_non_hidden_time_embedding(self):
+        """A module whose original_name starts with 'time_embedding' should
+        have is_hidden=False."""
+        mod = FakeLoRAModule().to(DEVICE)
+        mod.original_name = "time_embedding.linear_1"
+        tag_lora_module_params(mod)
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+        assert getattr(mod.lora_up.weight, "is_hidden", True) is False
+
+    def test_non_hidden_conv_in(self):
+        mod = FakeLoRAModule().to(DEVICE)
+        mod.original_name = "conv_in"
+        tag_lora_module_params(mod)
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+
+    def test_non_hidden_final_layer(self):
+        mod = FakeLoRAModule().to(DEVICE)
+        mod.original_name = "final_layer.linear"
+        tag_lora_module_params(mod)
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+
+    def test_non_hidden_img_in(self):
+        mod = FakeLoRAModule().to(DEVICE)
+        mod.original_name = "img_in"
+        tag_lora_module_params(mod)
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+
+    def test_hidden_nested_path(self):
+        """A nested path like 'down_blocks.0.attentions.0...' is hidden."""
+        mod = FakeLoRAModule().to(DEVICE)
+        mod.original_name = "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q"
+        tag_lora_module_params(mod)
+        assert getattr(mod.lora_down.weight, "is_hidden", False) is True
+
+    def test_hidden_flux_double_block(self):
+        mod = FakeLoRAModule().to(DEVICE)
+        mod.original_name = "double_blocks.0.img_attn.qkv"
+        tag_lora_module_params(mod)
+        assert getattr(mod.lora_down.weight, "is_hidden", False) is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

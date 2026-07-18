@@ -21,6 +21,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from networks.lora_flux import LoRAModule, LoRAInfModule
+from networks.network_base import _tag_all_network_params
 from library import sd3_models
 
 
@@ -644,6 +645,7 @@ class LoRANetwork(torch.nn.Module):
             text_encoder_lr = [text_encoder_lr[0], text_encoder_lr[1], text_encoder_lr[1]]
 
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
         all_params = []
         lr_descriptions = []
@@ -724,6 +726,7 @@ class LoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

@@ -13,6 +13,7 @@ from diffusers import AutoencoderKL
 from transformers import CLIPTextModel
 import numpy as np
 import torch
+from networks.network_base import _tag_all_network_params
 import re
 from library.utils import setup_logging
 setup_logging()
@@ -1035,6 +1036,7 @@ class LoRANetwork(torch.nn.Module):
     # 二つのText Encoderに別々の学習率を設定できるようにするといいかも
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
         all_params = []
 
         def enumerate_params(loras: List[LoRAModule]):
@@ -1086,6 +1088,7 @@ class LoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

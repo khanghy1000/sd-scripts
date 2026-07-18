@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import re
 from library.utils import setup_logging
+from networks.network_base import _tag_all_network_params
 
 setup_logging()
 import logging
@@ -383,6 +384,7 @@ class OFTNetwork(torch.nn.Module):
     # 二つのText Encoderに別々の学習率を設定できるようにするといいかも
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
         all_params = []
 
         def enumerate_params(ofts):
@@ -410,6 +412,7 @@ class OFTNetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

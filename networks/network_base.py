@@ -101,6 +101,94 @@ def _parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, Union[int, floa
     return pairs
 
 
+def tag_lora_module_params(lora_module):
+    """Tag a LoRA/OFT module's ``nn.Parameter`` objects with optimizer-relevant
+    attributes so that Advanced_Optimizers can identify each parameter's role.
+
+    Sets the following attributes on the appropriate parameters:
+
+    * ``_is_dora_scale``  — DoRA magnitude scale
+    * ``_is_oft``         — OFT skew-symmetric blocks
+    * ``_is_lora_A``      — LoRA down/A factor
+    * ``_is_lora_B``      — LoRA up/B factor
+    * ``is_hidden``       — generic 2D hidden-layer weight
+    * ``is_vector``       — logically-vector parameter (multi-dim)
+
+    Only attributes that can be accurately determined from the module's
+    parameter structure are set.
+
+    Args:
+        lora_module: A ``torch.nn.Module`` representing a single adapter
+            module (e.g. ``LoRAModule``, ``OFTModule``).
+    """
+    import torch.nn as nn
+
+    # --- OFT blocks ---
+    oft_blocks = getattr(lora_module, 'oft_blocks', None)
+    if isinstance(oft_blocks, nn.Parameter):
+        oft_blocks._is_oft = True
+    # OFTModule in oft_flux.py stores oft_blocks as a ParameterList
+    if isinstance(oft_blocks, nn.ParameterList):
+        for p in oft_blocks:
+            if isinstance(p, nn.Parameter):
+                p._is_oft = True
+
+    # --- DoRA scale ---
+    dora_scale = getattr(lora_module, 'dora_scale', None)
+    if isinstance(dora_scale, nn.Parameter):
+        dora_scale._is_dora_scale = True
+        dora_scale.is_vector = True
+
+    # --- Standard LoRA down/up ---
+    for attr, tag in (
+        ('lora_down', '_is_lora_A'),
+        ('lora_up', '_is_lora_B'),
+    ):
+        sub = getattr(lora_module, attr, None)
+        # Single module (Linear/Conv2d)
+        if isinstance(sub, nn.Module) and hasattr(sub, 'weight'):
+            w = sub.weight
+            if isinstance(w, nn.Parameter):
+                setattr(w, tag, True)
+                w.is_hidden = True
+        # ModuleList (split-dims in lora_flux.py / lora_lumina.py)
+        if isinstance(sub, nn.ModuleList):
+            for mod in sub:
+                if hasattr(mod, 'weight') and isinstance(mod.weight, nn.Parameter):
+                    setattr(mod.weight, tag, True)
+                    mod.weight.is_hidden = True
+
+    # --- Fallback: tag all remaining 2D trainable params as is_hidden ---
+    for p in lora_module.parameters(recurse=False):
+        if not isinstance(p, nn.Parameter):
+            continue
+        if p.ndim < 2:
+            continue
+        if getattr(p, '_is_oft', False):
+            continue
+        if getattr(p, '_is_lora_A', False) or getattr(p, '_is_lora_B', False):
+            continue
+        p.is_hidden = True
+
+
+def _tag_all_network_params(network):
+    """Tag all adapter modules' parameters in a network with optimizer-relevant
+    attributes.  Call this from ``prepare_optimizer_params()`` and
+    ``prepare_grad_etc()`` so attributes survive device moves.
+
+    Args:
+        network: A network object with ``text_encoder_loras`` and/or
+            ``unet_loras`` lists (or a ``loras`` list for the generic
+            ``AdditionalNetwork``).
+    """
+    loras = getattr(network, 'text_encoder_loras', []) + getattr(network, 'unet_loras', [])
+    if not loras:
+        # Fallback: AdditionalNetwork stores everything in a single 'loras' list
+        loras = getattr(network, 'loras', [])
+    for lora in loras:
+        tag_lora_module_params(lora)
+
+
 class AdditionalNetwork(torch.nn.Module):
     """Generic Additional network that supports LoHa, LoKr, and similar module types.
 
@@ -389,6 +477,7 @@ class AdditionalNetwork(torch.nn.Module):
             pass  # already a list with one element
 
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
         all_params = []
         lr_descriptions = []
@@ -495,6 +584,7 @@ class AdditionalNetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

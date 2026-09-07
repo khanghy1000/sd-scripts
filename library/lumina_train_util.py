@@ -15,6 +15,7 @@ from PIL import Image
 from safetensors.torch import save_file
 
 from library import lumina_models, strategy_base, strategy_lumina, train_util
+from library import custom_train_functions
 from library.flux_models import AutoEncoder
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
@@ -748,36 +749,31 @@ def compute_density_for_timestep_sampling(
     logit_mean: float = None,
     logit_std: float = None,
     mode_scale: float = None,
+    antithetic: bool = False,
+    stratified: bool = False,
+    device=None,
+    **kwargs,
 ):
+    """Compute the density for sampling the timesteps when doing SD3/Lumina training.
+
+    .. note::
+        Thin re-export of the canonical implementation in
+        :mod:`library.custom_train_functions`, kept for backward compatibility
+        with code that imports it from this module. New code should import
+        ``compute_density_for_timestep_sampling`` from
+        ``library.custom_train_functions`` directly.
     """
-    Compute the density for sampling the timesteps when doing SD3 training.
-
-    Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
-
-    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
-
-    Args:
-        weighting_scheme (str): The weighting scheme to use.
-        batch_size (int): The batch size for the sampling process.
-        logit_mean (float, optional): The mean of the logit distribution. Defaults to None.
-        logit_std (float, optional): The standard deviation of the logit distribution. Defaults to None.
-        mode_scale (float, optional): The mode scale for the mode weighting scheme. Defaults to None.
-
-    Returns:
-        u (Tensor): The sampled timesteps.
-    """
-    if weighting_scheme == "logit_normal":
-        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
-        u = torch.normal(
-            mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu"
-        )
-        u = torch.nn.functional.sigmoid(u)
-    elif weighting_scheme == "mode":
-        u = torch.rand(size=(batch_size,), device="cpu")
-        u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
-    else:
-        u = torch.rand(size=(batch_size,), device="cpu")
-    return u
+    return custom_train_functions.compute_density_for_timestep_sampling(
+        weighting_scheme=weighting_scheme,
+        batch_size=batch_size,
+        logit_mean=logit_mean,
+        logit_std=logit_std,
+        mode_scale=mode_scale,
+        antithetic=antithetic,
+        stratified=stratified,
+        device=device if device is not None else "cpu",
+        **kwargs,
+    )
 
 
 def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None) -> Tensor:
@@ -829,13 +825,35 @@ def get_noisy_model_input_and_timesteps(
     num_timesteps = noise_scheduler.config.num_train_timesteps
     sigmas = None
 
+    # Resolve variance-reduction flags. Precedence: antithetic > qmc > stratified.
+    antithetic = getattr(args, "antithetic_timestep_sampling", False) and is_train and fixed_timesteps is None
+    stratified = getattr(args, "stratified_timestep_sampling", False) and is_train and fixed_timesteps is None
+    qmc = getattr(args, "qmc_timestep_sampling", None) if (is_train and fixed_timesteps is None) else None
+    qmc_seed = getattr(args, "qmc_seed", 0)
+
     if fixed_timesteps is not None:
         timesteps = fixed_timesteps
         sigmas = timesteps / num_timesteps
         noisy_model_input = sigmas * latents + (1.0 - sigmas) * noise
     elif args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
         # Simple random t-based noise sampling
-        if args.timestep_sampling == "sigmoid":
+        if antithetic:
+            sigmas = custom_train_functions.compute_antithetic_sigmas(
+                bsz, args.timestep_sampling, device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif qmc is not None:
+            sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+                args.timestep_sampling, bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif stratified and args.timestep_sampling == "uniform":
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            sigmas = (edges + torch.rand(bsz, device=device)) / bsz
+        elif stratified and args.timestep_sampling == "sigmoid":
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(bsz, device=device)) / bsz
+            z = torch.logit(u.clamp(1e-6, 1 - 1e-6)) / args.sigmoid_scale
+            sigmas = torch.sigmoid(args.sigmoid_scale * z)
+        elif args.timestep_sampling == "sigmoid":
             # https://github.com/XLabs-AI/x-flux/tree/main
             sigmas = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
         else:
@@ -844,25 +862,84 @@ def get_noisy_model_input_and_timesteps(
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "shift":
         shift = args.discrete_flow_shift
-        sigmas = torch.randn(bsz, device=device)
-        sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigmas = sigmas.sigmoid()
+        if antithetic:
+            sigmas = custom_train_functions.compute_antithetic_sigmas(
+                bsz, "sigmoid", device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif qmc is not None:
+            sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif stratified:
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(bsz, device=device)) / bsz
+            z = torch.logit(u.clamp(1e-6, 1 - 1e-6)) / args.sigmoid_scale
+            sigmas = torch.sigmoid(args.sigmoid_scale * z)
+        else:
+            sigmas = torch.randn(bsz, device=device)
+            sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
+            sigmas = sigmas.sigmoid()
         sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "nextdit_shift":
-        sigmas = torch.rand((bsz,), device=device)
+        if antithetic:
+            sigmas = custom_train_functions.compute_antithetic_sigmas(bsz, "uniform", device)
+        elif qmc is not None:
+            sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+                "uniform", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device
+            )
+        elif stratified:
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            sigmas = (edges + torch.rand(bsz, device=device)) / bsz
+        else:
+            sigmas = torch.rand((bsz,), device=device)
         sigmas = torch.clamp(sigmas, min=1e-7).to(device)
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
         sigmas = time_shift(mu, 1.0, sigmas)
 
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "flux_shift":
-        sigmas = torch.randn(bsz, device=device)
-        sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigmas = sigmas.sigmoid()
+        if antithetic:
+            sigmas = custom_train_functions.compute_antithetic_sigmas(
+                bsz, "sigmoid", device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif qmc is not None:
+            sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif stratified:
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(bsz, device=device)) / bsz
+            z = torch.logit(u.clamp(1e-6, 1 - 1e-6)) / args.sigmoid_scale
+            sigmas = torch.sigmoid(args.sigmoid_scale * z)
+        else:
+            sigmas = torch.randn(bsz, device=device)
+            sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
+            sigmas = sigmas.sigmoid()
         sigmas = torch.clamp(sigmas, min=1e-7).to(device)
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
         sigmas = time_shift(mu, 1.0, sigmas)
+        timesteps = sigmas * num_timesteps
+    elif args.timestep_sampling == "hump":
+        # Inverted parabola distribution centered at hump_center
+        if (
+            getattr(args, "antithetic_timestep_sampling", False)
+            or getattr(args, "stratified_timestep_sampling", False)
+            or getattr(args, "qmc_timestep_sampling", None) is not None
+        ) and is_train:
+            logger.warning(
+                "--antithetic_timestep_sampling / --stratified_timestep_sampling / "
+                "--qmc_timestep_sampling is set but timestep_sampling='hump' uses a multinomial "
+                "draw that cannot honor pairing, stratification, or low-discrepancy sequences; "
+                "the flag(s) are ignored for this branch."
+            )
+        num_points = num_timesteps
+        x = torch.linspace(0, 1, num_points, device=device)
+        probabilities = -7.7 * ((x - args.hump_center) ** 2) + 2
+        probabilities = probabilities.clamp(min=0)
+        probabilities /= probabilities.sum()
+        indices = torch.multinomial(probabilities.unsqueeze(0).expand(bsz, -1), 1).squeeze(-1)
+        sigmas = x[indices]
         timesteps = sigmas * num_timesteps
     else:
         # Sample a random timestep for each image
@@ -873,9 +950,15 @@ def get_noisy_model_input_and_timesteps(
             logit_mean=args.logit_mean,
             logit_std=args.logit_std,
             mode_scale=args.mode_scale,
+            antithetic=getattr(args, "antithetic_timestep_sampling", False) and is_train,
+            stratified=getattr(args, "stratified_timestep_sampling", False) and is_train,
+            qmc=getattr(args, "qmc_timestep_sampling", None) if is_train else None,
+            qmc_seed=getattr(args, "qmc_seed", 0),
+            device=device,
+            rank=PartialState().process_index if getattr(args, "qmc_timestep_sampling", None) is not None else 0,
         )
-        indices = (u * num_timesteps).long()
-        timesteps = noise_scheduler.timesteps[indices].to(device=device)
+        indices = (u * num_timesteps).long().clamp(0, len(noise_scheduler.timesteps) - 1)
+        timesteps = noise_scheduler.timesteps.to(device=device)[indices]
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
 
     # Broadcast sigmas to latent shape
@@ -1066,7 +1149,7 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "nextdit_shift", "flux_shift"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "nextdit_shift", "flux_shift", "hump"],
         default="shift",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, Flux.1 and NextDIT.1 shifting. Default is 'shift'."
         " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、Flux.1、NextDIT.1のシフト。デフォルトは'shift'です。",
@@ -1076,6 +1159,12 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=1.0,
         help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid"). / sigmoidタイムステップサンプリングの倍率（timestep-samplingが"sigmoid"の場合のみ有効）。',
+    )
+    parser.add_argument(
+        "--hump_center",
+        type=float,
+        default=0.5,
+        help='Center position for "hump" timestep sampling distribution (0.0-1.0). / "hump"タイムステップサンプリング分布の中心位置（0.0-1.0）。',
     )
     parser.add_argument(
         "--model_prediction_type",

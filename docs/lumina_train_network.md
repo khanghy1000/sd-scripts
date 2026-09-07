@@ -265,6 +265,14 @@ python lumina_minimal_inference.py --pretrained_model_name_or_path path/to/lumin
 
 `--lora_weights` option can be used to specify the LoRA weights file, and optional multiplier (like `path;1.0`).
 
+## 5.5 High-Frequency Token Latent Loss
+
+`--hf_scale`, `--hf_exponent`, `--hf_patch` enable the High-Frequency Token latent loss
+(an opt-in auxiliary term weighting per-token x0-MSE by clean-token detail). Use
+`--hf_patch 2` for Lumina latent space. See the
+[advanced guide](train_network_advanced.md#210-high-frequency-token-latent-loss) for the
+full specification.
+
 ## 6. Others / その他
 
 `lumina_train_network.py` shares many features with `train_network.py`, such as sample image generation (`--sample_prompts`, etc.) and detailed optimizer settings. For these, see the [train_network.py guide](train_network.md#5-other-features--その他の機能) or run `python lumina_train_network.py --help`.

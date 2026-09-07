@@ -399,7 +399,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", type=str, required=True)
-    parser.add_argument("--model_type", type=str, choices=["flux", "chroma"], default="flux", help="Model type to use")
+    parser.add_argument("--model_type", type=str, choices=["flux", "chroma", "chroma_radiance"], default="flux", help="Model type to use")
     parser.add_argument("--clip_l", type=str, required=False)
     parser.add_argument("--t5xxl", type=str, required=False)
     parser.add_argument("--ae", type=str, required=False)

@@ -13,6 +13,7 @@ import torch
 import re
 from library.utils import setup_logging
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from networks.network_base import _tag_all_network_params
 
 setup_logging()
 import logging
@@ -1190,6 +1191,7 @@ class LoRANetwork(torch.nn.Module):
         #     ), "LoRA+ and Prodigy/DAdaptation is not supported / LoRA+とProdigy/DAdaptationの組み合わせはサポートされていません"
 
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
         all_params = []
         lr_descriptions = []
@@ -1278,6 +1280,7 @@ class LoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

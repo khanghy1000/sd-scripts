@@ -238,4 +238,4 @@ def test_lumina_latents_caching_strategy():
 
         # Test loading from disk
         loaded_data = caching_strategy.load_latents_from_disk(npz_path, image_size)
-        assert len(loaded_data) == 5  # Check for 5 expected elements
+        assert len(loaded_data) == 6  # (latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped_flag)

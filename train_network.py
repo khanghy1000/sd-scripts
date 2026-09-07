@@ -30,11 +30,15 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
+from library import anchor_loss
+from library import hf_token_loss
 from library.strategy_sdxl import SdxlTextEncodingStrategy
 
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
 from library.focal_frequency_loss import FocalFrequencyLoss
+from library.patch_topology_loss import PatchTopologyLoss, extract_spatial_mask
+from library.dynamic_loss_weighting import DynamicLossWeighter, build_weighter_from_args
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -42,15 +46,17 @@ from library.config_util import (
 )
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
-from library.adaptive_timestep_sampler import TimestepSamplerNetwork, AdaptiveTimestepManager
+from library.adaptive_timestep_sampler import AdaptiveTimestepManager
 from library.custom_train_functions import (
     apply_snr_weight,
+    apply_snr_weight_for_flow_matching,
     get_weighted_text_embeddings,
     prepare_scheduler_for_custom_training,
     scale_v_prediction_loss_like_noise_prediction,
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
+    _QMCSequenceManager,
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -107,17 +113,54 @@ class NetworkTrainer:
         self._adaptive_last_args = None
         self._adaptive_last_batch = None
         self._adaptive_losses_before = None
+        self._adaptive_update_pending = False  # True on steps where Algorithm 2 will run
+        self._adaptive_disable_empty_cache = False  # --adaptive_sampler_disable_empty_cache
 
         # Focal Frequency Loss config
         self.ffl_enabled = False
         self.ffl_module = None
         self.ffl_loss_value = None
 
+        # Patch Topology Loss config
+        self.patch_topology_enabled = False
+        self.patch_topology_loss_module = None
+        self.patch_topology_loss_value = None
+        self.patch_topology_full_weight = 1.0
+        self.patch_topology_start_step = 0
+        self.patch_topology_warmup_steps = 0
+        self._patch_topology_current_step = 0
+        # Dynamic multi-loss weighting (none/dwa/gradnorm); None = static weight
+        self.patch_topology_weighter: Optional[DynamicLossWeighter] = None
+        self.patch_topology_effective_weight = None  # last effective weight applied (for logging)
+
         # Latent Wavelet Diffusion (LWD) masking config
         self.wavelet_masking_enabled = False
         self.wavelet_dwt = None
         self._noisy_latents = None  # stored by get_noise_pred_and_target for wavelet map computation
         self._wavelet_mask_ratio = 0.0  # fraction of loss elements masked (for logging)
+
+        # High-Frequency Token latent loss config (see library/hf_token_loss.py)
+        self.hf_scale = 0.0              # lambda; 0 = off (bit-identical no-op)
+        self.hf_exponent = 1.0           # gamma, must be > 0
+        self.hf_patch = 2                # token patch size; must equal model's patchify size
+        self.hf_prediction_mode = None   # set by setup_hf_objective / subclasses (None => base derives)
+        self.hf_timesteps_in_sigma = False  # True for Anima (timesteps already in [0, 1])
+        self.hf_eps_train = 5e-2         # train-time epsilon for x0-residual models (ChromaRadiance raw)
+        self.hf_high_noise_snr_cut = (1.0 / 3.0) ** 2  # equivalent to flow sigma_cut=0.75
+        self.hf_high_noise_min_weight = 0.10  # retain a small high-noise HF signal
+        self.hf_high_noise_power = 1.0       # attenuation exponent above the cutoff
+        self._hf_noisy_latents = None    # stored by get_noise_pred_and_target (4D pre-pack)
+        self.hf_loss_value = None        # detached scaled HF contribution for logging (tensor)
+
+        # Multiscale MSE x0-prediction ("anchor") loss config (see library/anchor_loss.py)
+        self.anchor_scale = 0.0            # term weight; 0 = off (bit-identical no-op)
+        self.anchor_levels = 4             # requested Laplacian levels; must be >= 1
+        self.anchor_snr_weighting = False  # optional soft SNR(t) gate; inert while scale == 0
+        self.anchor_prediction_mode = None  # set by setup_anchor_objective / subclasses (None => base derives)
+        self.anchor_timesteps_in_sigma = False  # True for Anima (timesteps already in [0, 1])
+        self._anchor_noisy_latents = None  # stored by get_noise_pred_and_target (4D pre-pack)
+        self.anchor_loss_value = None      # detached scaled anchor contribution for logging (tensor)
+        self._anchor_warned_missing = False  # one-time warning when the term cannot run
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -141,8 +184,12 @@ class NetworkTrainer:
         current_val_loss=None,
         average_val_loss=None,
         current_ffl_loss=None,
+        current_patch_topology_loss=None,
+        current_patch_topology_weight=None,
         current_wav_mask_ratio=None,
         current_weight_noise_norm=None,
+        current_hf_loss=None,
+        current_anchor_loss=None,
         it_s: float = 0.0,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
@@ -158,11 +205,23 @@ class NetworkTrainer:
         if current_ffl_loss is not None:
             logs["loss/current_ffl"] = current_ffl_loss
 
+        if current_patch_topology_loss is not None:
+            logs["loss/current_patch_topology"] = current_patch_topology_loss
+
+        if current_patch_topology_weight is not None:
+            logs["loss/patch_topology_effective_weight"] = current_patch_topology_weight
+
         if current_wav_mask_ratio is not None:
             logs["loss/wavelet_mask_ratio"] = current_wav_mask_ratio
 
         if current_weight_noise_norm is not None:
             logs["weight_noise/noise_norm"] = current_weight_noise_norm
+
+        if current_hf_loss is not None:
+            logs["loss/current_hf"] = current_hf_loss
+
+        if current_anchor_loss is not None:
+            logs["loss/current_anchor"] = current_anchor_loss
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -283,7 +342,8 @@ class NetworkTrainer:
 
     def get_latents_caching_strategy(self, args):
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
-            True, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            True, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         return latents_caching_strategy
 
@@ -320,6 +380,11 @@ class NetworkTrainer:
         return noise_pred
 
     def all_reduce_network(self, accelerator, network):
+        # With a single process there is nothing to synchronize; iterating every
+        # parameter here would only add per-step Python overhead (DDP handles
+        # the multi-GPU case natively via accelerator.accumulate).
+        if accelerator.num_processes <= 1:
+            return
         for param in network.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
@@ -328,9 +393,20 @@ class NetworkTrainer:
         """Manually synchronize EDM2 model gradients across GPUs."""
         if edm2_model is None:
             return
+        if accelerator.num_processes <= 1:
+            return
         for param in edm2_model.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
+
+    def should_sync_ramtorch(self, args, accelerator) -> bool:
+        """Whether a full CUDA synchronize is required after backward for RamTorch.
+
+        RamTorch offloads linear weights to CPU; a synchronize is only needed at
+        gradient-synchronization boundaries (end of gradient accumulation), not
+        after every micro-batch, to avoid serializing CPU/GPU per micro-step.
+        """
+        return (args.use_ramtorch or args.use_ramtorch_network) and accelerator.sync_gradients
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizers[0], text_encoder, unet)
@@ -387,18 +463,33 @@ class NetworkTrainer:
             adaptive_fixed_timesteps = self.adaptive_manager.sample_timesteps(
                 latents, noise_scheduler.config.num_train_timesteps
             )
-            # Store data for Algorithm 2 (delta computation after optimizer step)
-            self._adaptive_last_latents = latents.detach()
-            self._adaptive_last_noise = noise.detach()
-            self._adaptive_last_args = args
+            # Store latents and args for Algorithm 2 (delta computation after optimizer step).
+            # Only pin tensors when this is an update step to avoid wasting VRAM on non-update steps.
+            if self._adaptive_update_pending:
+                self._adaptive_last_latents = latents.detach()
+                self._adaptive_last_args = args
 
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
             args, noise_scheduler, latents, fixed_timesteps=adaptive_fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
         )
 
+        # Now that noise is actually computed, store it for Algorithm 2
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None and self._adaptive_update_pending:
+            self._adaptive_last_noise = noise.detach()
+
         # Store noisy latents for LWD wavelet masking (used in process_batch)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
+
+        # Store noisy latents for High-Frequency Token loss (must be 4D pre-pack;
+        # for inpainting this is the 4-channel latent, before the mask concat below).
+        if is_train and self.hf_scale > 0.0:
+            self._hf_noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
+
+        # Store noisy latents for the multiscale x0-prediction anchor loss (must be 4D
+        # pre-pack; for inpainting this is the 4-channel latent, before the mask concat).
+        if is_train and self.anchor_scale > 0.0:
+            self._anchor_noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
 
         # ensure the hidden state will require grad
         if is_train and args.gradient_checkpointing:
@@ -483,16 +574,136 @@ class NetworkTrainer:
         return noise_pred, target, timesteps, None, noise
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
-        if args.min_snr_gamma:
-            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization, soft=args.min_snr_gamma_soft)
-        if args.scale_v_pred_loss_like_noise_pred:
-            loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
-        if args.v_pred_like_loss:
-            loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-        if args.debiased_estimation_loss:
-            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
+        if getattr(args, "flow_model", False):
+            # For flow-matching models (enabled via --flow_model), apply flow-aware
+            # Min-SNR-gamma instead of the DDPM-style apply_snr_weight (which
+            # requires a DDPM scheduler with alphas_cumprod).
+            if args.min_snr_gamma:
+                sigmas = timesteps / noise_scheduler.config.num_train_timesteps
+                loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma, soft=args.min_snr_gamma_soft)
+        else:
+            if args.min_snr_gamma:
+                loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization, soft=args.min_snr_gamma_soft)
+            if args.scale_v_pred_loss_like_noise_pred:
+                loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+            if args.v_pred_like_loss:
+                loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+            if args.debiased_estimation_loss:
+                loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
         return loss
 
+    def setup_hf_objective(self, args):
+        """Resolve the High-Frequency Token latent loss config from args.
+
+        Base objective resolution: eps/v-pred/flow (DDPM-family). Subclasses set
+        `self.hf_prediction_mode` (and optionally `hf_timesteps_in_sigma`) in their
+        `__init__` or override this method; a non-None mode is never clobbered here.
+        """
+        self.hf_scale = float(getattr(args, "hf_scale", 0.0) or 0.0)
+        self.hf_exponent = float(getattr(args, "hf_exponent", 1.0) or 1.0)
+        self.hf_patch = int(getattr(args, "hf_patch", 2) or 2)
+        self.hf_high_noise_min_weight = float(getattr(args, "hf_high_noise_min_weight", 0.10))
+        self.hf_high_noise_power = float(getattr(args, "hf_high_noise_power", 1.0))
+        self.hf_high_noise_snr_cut = float(getattr(args, "hf_high_noise_snr_cut", 1.0 / 9.0))
+        hf_token_loss.validate_hf_args(self.hf_scale, self.hf_exponent, self.hf_patch)
+        hf_token_loss.validate_hf_high_noise_gate_args(
+            self.hf_high_noise_min_weight,
+            self.hf_high_noise_power,
+            self.hf_high_noise_snr_cut,
+        )
+        if self.hf_prediction_mode is None:
+            if getattr(args, "flow_model", False):
+                self.hf_prediction_mode = "flow"
+            elif args.v_parameterization:
+                self.hf_prediction_mode = "vpred_ddpm"
+            else:
+                self.hf_prediction_mode = "eps_ddpm"
+        if self.hf_scale > 0.0:
+            logger.info(
+                f"High-Frequency Token latent loss enabled: scale={self.hf_scale}, "
+                f"exponent={self.hf_exponent}, patch={self.hf_patch}, mode={self.hf_prediction_mode}, "
+                f"high_noise_snr_cut={self.hf_high_noise_snr_cut}, "
+                f"high_noise_min_weight={self.hf_high_noise_min_weight}, "
+                f"high_noise_power={self.hf_high_noise_power}"
+            )
+
+    def setup_anchor_objective(self, args):
+        """Resolve the multiscale MSE x0-prediction ("anchor") loss config from args.
+
+        Base objective resolution: eps/v-pred/flow (DDPM-family). Subclasses set
+        `self.anchor_prediction_mode` (and optionally `anchor_timesteps_in_sigma`) in
+        their `__init__`; a non-None mode is never clobbered here.
+        """
+        self.anchor_scale = float(getattr(args, "anchor_scale", 0.0) or 0.0)
+        anchor_levels_arg = getattr(args, "anchor_levels", 4)
+        self.anchor_levels = 4 if anchor_levels_arg is None else int(anchor_levels_arg)
+        self.anchor_snr_weighting = bool(getattr(args, "anchor_snr_weighting", False))
+        anchor_loss.validate_anchor_args(self.anchor_scale, self.anchor_levels)
+        if self.anchor_prediction_mode is None:
+            if getattr(args, "flow_model", False):
+                self.anchor_prediction_mode = "flow"
+            elif args.v_parameterization:
+                self.anchor_prediction_mode = "vpred_ddpm"
+            else:
+                self.anchor_prediction_mode = "eps_ddpm"
+        if self.anchor_scale > 0.0:
+            logger.info(
+                f"Multiscale MSE x0-prediction anchor loss enabled: scale={self.anchor_scale}, "
+                f"levels={self.anchor_levels}, snr_weighting={self.anchor_snr_weighting}, "
+                f"mode={self.anchor_prediction_mode}"
+            )
+
+    def build_adaptive_model_fn(self, unet, accelerator, weight_dtype):
+        """Build a model_fn(noisy_latents, timesteps, wdtype) -> noise_pred for Algorithm 2.
+
+        The returned closure captures the last training step's text_conds, args, batch,
+        and masks.  When called with an *arbitrary* batch size N (e.g. chunk_len for the
+        queue, or B*|S| for the batch-loss cache), it expands the captured conditioning
+        tensors so their leading dimension matches N.
+
+        Subclasses (e.g. AnimaNetworkTrainer) override this to call their own model
+        instead of ``self.call_unet``.
+        """
+        text_conds = self._adaptive_last_text_conds
+        text_masks = text_conds[1] if len(text_conds) > 1 else None
+        adaptive_args = self._adaptive_last_args
+        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
+        base_batch_size = self._adaptive_last_latents.shape[0] if self._adaptive_last_latents is not None else 1
+
+        def model_fn(noisy_latents, timesteps, wdtype):
+            N = noisy_latents.shape[0]
+            noisy_latents_in = noisy_latents.to(wdtype)
+
+            # Expand conditioning to match the batch dimension of noisy_latents.
+            # The queue path (single x_0) and batch-loss path (B*|S|) both produce
+            # latents whose leading dimension may differ from the training batch B.
+            if N != base_batch_size:
+                # Repeat the first element to match N — safe because the adaptive
+                # sampler always operates on a single x_0 expanded to N copies, or
+                # on the full batch expanded by |S| copies per sample.
+                expanded_conds = []
+                for c in text_conds:
+                    if isinstance(c, torch.Tensor) and c.shape[0] > 0:
+                        expanded_conds.append(c[:1].expand(N, *c.shape[1:]).contiguous())
+                    else:
+                        expanded_conds.append(c)
+                encoder_mask_bias = expanded_conds[1] if len(expanded_conds) > 1 else None
+                # Autocast to match the training forward pass (avoids float32-vs-bf16
+                # dtype mismatch in mixed-precision training).
+                with accelerator.autocast():
+                    return self.call_unet(
+                        adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                        expanded_conds, encoder_mask_bias, adaptive_batch, wdtype,
+                    )
+            else:
+                encoder_mask_bias = text_masks
+                with accelerator.autocast():
+                    return self.call_unet(
+                        adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                        text_conds, encoder_mask_bias, adaptive_batch, wdtype,
+                    )
+
+        return model_fn
 
     def compute_adaptive_delta_before_step(self, unet, noise_scheduler, weight_dtype, accelerator, global_step):
         """Compute per-timestep losses with theta_k (before optimizer step) for Algorithm 2.
@@ -512,22 +723,11 @@ class NetworkTrainer:
         if latents is None or noise is None or text_conds is None:
             return
 
-        text_masks = text_conds[1] if len(text_conds) > 1 else None
-
-        adaptive_args = self._adaptive_last_args
-        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
-
-        def model_fn(noisy_latents, timesteps, wdtype):
-            noisy_latents_in = noisy_latents.to(wdtype)
-            encoder_mask_bias = text_masks
-            return self.call_unet(
-                adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
-                text_conds, encoder_mask_bias, adaptive_batch, wdtype,
-            )
+        model_fn = self.build_adaptive_model_fn(unet, accelerator, weight_dtype)
 
         # Compute per-timestep losses for a single x_0 at all T timesteps (for the queue)
         self._adaptive_losses_before = self.adaptive_manager.compute_per_timestep_losses(
-            latents, noise, model_fn, weight_dtype
+            latents, noise, model_fn, weight_dtype, label="theta_k pre-step"
         )
 
         # Cache per-timestep losses for the FULL batch at the current |S| timesteps,
@@ -552,18 +752,7 @@ class NetworkTrainer:
         if latents is None or noise is None or text_conds is None:
             return
 
-        text_masks = text_conds[1] if len(text_conds) > 1 else None
-
-        adaptive_args = self._adaptive_last_args
-        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
-
-        def model_fn(noisy_latents, timesteps, wdtype):
-            noisy_latents_in = noisy_latents.to(wdtype)
-            encoder_mask_bias = text_masks
-            return self.call_unet(
-                adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
-                text_conds, encoder_mask_bias, adaptive_batch, wdtype,
-            )
+        model_fn = self.build_adaptive_model_fn(unet, accelerator, weight_dtype)
 
         # Algorithm 2: compute delta approximation. When a previous |S| selection
         # exists, the full batch at those timesteps is used (paper Algorithm 2 line 7).
@@ -573,7 +762,7 @@ class NetworkTrainer:
         )
 
         # Update sampler via policy gradient (Algorithm 1, line 8)
-        self.adaptive_manager.update_sampler(delta_approx, latents[:1])
+        self.adaptive_manager.update_sampler(delta_approx, latents)
 
         # Clear cached data
         self._adaptive_losses_before = None
@@ -582,6 +771,11 @@ class NetworkTrainer:
         self._adaptive_last_text_conds = None
         self._adaptive_last_args = None
         self._adaptive_last_batch = None
+
+        # Release the caching allocator's reserved pool after Algorithm 2 sweeps
+        # to prevent permanently elevated VRAM (the sweeps spike peak reserved memory).
+        if not self._adaptive_disable_empty_cache and accelerator.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def get_adaptive_model_type(self, args) -> str:
         """Return the model type for the adaptive timestep sampler.
@@ -846,7 +1040,7 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # Store text encoder conditions and batch for adaptive Algorithm 2
-        if self.adaptive_manager is not None and is_train:
+        if self.adaptive_manager is not None and is_train and self._adaptive_update_pending:
             self._adaptive_last_text_conds = [c.detach() if isinstance(c, torch.Tensor) else c for c in text_encoder_conds]
             self._adaptive_last_batch = batch
 
@@ -905,11 +1099,18 @@ class NetworkTrainer:
             if self.wavelet_masking_enabled and self._noisy_latents is not None:
                 with torch.no_grad():
                     A = train_util.compute_wavelet_attention_map(self._noisy_latents, self.wavelet_dwt)
+                    # Flow-matching trainers (Flux/SD3/Anima/Lumina/Hunyuan) return
+                    # timesteps in [0, 1]; DDPM trainers return them in [0, T].
+                    # get_adaptive_model_type() is the explicit discriminator
+                    # (overridden to "flow_matching" by all flow trainers, defaults
+                    # to "ddpm" in the base class).
+                    is_flow_matching = self.get_adaptive_model_type(args) == "flow_matching"
                     M = train_util.get_wavelet_mask(
                         A,
                         l=float(getattr(args, "wavelet_mask_l_bound", 0.3)),
                         T=noise_scheduler.config.num_train_timesteps,
                         timesteps=timesteps,
+                        flow_matching=is_flow_matching,
                     )
                 # M shape: (B, 1, H, W), loss shape: (B, C, H, W) or (B, seq_len)
                 if loss.ndim == 4 and loss.shape[2:] == M.shape[2:]:
@@ -925,6 +1126,25 @@ class NetworkTrainer:
                     self._wavelet_mask_ratio = 0.0
         else:
                 loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
+
+        # --- Token-level hard mining: reweight spatial tokens by detached per-token difficulty ---
+        if is_train and getattr(args, "token_mining", False):
+            mining_sigmas = None
+            if not getattr(args, "token_mining_no_sigma_gate", False):
+                ts = timesteps.detach().float().reshape(-1)
+                if ts.numel() > 0 and ts.max() > 1.5:  # discrete timesteps in [0, T]
+                    mining_sigmas = ts / noise_scheduler.config.num_train_timesteps
+                else:  # flow-matching trainers already return sigmas in [0, 1]
+                    mining_sigmas = ts
+            loss = custom_train_functions.apply_token_mining(
+                loss,
+                sigmas=mining_sigmas,
+                alpha=float(getattr(args, "token_mining_alpha", 1.0)),
+                min_weight=float(getattr(args, "token_mining_min_weight", 0.25)),
+                max_weight=float(getattr(args, "token_mining_max_weight", 4.0)),
+                sigma_gate=mining_sigmas is not None,
+            )
+
         loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
 
         if is_train:
@@ -958,6 +1178,189 @@ class NetworkTrainer:
             ffl_loss = self.ffl_module(noise_pred, target)
             self.ffl_loss_value = ffl_loss.detach().item()
             final_loss = final_loss + ffl_loss
+
+        # Patch Topology Loss: VAE-free spatial self-similarity topology matching
+        # Supports delayed start (--patch_topology_start_step), linear warmup
+        # (--patch_topology_warmup_steps), optional dynamic multi-loss weighting
+        # (--patch_topology_dynamic_weighting: none/dwa/gradnorm), spatial mask
+        # weighting (masked loss / alpha masks) and per-sample loss_weights for
+        # consistency with the base objective.
+        self.patch_topology_loss_value = None
+        self.patch_topology_effective_weight = None
+        if is_train and self.patch_topology_enabled and self.patch_topology_loss_module is not None:
+            # Warmup gate: ramps linearly from 0 to 1 over warmup_steps after start_step.
+            warmup_gate = 0.0
+            if self._patch_topology_current_step >= self.patch_topology_start_step:
+                if self.patch_topology_warmup_steps > 0:
+                    steps_into_warmup = self._patch_topology_current_step - self.patch_topology_start_step
+                    warmup_gate = min(1.0, float(steps_into_warmup) / float(self.patch_topology_warmup_steps))
+                else:
+                    warmup_gate = 1.0
+
+            if warmup_gate > 0.0:
+                # Spatial mask for masked/inpainting training, mirroring apply_masked_loss.
+                topo_mask = None
+                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    if noise_pred.ndim == 4:
+                        topo_mask = extract_spatial_mask(
+                            batch, noise_pred.shape[2:], noise_pred.device, torch.float32
+                        )
+
+                try:
+                    patch_topo_loss_per_sample = self.patch_topology_loss_module(
+                        pred=noise_pred,
+                        target=target,
+                        timesteps=timesteps,
+                        mask=topo_mask,
+                    )
+                except ValueError as e:
+                    # e.g. non-square sequence lengths from packed DiT outputs
+                    logger.warning_once(f"Patch Topology Loss skipped for this batch: {e}")
+                    patch_topo_loss_per_sample = None
+
+                if patch_topo_loss_per_sample is not None:
+                    # Per-sample loss_weights, consistent with the base loss.
+                    loss_weights = batch.get("loss_weights")
+                    if loss_weights is not None:
+                        patch_topo_loss_per_sample = patch_topo_loss_per_sample * loss_weights.to(
+                            patch_topo_loss_per_sample.dtype
+                        )
+
+                    patch_topo_loss_mean = patch_topo_loss_per_sample.mean()
+
+                    # Effective weight: dynamic multi-loss weighting (dwa/gradnorm) or static.
+                    if self.patch_topology_weighter is not None:
+                        shared_params = None
+                        if self.patch_topology_weighter.mode == "gradnorm" and network is not None:
+                            # GradNorm balances gradient norms on shared (trainable) parameters;
+                            # restrict to the last few LoRA tensors to bound the extra backward cost.
+                            trainable = [p for p in network.parameters() if p.requires_grad]
+                            shared_params = trainable[-8:] if trainable else None
+                        dynamic_weight = self.patch_topology_weighter.compute_weight(
+                            final_loss, patch_topo_loss_mean, shared_params=shared_params
+                        )
+                        effective_weight = warmup_gate * dynamic_weight
+                    else:
+                        effective_weight = warmup_gate * self.patch_topology_full_weight
+
+                    self.patch_topology_loss_value = patch_topo_loss_mean.detach().item()
+                    self.patch_topology_effective_weight = effective_weight
+                    final_loss = final_loss + effective_weight * patch_topo_loss_mean
+
+        # --- High-Frequency Token latent loss: per-token x0-MSE weighted by clean-token detail ---
+        # Opt-in auxiliary (hf_scale > 0). The Python-level gate inside hf_apply_term makes
+        # the off-mode bit-identical (no extra ops/allocations/RNG). Weights derive from the
+        # clean target only (never from the prediction), and the term is differentiable only
+        # through x0_hat. The detached scaled value is stored for logging (materialized at the
+        # existing periodic sync, not on the hot path).
+        self.hf_loss_value = None
+        if is_train and self._hf_noisy_latents is not None:
+            # HF-only one-sided high-noise gate. Low-noise samples remain exactly
+            # at weight 1; the main loss weighting is not modified.
+            hf_weighting = weighting
+            if self.hf_prediction_mode in (
+                "flow",
+                "x0_residual_eps",
+                "x0_direct",
+                "vpred_ddpm",
+                "eps_ddpm",
+            ):
+                hf_snr = hf_token_loss.hf_snr_from_timesteps(
+                    timesteps,
+                    mode=self.hf_prediction_mode,
+                    noise_scheduler=noise_scheduler,
+                    timesteps_in_sigma=self.hf_timesteps_in_sigma,
+                )
+                # Epsilon -> x0 reconstruction has a 1/SNR gradient factor;
+                # a zero floor is required to cap that factor at low SNR.
+                hf_min_gate = (
+                    0.0 if self.hf_prediction_mode == "eps_ddpm" else self.hf_high_noise_min_weight
+                )
+                hf_gate = hf_token_loss.hf_one_sided_snr_gate(
+                    hf_snr,
+                    snr_cut=self.hf_high_noise_snr_cut,
+                    min_gate=hf_min_gate,
+                    power=self.hf_high_noise_power,
+                )
+                if hf_weighting is None:
+                    hf_weighting = hf_gate
+                else:
+                    hf_weighting = (
+                        hf_weighting.detach().reshape(-1).to(dtype=hf_gate.dtype) * hf_gate
+                    )
+
+            final_loss, self.hf_loss_value = hf_token_loss.hf_apply_term(
+                final_loss,
+                noise_pred,
+                clean=latents,
+                noisy=self._hf_noisy_latents,
+                timesteps=timesteps,
+                weighting=hf_weighting,
+                scale=self.hf_scale,
+                exponent=self.hf_exponent,
+                patch=self.hf_patch,
+                mode=self.hf_prediction_mode,
+                noise_scheduler=noise_scheduler,
+                timesteps_in_sigma=self.hf_timesteps_in_sigma,
+                eps_train=self.hf_eps_train,
+            )
+
+        # --- Multiscale MSE x0-prediction ("anchor") loss: frequency-even Laplacian-pyramid MSE on the predicted x0 ---
+        # Opt-in auxiliary (anchor_scale > 0). The Python-level gate keeps the off path
+        # bit-identical (no extra ops/allocations/RNG). The pyramid is built ONCE on the
+        # delta (x0_pred - clean); band MSEs are whitened by calibrated band filter
+        # energies (cached per shape/dtype) and averaged uniformly. Batch aggregation
+        # mirrors the primary loss's per-sample weighting and reduction (spec §3.8).
+        self.anchor_loss_value = None
+        if is_train and self.anchor_scale > 0.0 and self._anchor_noisy_latents is None and not self._anchor_warned_missing:
+            # Trainers/paths that never store the noisy latents (e.g. flux/sd3/lumina/
+            # hunyuan, which override get_noise_pred_and_target, and the iLECO/ADDifT
+            # distillation paths, which have no analytic clean x0) silently skip the
+            # term — make that visible instead of a silent no-op.
+            self._anchor_warned_missing = True
+            logger.warning(
+                "anchor_scale > 0 but no noisy latents were stored by this trainer/path; "
+                "the multiscale x0-prediction anchor loss is INERT for this configuration."
+            )
+        if is_train and self.anchor_scale > 0.0 and self._anchor_noisy_latents is not None:
+            anchor_per_sample = anchor_loss.anchor_per_sample_from_prediction(
+                noise_pred,
+                clean=latents,
+                noisy=self._anchor_noisy_latents,
+                timesteps=timesteps,
+                mode=self.anchor_prediction_mode,
+                noise_scheduler=noise_scheduler,
+                timesteps_in_sigma=self.anchor_timesteps_in_sigma,
+                levels=self.anchor_levels,
+            )  # [B] fp32, differentiable only through x0_pred
+
+            # Optional soft SNR(t) gate (batch-mean-1 normalized; reshapes across t only).
+            if self.anchor_snr_weighting:
+                anchor_snr_w = anchor_loss.anchor_snr_weights(
+                    timesteps,
+                    self.anchor_prediction_mode,
+                    noise_scheduler=noise_scheduler,
+                    timesteps_in_sigma=self.anchor_timesteps_in_sigma,
+                )
+                anchor_per_sample = anchor_per_sample * anchor_snr_w
+
+            # Mirror the primary loss's per-sample weighting: scheduler weighting,
+            # per-sample data weights, then the per-sample timestep weighting
+            # (min-SNR-gamma etc.) applied by post_process_loss.
+            if weighting is not None:
+                anchor_w = weighting.detach().reshape(-1)
+                if anchor_w.shape[0] == anchor_per_sample.shape[0]:
+                    anchor_per_sample = anchor_per_sample * anchor_w.to(anchor_per_sample.dtype)
+            anchor_loss_weights = batch.get("loss_weights")
+            if anchor_loss_weights is not None:
+                anchor_per_sample = anchor_per_sample * anchor_loss_weights.reshape(-1).to(anchor_per_sample.dtype)
+            anchor_per_sample = self.post_process_loss(anchor_per_sample, args, timesteps, noise_scheduler)
+
+            anchor_term = anchor_per_sample.mean()
+            final_loss = final_loss + self.anchor_scale * anchor_term
+            # Detached, already-scaled contribution for logging (materialized at the
+            # caller's existing periodic sync — no .item() on the hot path).
+            self.anchor_loss_value = (self.anchor_scale * anchor_term).detach()
 
         return final_loss, pre_scaling_loss, loss_scaled
     
@@ -1215,6 +1618,11 @@ class NetworkTrainer:
 
         self.restore_rng_state(rng_states, accelerator)
 
+        # Release CUDA caching-allocator reserved memory from validation forward
+        # passes (multiple timesteps × batches accumulate distinct tensor-size
+        # pools that the allocator never frees on its own).
+        clean_memory_on_device(accelerator.device)
+
         return current_val_loss, average_val_loss, logs
 
 
@@ -1223,6 +1631,8 @@ class NetworkTrainer:
         training_started_at = time.time()
         train_util.verify_training_args(args)
         train_util.prepare_dataset_args(args, True)
+        self.setup_hf_objective(args)  # High-Frequency Token latent loss (validates hf_scale/hf_exponent/hf_patch)
+        self.setup_anchor_objective(args)  # Multiscale MSE x0-prediction anchor loss (validates anchor args)
         train_util.set_torch_cuda_reduced_precision(args)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
@@ -1370,6 +1780,44 @@ class NetworkTrainer:
             for ds in train_dataset_group.datasets:
                 ds.log_caption_dropout = True
 
+        # K-variant sampled augmentation caching: precompute augmented latent/caption variants.
+        # Must be set before the cacheability assertions below (they depend on the variant config).
+        latents_aug_variants = int(getattr(args, "cache_aug_variants", 0) or 0)
+        caption_aug_variants = int(getattr(args, "cache_caption_variants", 0) or 0)
+        if latents_aug_variants > 1 or caption_aug_variants > 1:
+            if hasattr(train_dataset_group, "set_aug_variant_config"):
+                train_dataset_group.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+            if val_dataset_group is not None and hasattr(val_dataset_group, "set_aug_variant_config"):
+                val_dataset_group.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+
+            if latents_aug_variants > 1:
+                if not cache_latents:
+                    logger.warning("--cache_aug_variants has no effect without --cache_latents / --cache_latentsがないため--cache_aug_variantsは無効です")
+                else:
+                    logger.info(f"caching up to {latents_aug_variants} latent augmentation variants per image.")
+            if caption_aug_variants > 1:
+                if not getattr(args, "cache_text_encoder_outputs", False):
+                    logger.warning(
+                        "--cache_caption_variants has no effect without --cache_text_encoder_outputs / --cache_text_encoder_outputsがないため--cache_caption_variantsは無効です"
+                    )
+                elif getattr(args, "weighted_captions", False):
+                    logger.warning(
+                        "--cache_caption_variants is ignored with --weighted_captions (captions are tokenized per step) / --weighted_captions使用時は--cache_caption_variantsは無視されます"
+                    )
+                else:
+                    logger.info(f"caching up to {caption_aug_variants} caption variants per image.")
+
+        # Epoch-variant refresh configuration
+        aug_refresh_epochs = int(getattr(args, "cache_aug_refresh_epochs", 0) or 0)
+        if aug_refresh_epochs > 0:
+            if latents_aug_variants <= 1 and caption_aug_variants <= 1:
+                logger.warning("--cache_aug_refresh_epochs requires --cache_aug_variants or --cache_caption_variants > 1; ignoring")
+                aug_refresh_epochs = 0
+            else:
+                if hasattr(train_dataset_group, "set_aug_refresh_epochs"):
+                    train_dataset_group.set_aug_refresh_epochs(aug_refresh_epochs)
+                logger.info(f"augmentation variants will be refreshed every {aug_refresh_epochs} epoch(s) in-memory.")
+
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -1392,11 +1840,11 @@ class NetworkTrainer:
         if cache_latents:
             assert (
                 train_dataset_group.is_latent_cacheable()
-            ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
+            ), "when caching latents, either color_aug or random_crop cannot be used (use --cache_aug_variants to cache augmented variants) / latentをキャッシュするときはcolor_augとrandom_cropは使えません（--cache_aug_variantsでaugmentation済みバリアントをキャッシュ可能です）"
             if val_dataset_group is not None:
                 assert (
                     val_dataset_group.is_latent_cacheable()
-                ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
+                ), "when caching latents, either color_aug or random_crop cannot be used (use --cache_aug_variants to cache augmented variants) / latentをキャッシュするときはcolor_augとrandom_cropは使えません（--cache_aug_variantsでaugmentation済みバリアントをキャッシュ可能です）"
 
         self.assert_extra_args(args, train_dataset_group, val_dataset_group)  # may change some args
 
@@ -1435,6 +1883,14 @@ class NetworkTrainer:
             if val_dataset_group is not None:
                 val_dataset_group.new_cache_latents(vae, accelerator)
 
+            # Initial in-memory variant generation (VAE is still on GPU)
+            if aug_refresh_epochs > 0 and latents_aug_variants > 1:
+                vae_encode_fn = lambda imgs: self.encode_images_to_latents(args, vae, imgs)
+                train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                if val_dataset_group is not None:
+                    val_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                logger.info("Initial latent augmentation variants generated in-memory.")
+
             vae.to("cpu")
             clean_memory_on_device(accelerator.device)
 
@@ -1451,6 +1907,22 @@ class NetworkTrainer:
         self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
         if val_dataset_group is not None:
             self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
+
+        # Initial in-memory caption TE variant generation.
+        # TE models may have been moved back to CPU by cache_text_encoder_outputs_if_needed
+        # (e.g. Anima's trainer). Save/restore device states so we don't change placement.
+        if aug_refresh_epochs > 0 and caption_aug_variants > 1 and getattr(args, "cache_text_encoder_outputs", False):
+            logger.info("Generating initial caption TE variants in-memory...")
+            te_device_states = [(t_enc, next(t_enc.parameters()).device) for t_enc in text_encoders]
+            for t_enc in text_encoders:
+                t_enc.to(accelerator.device, dtype=weight_dtype)
+            train_dataset_group.refresh_caption_te_variants(
+                text_encoders, tokenize_strategy, text_encoding_strategy, accelerator
+            )
+            for t_enc, orig_device in te_device_states:
+                t_enc.to(orig_device)
+            clean_memory_on_device(accelerator.device)
+            logger.info("Initial caption TE variants generated.")
 
         if unet is None:
             # lazy load unet if needed. text encoders may be freed or replaced with dummy models for saving memory
@@ -1636,12 +2108,6 @@ class NetworkTrainer:
                 pin_memory=args.pin_data_loader_memory or args.pin_memory,
             )
 
-        if val_dataset_group is not None:
-            val_dataloader = accelerator.prepare(val_dataloader)
-            cyclic_val_dataloader = itertools.cycle(val_dataloader)
-        else:
-            val_dataloader, cyclic_val_dataloader = None, None
-
         # 学習ステップ数を計算する
         if args.max_train_epochs is not None:
             args.max_train_steps = args.max_train_epochs * math.ceil(
@@ -1691,10 +2157,13 @@ class NetworkTrainer:
             # logger.info(f"set U-Net weight dtype to {unet_weight_dtype}, device to {accelerator.device}")
             # unet.to(accelerator.device, dtype=unet_weight_dtype)  # this seems to be safer than above
             logger.info(f"set U-Net weight dtype to {unet_weight_dtype}")
-            unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
+            if not args.keep_unet_dtype:
+                unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
+            else:
+                accelerator.print(f"keeping U-Net in its loaded dtype (skip fp8 cast)")
 
         unet.requires_grad_(False)
-        if self.cast_unet(args):
+        if self.cast_unet(args) and not args.keep_unet_dtype:
             unet.to(dtype=unet_weight_dtype)
         for i, t_enc in enumerate(text_encoders):
             t_enc.requires_grad_(False)
@@ -1999,6 +2468,18 @@ class NetworkTrainer:
                 with open(adaptive_state_file, "w", encoding="utf-8") as f:
                     json.dump(adaptive_state_serializable, f)
 
+            # save QMC timestep sampling sequence position if enabled, so the
+            # low-discrepancy coverage is preserved across checkpoint resume.
+            _qmc_method = getattr(args, "qmc_timestep_sampling", None)
+            if _qmc_method is not None:
+                _qmc_seed = getattr(args, "qmc_seed", 0)
+                _qmc_rank = accelerator.process_index if hasattr(accelerator, "process_index") else 0
+                _qmc_mgr = _QMCSequenceManager(method=_qmc_method, seed=_qmc_seed, rank=_qmc_rank)
+                qmc_state_file = os.path.join(output_dir, "qmc_state.json")
+                logger.info(f"save QMC sequence state to {qmc_state_file}")
+                with open(qmc_state_file, "w", encoding="utf-8") as f:
+                    json.dump(_qmc_mgr.state_dict(), f)
+
         steps_from_state = None
 
         def load_model_hook(models, input_dir):
@@ -2039,6 +2520,20 @@ class NetworkTrainer:
                         "num_selected": adaptive_state_serializable["num_selected"],
                     }
                     self.adaptive_manager.load_state_dict(adaptive_state)
+
+            # load QMC timestep sampling sequence position if available, so the
+            # low-discrepancy coverage continues from where it left off.
+            _qmc_method = getattr(args, "qmc_timestep_sampling", None)
+            if _qmc_method is not None:
+                qmc_state_file = os.path.join(input_dir, "qmc_state.json")
+                if os.path.exists(qmc_state_file):
+                    logger.info(f"load QMC sequence state from {qmc_state_file}")
+                    with open(qmc_state_file, "r", encoding="utf-8") as f:
+                        qmc_state = json.load(f)
+                    _qmc_seed = getattr(args, "qmc_seed", 0)
+                    _qmc_rank = accelerator.process_index if hasattr(accelerator, "process_index") else 0
+                    _qmc_mgr = _QMCSequenceManager(method=_qmc_method, seed=_qmc_seed, rank=_qmc_rank)
+                    _qmc_mgr.load_state_dict(qmc_state)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -2120,6 +2615,9 @@ class NetworkTrainer:
             "ss_adaptive_sampler_lr": args.adaptive_sampler_lr if getattr(args, "adaptive_timestep_sampling", False) else None,
             "ss_adaptive_sampler_entropy_coeff": args.adaptive_sampler_entropy_coeff if getattr(args, "adaptive_timestep_sampling", False) else None,
             "ss_adaptive_sampler_update_freq": args.adaptive_sampler_update_freq if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_eval_chunk_size": getattr(args, "adaptive_sampler_eval_chunk_size", 16) if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_eval_stride": getattr(args, "adaptive_sampler_eval_stride", 1) if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_fp32_eval": bool(getattr(args, "adaptive_sampler_fp32_eval", False)) if getattr(args, "adaptive_timestep_sampling", False) else None,
             "ss_min_snr_gamma": args.min_snr_gamma,
             "ss_scale_weight_norms": args.scale_weight_norms,
             "ss_ip_noise_gamma": args.ip_noise_gamma,
@@ -2141,6 +2639,28 @@ class NetworkTrainer:
             "ss_focal_frequency_loss": bool(getattr(args, "focal_frequency_loss", False)),
             "ss_focal_frequency_loss_weight": getattr(args, "focal_frequency_loss_weight", 1.0),
             "ss_focal_frequency_loss_alpha": getattr(args, "focal_frequency_loss_alpha", 1.0),
+            "ss_patch_topology_loss": bool(getattr(args, "patch_topology_loss", False)),
+            "ss_patch_topology_weight": getattr(args, "patch_topology_weight", 1.0),
+            "ss_patch_topology_tau": getattr(args, "patch_topology_tau", 0.1),
+            "ss_patch_topology_scale_levels": getattr(args, "patch_topology_scale_levels", 2),
+            "ss_patch_topology_loss_type": getattr(args, "patch_topology_loss_type", "kl"),
+            "ss_patch_topology_disable_timestep_weight": bool(getattr(args, "patch_topology_disable_timestep_weight", False)),
+            "ss_patch_topology_chunk_size": getattr(args, "patch_topology_chunk_size", 512),
+            "ss_patch_topology_start_step": getattr(args, "patch_topology_start_step", 0),
+            "ss_patch_topology_warmup_steps": getattr(args, "patch_topology_warmup_steps", 0),
+            "ss_patch_topology_dynamic_weighting": getattr(args, "patch_topology_dynamic_weighting", "none"),
+            "ss_patch_topology_dwa_temperature": getattr(args, "patch_topology_dwa_temperature", 2.0),
+            "ss_patch_topology_gradnorm_alpha": getattr(args, "patch_topology_gradnorm_alpha", 1.5),
+            "ss_patch_topology_dynamic_max_weight": getattr(args, "patch_topology_dynamic_max_weight", 10.0),
+            "ss_hf_scale": self.hf_scale if self.hf_scale > 0.0 else 0.0,
+            "ss_hf_exponent": self.hf_exponent if self.hf_scale > 0.0 else None,
+            "ss_hf_patch": self.hf_patch if self.hf_scale > 0.0 else None,
+            "ss_hf_high_noise_snr_cut": self.hf_high_noise_snr_cut if self.hf_scale > 0.0 else None,
+            "ss_hf_high_noise_min_weight": self.hf_high_noise_min_weight if self.hf_scale > 0.0 else None,
+            "ss_hf_high_noise_power": self.hf_high_noise_power if self.hf_scale > 0.0 else None,
+            "ss_anchor_scale": self.anchor_scale if self.anchor_scale > 0.0 else 0.0,
+            "ss_anchor_levels": self.anchor_levels if self.anchor_scale > 0.0 else None,
+            "ss_anchor_snr_weighting": bool(self.anchor_snr_weighting) if self.anchor_scale > 0.0 else None,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2187,6 +2707,9 @@ class NetworkTrainer:
                         "caption_prefix": subset.caption_prefix,
                         "caption_suffix": subset.caption_suffix,
                         "resize_interpolation": subset.resize_interpolation,
+                        "resolution": subset.resolution,
+                        "min_bucket_reso": subset.min_bucket_reso,
+                        "max_bucket_reso": subset.max_bucket_reso,
                     }
 
                     image_dir_or_metadata_file = None
@@ -2279,6 +2802,15 @@ class NetworkTrainer:
                     "ss_enable_bucket": bool(dataset.enable_bucket),
                     "ss_bucket_no_upscale": bool(dataset.bucket_no_upscale),
                     "ss_multires_training": bool(getattr(dataset, "multires_training", False)),
+                    "ss_resolution_jitter": json.dumps(
+                        {
+                            "resolutions": dataset.resolution_jitter_resolutions,
+                            "batch_sizes": dataset.resolution_jitter_batch_sizes,
+                            "weights": dataset.resolution_jitter_weights,
+                        }
+                    )
+                    if getattr(dataset, "has_resolution_jitter", False)
+                    else None,
                     "ss_min_bucket_reso": dataset.min_bucket_reso,
                     "ss_max_bucket_reso": dataset.max_bucket_reso,
                     "ss_skip_image_resolution": dataset.skip_image_resolution,
@@ -2390,6 +2922,35 @@ class NetworkTrainer:
                 f"alpha={args.focal_frequency_loss_alpha}"
             )
 
+        # Initialize Patch Topology Loss if enabled
+        if getattr(args, "patch_topology_loss", False):
+            self.patch_topology_enabled = True
+            self.patch_topology_full_weight = float(getattr(args, "patch_topology_weight", 1.0))
+            self.patch_topology_start_step = int(getattr(args, "patch_topology_start_step", 0))
+            self.patch_topology_warmup_steps = int(getattr(args, "patch_topology_warmup_steps", 0))
+            self.patch_topology_loss_module = PatchTopologyLoss(
+                loss_weight=1.0,  # effective weight applied dynamically via warmup/start_step
+                tau_latent=float(getattr(args, "patch_topology_tau", 0.1)),
+                tau_target=float(getattr(args, "patch_topology_tau", 0.1)),
+                scale_levels=int(getattr(args, "patch_topology_scale_levels", 2)),
+                loss_type=getattr(args, "patch_topology_loss_type", "kl"),
+                apply_timestep_weight=not getattr(args, "patch_topology_disable_timestep_weight", False),
+                chunk_size=int(getattr(args, "patch_topology_chunk_size", 512)),
+            )
+            self.patch_topology_loss_module.to(accelerator.device)
+            self.patch_topology_weighter = build_weighter_from_args(args, self.patch_topology_full_weight)
+            logger.info(
+                f"Patch Topology Loss enabled: weight={self.patch_topology_full_weight}, "
+                f"tau={getattr(args, 'patch_topology_tau', 0.1)}, "
+                f"scale_levels={getattr(args, 'patch_topology_scale_levels', 2)}, "
+                f"loss_type={getattr(args, 'patch_topology_loss_type', 'kl')}, "
+                f"timestep_weight={not getattr(args, 'patch_topology_disable_timestep_weight', False)}, "
+                f"chunk_size={getattr(args, 'patch_topology_chunk_size', 512)}, "
+                f"start_step={self.patch_topology_start_step}, "
+                f"warmup_steps={self.patch_topology_warmup_steps}, "
+                f"dynamic_weighting={getattr(args, 'patch_topology_dynamic_weighting', 'none')}"
+            )
+
         # Initialize Latent Wavelet Diffusion (LWD) masking if enabled
         if getattr(args, "wavelet_masking", False):
             self.wavelet_masking_enabled = True
@@ -2413,16 +2974,29 @@ class NetworkTrainer:
 
         # Initialize Adaptive Timestep Sampler
         if getattr(args, "adaptive_timestep_sampling", False):
-            unet_config = getattr(unet, "config", None)
-            in_channels = getattr(unet_config, "in_channels", 4) if unet_config else 4
-            sampler_net = TimestepSamplerNetwork(
-                in_channels=in_channels,
-                hidden_channels=args.adaptive_sampler_hidden_channels,
-                hidden_depth=args.adaptive_sampler_hidden_depth,
-            ).to(accelerator.device)
+            # Adaptive sampling produces its own timesteps (passed as fixed_timesteps),
+            # which bypasses the antithetic/stratified/QMC variance-reduction paths. Warn
+            # so the user knows they are mutually exclusive (adaptive takes precedence).
+            if (
+                getattr(args, "antithetic_timestep_sampling", False)
+                or getattr(args, "stratified_timestep_sampling", False)
+                or getattr(args, "qmc_timestep_sampling", None) is not None
+            ):
+                logger.warning(
+                    "Both --adaptive_timestep_sampling and "
+                    "--antithetic_timestep_sampling/--stratified_timestep_sampling/--qmc_timestep_sampling "
+                    "are enabled. Adaptive timestep sampling takes precedence and supplies fixed "
+                    "timesteps, so antithetic/stratified/QMC variance reduction will NOT be applied. "
+                    "Disable one of them to avoid this conflict."
+                )
             adaptive_model_type = self.get_adaptive_model_type(args)
+            adaptive_min_ts = 0 if args.min_timestep is None else args.min_timestep
+            adaptive_max_ts = args.max_timestep  # None → defaults to num_train_timesteps in manager
+            self._adaptive_disable_empty_cache = getattr(args, "adaptive_sampler_disable_empty_cache", False)
             self.adaptive_manager = AdaptiveTimestepManager(
-                sampler_network=sampler_net,
+                # Network is lazily initialized on first sample_timesteps() call,
+                # inferring in_channels from the actual latent tensor shape.
+                # This correctly handles any VAE (4-ch SD1.5/SDXL, 16-ch Flux/SD3/Anima).
                 noise_scheduler=noise_scheduler,
                 device=accelerator.device,
                 dtype=weight_dtype,
@@ -2433,8 +3007,41 @@ class NetworkTrainer:
                 num_selected=args.adaptive_sampler_num_selected,
                 v_parameterization=args.v_parameterization,
                 model_type=adaptive_model_type,
+                hidden_channels=args.adaptive_sampler_hidden_channels,
+                hidden_depth=args.adaptive_sampler_hidden_depth,
+                min_timestep=adaptive_min_ts,
+                max_timestep=adaptive_max_ts,
+                eval_chunk_size=getattr(args, "adaptive_sampler_eval_chunk_size", 16),
+                eval_stride=getattr(args, "adaptive_sampler_eval_stride", 1),
+                fp32_eval=getattr(args, "adaptive_sampler_fp32_eval", False),
             )
             logger.info(f"Adaptive non-uniform timestep sampling enabled (model_type={adaptive_model_type})")
+
+        # Warn about variance-reduction pairing breakage under gradient accumulation or
+        # DDP. Antithetic assumes each (u, 1-u) pair lives in the same loss/gradient
+        # aggregation unit; with gradient accumulation the batch is split into
+        # micro-batches and with DDP it is sharded across ranks, so pairs may be
+        # separated, reducing the variance-reduction benefit. (QMC is DDP-safe: each
+        # rank offsets its scramble seed by its process index, so ranks draw from
+        # different scrambled low-discrepancy sequences with no duplicate points.)
+        if (
+            getattr(args, "antithetic_timestep_sampling", False)
+            or getattr(args, "stratified_timestep_sampling", False)
+            or getattr(args, "qmc_timestep_sampling", None) is not None
+        ):
+            _ga = getattr(args, "gradient_accumulation_steps", 1)
+            _np = accelerator.num_processes if hasattr(accelerator, "num_processes") else 1
+            if _ga > 1 or _np > 1:
+                logger.warning(
+                    f"Antithetic/stratified/QMC timestep sampling is enabled with "
+                    f"gradient_accumulation_steps={_ga} and num_processes={_np}. "
+                    "Antithetic mirrored pairs may be split across micro-batches or GPU "
+                    "ranks, which reduces (and can eliminate) the variance-reduction "
+                    "benefit of antithetic. (QMC is DDP-safe: each rank consumes a disjoint "
+                    "slice of the global low-discrepancy sequence.) For full antithetic "
+                    "benefit, use a single GPU with gradient_accumulation_steps=1, or form "
+                    "pairs within each micro-batch/rank."
+                )
 
         train_util.init_trackers(accelerator, args, "network_train")
 
@@ -2446,7 +3053,11 @@ class NetworkTrainer:
             loss_scaled_recorder = train_util.EMARecorder()
             loss_edm2_recorder = train_util.EMARecorder()
 
-        del train_dataset_group
+        # NOTE: train_dataset_group is intentionally NOT deleted here.
+        # The DataLoader holds a reference regardless (so `del` never freed
+        # the object), and the epoch-variant refresh path
+        # (cache_aug_refresh_epochs) needs the name to call
+        # refresh_latent_variants / refresh_caption_te_variants.
         if val_dataset_group is not None:
             del val_dataset_group
 
@@ -2482,7 +3093,14 @@ class NetworkTrainer:
 
         # if text_encoder is not needed for training, delete it to save memory.
         # TODO this can be automated after SDXL sample prompt cache is implemented
-        if self.is_text_encoder_not_needed_for_training(args):
+        # Keep TE models alive when caption-variant epoch refresh is active,
+        # because refresh_caption_te_variants() needs them on GPU each epoch.
+        _need_te_for_refresh = (
+            aug_refresh_epochs > 0
+            and caption_aug_variants > 1
+            and getattr(args, "cache_text_encoder_outputs", False)
+        )
+        if self.is_text_encoder_not_needed_for_training(args) and not _need_te_for_refresh:
             logger.info("text_encoder is not needed for training. deleting to save memory.")
             for t_enc in text_encoders:
                 del t_enc
@@ -2501,8 +3119,11 @@ class NetworkTrainer:
         current_global_step_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         average_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         current_global_step_ffl = 0.0 if self.ffl_enabled else None
+        current_global_step_patch_topo = 0.0 if self.patch_topology_enabled else None
         current_global_step_wav_mask = 0.0 if self.wavelet_masking_enabled else None
         current_global_step_wnoise = 0.0 if self.weight_noise_enabled else None
+        current_global_step_hf = 0.0 if self.hf_scale > 0.0 else None
+        current_global_step_anchor = 0.0 if self.anchor_scale > 0.0 else None
         avr_loss = 0.0
         accumulation_counter = 0
         accumulated_samples = 0  # Tracks actual samples across micro-batches for dynamic sigma
@@ -2542,7 +3163,7 @@ class NetworkTrainer:
                         accelerator.unwrap_model(t_enc).train()
 
         if plot_edm2_loss_weighting_check(args, global_step):
-            plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
+            plot_edm2_loss_weighting(args, global_step, edm2_model, noise_scheduler.config.num_train_timesteps, accelerator.device)
 
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
@@ -2566,6 +3187,9 @@ class NetworkTrainer:
                 current_val_loss=current_val_loss,
                 average_val_loss=average_val_loss,
                 current_ffl_loss=None,
+                current_patch_topology_loss=None,
+                current_hf_loss=None,
+                current_anchor_loss=None,
                 it_s=rate_tracker.it_per_sec,
             )
             if val_logs:
@@ -2601,6 +3225,38 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(text_encoder, unet)  # network.train() is called here
 
+            # Epoch-variant refresh: regenerate augmentation variants in-memory
+            if (aug_refresh_epochs > 0
+                and epoch > epoch_to_start
+                and (epoch - epoch_to_start) % aug_refresh_epochs == 0):
+                # Refresh latent variants (requires VAE on GPU)
+                if latents_aug_variants > 1 and cache_latents:
+                    logger.info(f"Refreshing latent augmentation variants for epoch {current_epoch.value}...")
+                    vae.to(accelerator.device, dtype=vae_dtype)
+                    vae_encode_fn = lambda imgs: self.encode_images_to_latents(args, vae, imgs)
+                    train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                    vae.to("cpu")
+                    clean_memory_on_device(accelerator.device)
+                    logger.info("Latent augmentation variants refreshed.")
+                # Refresh caption TE variants (requires TE models on GPU for encoding)
+                if caption_aug_variants > 1 and getattr(args, "cache_text_encoder_outputs", False):
+                    logger.info(f"Refreshing caption TE variants for epoch {current_epoch.value}...")
+                    # Save TE device states and move to GPU for encoding
+                    te_device_states = [(t_enc, next(t_enc.parameters()).device) for t_enc in text_encoders]
+                    for t_enc in text_encoders:
+                        t_enc.to(accelerator.device, dtype=weight_dtype)
+                    train_dataset_group.refresh_caption_te_variants(
+                        text_encoders, tokenize_strategy, text_encoding_strategy, accelerator
+                    )
+                    # Restore TEs to their original devices (CPU for archs that don't train TEs)
+                    for t_enc, orig_device in te_device_states:
+                        t_enc.to(orig_device)
+                    clean_memory_on_device(accelerator.device)
+                    logger.info("Caption TE variants refreshed.")
+
+                # Synchronize all processes after refresh
+                accelerator.wait_for_everyone()
+
             # TRAINING
             skipped_dataloader = None
             if initial_step > 0:
@@ -2613,6 +3269,10 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+
+                # Set adaptive update flag: stash tensors only on steps where Algorithm 2 will run
+                if self.adaptive_manager is not None:
+                    self._adaptive_update_pending = self.adaptive_manager.should_update(global_step)
 
                 with train_util.determine_grad_sync_context(args, accelerator, None, training_model, edm2_model):
                     on_step_start_for_network(text_encoder, unet)
@@ -2633,6 +3293,9 @@ class NetworkTrainer:
 
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
+
+                    # Update patch topology current step for warmup/start_step logic
+                    self._patch_topology_current_step = global_step
 
                     loss, pre_scaling_loss, loss_scaled = self.process_batch(
                         batch,
@@ -2657,17 +3320,31 @@ class NetworkTrainer:
                     if self.ffl_enabled and self.ffl_loss_value is not None:
                         current_global_step_ffl = (current_global_step_ffl or 0.0) + self.ffl_loss_value
 
+                    # Track Patch Topology loss for logging
+                    if self.patch_topology_enabled and self.patch_topology_loss_value is not None:
+                        current_global_step_patch_topo = (current_global_step_patch_topo or 0.0) + self.patch_topology_loss_value
+
                     # Track wavelet mask ratio for logging
                     if self.wavelet_masking_enabled:
                         current_global_step_wav_mask = (current_global_step_wav_mask or 0.0) + self._wavelet_mask_ratio
+
+                    # Track High-Frequency Token loss for logging (materialized at the
+                    # existing periodic sync — the hot path keeps a detached tensor)
+                    if self.hf_scale > 0.0 and self.hf_loss_value is not None:
+                        current_global_step_hf = (current_global_step_hf or 0.0) + self.hf_loss_value.item()
+
+                    # Track multiscale anchor loss for logging (materialized at the
+                    # existing periodic sync — the hot path keeps a detached tensor)
+                    if self.anchor_scale > 0.0 and self.anchor_loss_value is not None:
+                        current_global_step_anchor = (current_global_step_anchor or 0.0) + self.anchor_loss_value.item()
 
                     if loss.ndim != 0:
                         loss = loss.mean()
 
                     accelerator.backward(loss)
 
-                    if args.use_ramtorch or args.use_ramtorch_network:
-                        torch.cuda.synchronize() 
+                    if self.should_sync_ramtorch(args, accelerator):
+                        torch.cuda.synchronize()
 
                     edm2_loss = loss
                     loss = pre_scaling_loss
@@ -2869,7 +3546,7 @@ class NetworkTrainer:
 
                     # EDM2 graph generation - moved outside the sample/val/save conditional
                     if plot_edm2_loss_weighting_check(args, global_step):
-                        plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
+                        plot_edm2_loss_weighting(args, global_step, edm2_model, noise_scheduler.config.num_train_timesteps, accelerator.device)
 
                 current_global_step_loss += loss.detach().item()
                 if args.edm2_loss_weighting:
@@ -2923,8 +3600,12 @@ class NetworkTrainer:
                             current_val_loss=current_val_loss,
                             average_val_loss=average_val_loss,
                             current_ffl_loss=(current_global_step_ffl / accumulation_counter) if self.ffl_enabled and current_global_step_ffl is not None else None,
+                            current_patch_topology_loss=(current_global_step_patch_topo / accumulation_counter) if self.patch_topology_enabled and current_global_step_patch_topo is not None else None,
+                            current_patch_topology_weight=self.patch_topology_effective_weight if self.patch_topology_enabled else None,
                             current_wav_mask_ratio=(current_global_step_wav_mask / accumulation_counter) if self.wavelet_masking_enabled and current_global_step_wav_mask is not None else None,
                             current_weight_noise_norm=(current_global_step_wnoise / accumulation_counter) if self.weight_noise_enabled and current_global_step_wnoise is not None else None,
+                            current_hf_loss=(current_global_step_hf / accumulation_counter) if self.hf_scale > 0.0 and current_global_step_hf is not None else None,
+                            current_anchor_loss=(current_global_step_anchor / accumulation_counter) if self.anchor_scale > 0.0 and current_global_step_anchor is not None else None,
                             it_s=rate_tracker.it_per_sec,
                         )
                         if val_logs:
@@ -2936,10 +3617,16 @@ class NetworkTrainer:
                         current_global_step_loss_edm2 = 0.0
                     if self.ffl_enabled:
                         current_global_step_ffl = 0.0
+                    if self.patch_topology_enabled:
+                        current_global_step_patch_topo = 0.0
                     if self.wavelet_masking_enabled:
                         current_global_step_wav_mask = 0.0
                     if self.weight_noise_enabled:
                         current_global_step_wnoise = 0.0
+                    if self.hf_scale > 0.0:
+                        current_global_step_hf = 0.0
+                    if self.anchor_scale > 0.0:
+                        current_global_step_anchor = 0.0
                     accumulation_counter = 0
                     accumulated_samples = 0
 
@@ -2996,6 +3683,11 @@ class NetworkTrainer:
                             accelerator.unwrap_model(t_enc).train()
 
             # end of epoch
+
+            # Release CUDA caching-allocator reserved memory accumulated during
+            # this epoch (distinct bucket-shape pools from random-crop
+            # training, validation, and sample-image generation).
+            clean_memory_on_device(accelerator.device)
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
@@ -3496,6 +4188,83 @@ def setup_parser() -> argparse.ArgumentParser:
         default=0.3,
         help="Lower bound l for wavelet masking (default: 0.3). All spatial regions receive at least "
         "l*T supervision steps. Paper ablation shows 0.3 is optimal. Range: [0.0, 1.0].",
+    )
+
+    # High-Frequency Token latent loss arguments (see library/hf_token_loss.py)
+    parser.add_argument(
+        "--hf_scale",
+        type=float,
+        default=0.0,
+        help="High-Frequency token latent loss weight (lambda, 0 = off, must be >= 0). "
+        "L_total = L_mse + hf_scale * L_hf. Concentrates training effort on image tokens "
+        "carrying fine (high-frequency) detail.",
+    )
+    parser.add_argument(
+        "--hf_exponent",
+        type=float,
+        default=1.0,
+        help="HF token weight concentration exponent (gamma, must be > 0). 1 = linear in detail, "
+        "> 1 concentrates on the highest-detail tokens, < 1 flattens toward uniform.",
+    )
+    parser.add_argument(
+        "--hf_patch",
+        type=int,
+        default=2,
+        help="HF token patch size; MUST equal the model's own patchify size. "
+        "2 for latent-space models (SD1.5/SD2/SDXL/Flux/SD3/Lumina/Hunyuan/Anima), "
+        "16 for pixel-space models (e.g. ChromaRadiance).",
+    )
+    parser.add_argument(
+        "--hf_high_noise_snr_cut",
+        type=float,
+        default=1.0 / 9.0,
+        help="Universal SNR cutoff for HF high-noise attenuation (default: 0.111111, "
+        "equivalent to flow sigma 0.75). Must be > 0.",
+    )
+    parser.add_argument(
+        "--hf_high_noise_min_weight",
+        type=float,
+        default=0.10,
+        help="Minimum HF multiplier at the highest flow noise levels (default: 0.10). Range: [0, 1].",
+    )
+    parser.add_argument(
+        "--hf_high_noise_power",
+        type=float,
+        default=1.0,
+        help="Power controlling high-noise HF attenuation below hf_high_noise_snr_cut (default: 1.0).",
+    )
+
+    # Multiscale MSE x0-prediction ("anchor") loss arguments (see library/anchor_loss.py)
+    parser.add_argument(
+        "--anchor_scale",
+        type=float,
+        default=0.0,
+        help="Multiscale MSE x0-prediction (anchor) loss weight (0 = off, must be >= 0). "
+        "L_total = L_mse + anchor_scale * L_anchor. Frequency-even Laplacian-pyramid "
+        "reconstruction term on the predicted clean output (x0): emphasizes composition "
+        "and global look without zeroing out fine detail. Sweep 0.05 - 1.0.",
+    )
+    parser.add_argument(
+        "--anchor_levels",
+        type=int,
+        default=4,
+        help="Number of Laplacian pyramid band-pass octaves for the anchor loss (plus the "
+        "coarsest Gaussian residual). Must be >= 1; clamped down to what the latent grid "
+        "supports. More levels give subject/identity detail a voice, fewer levels judge "
+        "mostly composition/global look.",
+    )
+    parser.add_argument(
+        "--anchor_snr_weighting",
+        action="store_true",
+        help="Apply the soft SNR(t) gate to the anchor loss (batch-mean-1 normalized): "
+        "early (noisy, low-SNR) steps weigh less, late (clean, high-SNR) steps weigh more. "
+        "Inert while --anchor_scale is 0.",
+    )
+
+    parser.add_argument(
+        "--keep_unet_dtype",
+        action="store_true",
+        help="TBD",
     )
 
     return parser

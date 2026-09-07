@@ -43,7 +43,7 @@ from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
 )
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 
 # from library.custom_train_functions import (
 #     apply_snr_weight,
@@ -107,7 +107,8 @@ def train(args):
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:
         latents_caching_strategy = strategy_sd3.Sd3LatentsCachingStrategy(
-            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
@@ -174,6 +175,7 @@ def train(args):
                     False,
                     False,
                     False,
+                    cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
                 )
             )
         train_dataset_group.set_current_strategies()
@@ -284,6 +286,7 @@ def train(args):
             train_clip or args.use_t5xxl_cache_only,  # if clip is trained or t5xxl is cached, caching is partial
             args.apply_lg_attn_mask,
             args.apply_t5_attn_mask,
+            cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
         )
         strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_caching_strategy)
 
@@ -809,6 +812,7 @@ def train(args):
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
+                noise = maybe_apply_antithetic_noise_pairing(args, noise)
                 # bsz = latents.shape[0]
 
                 # get noisy model input and timesteps

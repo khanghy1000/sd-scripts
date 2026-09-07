@@ -19,6 +19,7 @@ from torch import Tensor
 import re
 from library.utils import setup_logging
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from networks.network_base import _tag_all_network_params
 
 setup_logging()
 import logging
@@ -1238,6 +1239,7 @@ class LoRANetwork(torch.nn.Module):
             text_encoder_lr = [text_encoder_lr[0], text_encoder_lr[0]]
 
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
         all_params = []
         lr_descriptions = []
@@ -1368,6 +1370,7 @@ class LoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

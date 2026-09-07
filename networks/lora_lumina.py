@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple, Type, Union
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from transformers import CLIPTextModel
 import torch
+from networks.network_base import _tag_all_network_params
 from torch import Tensor, nn
 from library.utils import setup_logging
 
@@ -901,6 +902,7 @@ class LoRANetwork(torch.nn.Module):
             text_encoder_lr = [text_encoder_lr[0], text_encoder_lr[0]]
 
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
         all_params = []
         lr_descriptions = []
@@ -965,6 +967,7 @@ class LoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

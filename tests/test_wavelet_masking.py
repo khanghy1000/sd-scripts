@@ -206,6 +206,96 @@ class TestGetWaveletMask:
         mask_sample_1 = mask[1].sum()
         assert mask_sample_0 >= mask_sample_1
 
+    def test_flow_matching_timesteps_not_all_ones(self, dwt_module):
+        """Flow-matching timesteps in [0, 1] must NOT produce an all-ones mask.
+
+        Regression test for the bug where flow-matching trainers (Flux/SD3/Anima/
+        Lumina/Hunyuan) divide timesteps by 1000 before returning them, so
+        get_wavelet_mask compared t in [0,1] against T*(A+l) in [300,1300] and
+        the mask was always 1.0 (wavelet_mask_ratio stuck at 1.0).
+        """
+        B, H, W = 2, 32, 32
+        A = torch.rand(B, H, W)
+        # Flow-matching convention: timesteps in [0, 1]
+        timesteps = torch.tensor([0.5, 0.9])
+        mask = get_wavelet_mask(A, l=0.3, T=1000, timesteps=timesteps, flow_matching=True)
+        # The mask must NOT be all ones (that was the bug)
+        assert mask.sum() < mask.numel()
+        # And it must contain some zeros
+        assert (mask == 0.0).any()
+
+    def test_flow_matching_matches_ddpm_scale(self, dwt_module):
+        """A flow-matching timestep t in [0,1] must yield the same mask as t*T in [0,T].
+
+        Eq. 6 is scale-invariant: M_t = 1 iff T*(A+l) >= t iff (A+l) >= t/T.
+        So t=0.5 (flow) should equal t=500 (DDPM) for T=1000.
+        """
+        B, H, W = 2, 32, 32
+        torch.manual_seed(42)
+        A = torch.rand(B, H, W)
+        l = 0.3
+        T = 1000
+
+        # Flow-matching convention
+        t_flow = torch.tensor([0.25, 0.75])
+        mask_flow = get_wavelet_mask(A, l=l, T=T, timesteps=t_flow, flow_matching=True)
+
+        # Equivalent DDPM convention
+        t_ddpm = t_flow * T
+        mask_ddpm = get_wavelet_mask(A, l=l, T=T, timesteps=t_ddpm, flow_matching=False)
+
+        assert torch.equal(mask_flow, mask_ddpm)
+
+    def test_flow_matching_high_timestep_masks_low_energy(self, dwt_module):
+        """At high flow-matching timestep with l=0, low-energy regions must be masked out."""
+        B, H, W = 1, 32, 32
+        A = torch.zeros(B, H, W)
+        A[0, 0, 0] = 1.0  # single high-energy location
+        # Flow-matching t=1.0 (max noise)
+        timesteps = torch.tensor([1.0])
+        mask = get_wavelet_mask(A, l=0.0, T=1000, timesteps=timesteps, flow_matching=True)
+        # Only the high-energy spot (A=1) satisfies T*(1+0) >= 1000
+        assert mask[0, 0, 0, 0] == 1.0
+        # Most of the mask should be 0
+        assert mask.sum() < mask.numel()
+
+    def test_flow_matching_ratio_varies_with_timestep(self, dwt_module):
+        """The mask ratio should decrease as the flow-matching timestep increases.
+
+        This directly tests the reported symptom: ratio was stuck at 1.0 regardless
+        of timestep. After the fix, higher timesteps must yield lower ratios.
+        """
+        B, H, W = 1, 64, 64
+        torch.manual_seed(0)
+        A = torch.rand(B, H, W)
+        l = 0.3
+        T = 1000
+
+        ratios = []
+        for t_val in [0.1, 0.3, 0.5, 0.7, 0.9]:
+            t = torch.tensor([t_val])
+            mask = get_wavelet_mask(A, l=l, T=T, timesteps=t, flow_matching=True)
+            ratios.append(mask.mean().item())
+
+        # Ratio at low timestep should be higher than at high timestep
+        assert ratios[0] > ratios[-1]
+        # And the highest-timestep ratio must be strictly less than 1.0
+        assert ratios[-1] < 1.0
+
+    def test_flow_matching_false_with_unit_timesteps_is_all_ones(self, dwt_module):
+        """Without flow_matching=True, unit-scale timesteps must stay all-ones.
+
+        This documents the original bug behavior: if a flow-matching trainer
+        forgets to pass flow_matching=True, the mask silently degrades to
+        all-ones (ratio=1.0). The explicit flag is required for correctness.
+        """
+        B, H, W = 1, 32, 32
+        A = torch.rand(B, H, W)
+        timesteps = torch.tensor([0.9])  # unit-scale, but flag omitted
+        mask = get_wavelet_mask(A, l=0.3, T=1000, timesteps=timesteps, flow_matching=False)
+        # Bug behavior: threshold in [300,1300] >> t=0.9 -> all ones
+        assert mask.sum() == mask.numel()
+
 
 class TestEndToEndMaskApplication:
     """Test that the wavelet mask can be applied to a loss tensor correctly."""

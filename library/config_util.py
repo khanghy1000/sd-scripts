@@ -49,12 +49,108 @@ def add_config_arguments(parser: argparse.ArgumentParser):
     )
 
 
+# Resolution jitter config keys. All three must be specified together for jitter to be active.
+RESOLUTION_JITTER_KEYS = (
+    "resolution_jitter_resolutions",
+    "resolution_jitter_batch_sizes",
+    "resolution_jitter_weights",
+)
+
+
+def _validate_resolution_jitter_level(config: dict, level_name: str) -> bool:
+    """Validate the resolution jitter keys at a single config level (general / dataset / subset).
+
+    Returns True when jitter is active at this level, False when unset.
+    Raises ValueError for partial or invalid configurations.
+    """
+    present = [key for key in RESOLUTION_JITTER_KEYS if config.get(key) is not None]
+    if not present:
+        return False
+
+    if len(present) != len(RESOLUTION_JITTER_KEYS):
+        missing = [key for key in RESOLUTION_JITTER_KEYS if key not in present]
+        raise ValueError(
+            f"{level_name}: resolution jitter requires all of {', '.join(RESOLUTION_JITTER_KEYS)} "
+            f"to be specified together (missing: {', '.join(missing)}) / "
+            f"解像度ジッターには {', '.join(RESOLUTION_JITTER_KEYS)} のすべてを同時に指定する必要があります"
+        )
+
+    resolutions = config["resolution_jitter_resolutions"]
+    batch_sizes = config["resolution_jitter_batch_sizes"]
+    weights = config["resolution_jitter_weights"]
+
+    if not (len(resolutions) == len(batch_sizes) == len(weights)):
+        raise ValueError(
+            f"{level_name}: resolution jitter lists must have the same length "
+            f"(got {len(resolutions)} resolutions, {len(batch_sizes)} batch sizes, {len(weights)} weights) / "
+            f"解像度ジッターのリストはすべて同じ長さである必要があります"
+        )
+    if len(resolutions) == 0:
+        raise ValueError(f"{level_name}: resolution jitter lists must not be empty / 解像度ジッターのリストは空にできません")
+
+    for reso in resolutions:
+        if not isinstance(reso, int) or isinstance(reso, bool) or reso <= 0:
+            raise ValueError(f"{level_name}: resolution jitter resolutions must be positive integers, got {reso!r}")
+    for bs in batch_sizes:
+        if not isinstance(bs, int) or isinstance(bs, bool) or bs < 1:
+            raise ValueError(f"{level_name}: resolution jitter batch sizes must be integers >= 1, got {bs!r}")
+    for weight in weights:
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool) or weight <= 0:
+            raise ValueError(f"{level_name}: resolution jitter weights must be numbers > 0, got {weight!r}")
+
+    return True
+
+
+def validate_resolution_jitter_config(user_config: dict) -> None:
+    """Cross-field validation for resolution jitter settings in a sanitized user config.
+
+    Checks:
+    - all-or-none per level (general / dataset / subset)
+    - equal list lengths, positive values
+    - jitter is incompatible with bucket_no_upscale and multires_training
+    """
+    general_config = user_config.get("general", {})
+    general_jitter_active = _validate_resolution_jitter_level(general_config, "general")
+
+    for i, dataset_config in enumerate(user_config.get("datasets", [])):
+        dataset_jitter_active = _validate_resolution_jitter_level(dataset_config, f"datasets[{i}]")
+
+        subsets_jitter_active = False
+        for j, subset_config in enumerate(dataset_config.get("subsets", [])):
+            if _validate_resolution_jitter_level(subset_config, f"datasets[{i}].subsets[{j}]"):
+                subsets_jitter_active = True
+
+        if not (general_jitter_active or dataset_jitter_active or subsets_jitter_active):
+            continue
+
+        # conflict checks: jitter may upscale images and manages its own multi-resolution buckets
+        bucket_no_upscale = bool(dataset_config.get("bucket_no_upscale", general_config.get("bucket_no_upscale", False)))
+        if bucket_no_upscale:
+            raise ValueError(
+                f"datasets[{i}]: resolution_jitter cannot be used with bucket_no_upscale "
+                f"(jitter may upscale images) / 解像度ジッターはbucket_no_upscaleと併用できません"
+            )
+        multires_training = bool(dataset_config.get("multires_training", general_config.get("multires_training", False)))
+        if multires_training:
+            raise ValueError(
+                f"datasets[{i}]: resolution_jitter cannot be used with multires_training "
+                f"(both manage multi-resolution training) / 解像度ジッターはmultires_trainingと併用できません"
+            )
+
+
 # TODO: inherit Params class in Subset, Dataset
 
 
 @dataclass
 class BaseSubsetParams:
     image_dir: Optional[str] = None
+    resolution: Optional[Tuple[int, int]] = None
+    min_bucket_reso: Optional[int] = None
+    max_bucket_reso: Optional[int] = None
+    batch_size: Optional[int] = None
+    resolution_jitter_resolutions: Optional[List[int]] = None
+    resolution_jitter_batch_sizes: Optional[List[int]] = None
+    resolution_jitter_weights: Optional[List[float]] = None
     num_repeats: int = 1
     shuffle_caption: bool = False
     caption_separator: str = (",",)
@@ -120,6 +216,9 @@ class BaseDatasetParams:
     resize_interpolation: Optional[str] = None
     multires_training: bool = False
     skip_image_resolution: Optional[Tuple[int, int]] = None
+    resolution_jitter_resolutions: Optional[List[int]] = None
+    resolution_jitter_batch_sizes: Optional[List[int]] = None
+    resolution_jitter_weights: Optional[List[float]] = None
 
 @dataclass
 class DreamBoothDatasetParams(BaseDatasetParams):
@@ -193,6 +292,13 @@ class ConfigSanitizer:
 
     # subset schema
     SUBSET_ASCENDABLE_SCHEMA = {
+            "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
+            "min_bucket_reso": int,
+            "max_bucket_reso": int,
+            "batch_size": int,
+        "resolution_jitter_resolutions": [int],
+        "resolution_jitter_batch_sizes": [int],
+        "resolution_jitter_weights": [Any(float, int)],
         "color_aug": bool,
         "gamma_aug": bool,
         "gamma_aug_range": functools.partial(__validate_and_convert_twodim.__func__, float),
@@ -266,6 +372,9 @@ class ConfigSanitizer:
         "resize_interpolation": str,
         "multires_training": bool,
         "skip_image_resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
+        "resolution_jitter_resolutions": [int],
+        "resolution_jitter_batch_sizes": [int],
+        "resolution_jitter_weights": [Any(float, int)],
     }
 
     # options handled by argparse but not handled by user config
@@ -393,11 +502,13 @@ class ConfigSanitizer:
 
     def sanitize_user_config(self, user_config: dict) -> dict:
         try:
-            return self.user_config_validator(user_config)
+            sanitized = self.user_config_validator(user_config)
         except MultipleInvalid:
             # TODO: エラー発生時のメッセージをわかりやすくする
             logger.error("Invalid user config / ユーザ設定の形式が正しくないようです")
             raise
+        validate_resolution_jitter_config(sanitized)
+        return sanitized
 
     # NOTE: In nature, argument parser result is not needed to be sanitize
     #   However this will help us to detect program bug
@@ -612,6 +723,10 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     alpha_mask: {subset.alpha_mask}
                     resize_interpolation: {subset.resize_interpolation}
                     custom_attributes: {subset.custom_attributes}
+                    resolution: {subset.resolution}
+                    min_bucket_reso: {subset.min_bucket_reso}
+                    max_bucket_reso: {subset.max_bucket_reso}
+                    batch_size: {subset.batch_size}
                 """), "  ")
 
                 if is_dreambooth:

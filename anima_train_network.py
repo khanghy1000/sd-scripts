@@ -24,7 +24,10 @@ from library import (
     strategy_base,
     train_util,
 )
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import (
+    apply_snr_weight_for_flow_matching,
+    maybe_apply_antithetic_noise_pairing,
+)
 import library.compile_utils as compile_utils
 import train_network
 from library.utils import setup_logging
@@ -40,14 +43,137 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        # Anima is a flow-matching model; timesteps are returned already in [0, 1]
+        # (divided by 1000), so the HF Tweedie must treat them as sigmas directly.
+        self.hf_prediction_mode = "flow"
+        self.hf_timesteps_in_sigma = True
+        # Same convention for the multiscale x0-prediction anchor loss (flow Tweedie
+        # on sigmas in [0, 1]).
+        self.anchor_prediction_mode = "flow"
+        self.anchor_timesteps_in_sigma = True
         self._ot_logged = False    # fires a one-time first-batch OT log
         self._cfm_logged = False   # fires a one-time first-batch CFM log
         self.ileco_text_encoder_conds = None
         self.ileco_prompt_pairs = None
         self.addift_pair_settings = None
+        # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
+        # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
+        # mutated in place), so a single reusable buffer per key avoids a fresh CUDA
+        # allocation on every forward pass.
+        self._padding_mask_cache = {}
+
+    def get_padding_mask(self, batch_size: int, height: int, width: int, dtype: torch.dtype, device) -> torch.Tensor:
+        """Return a cached zero padding mask for the given shape/dtype/device.
+
+        Creates and caches the buffer on first use; subsequent calls with the same
+        key return the identical tensor, eliminating per-forward allocation churn.
+        """
+        key = (batch_size, height, width, dtype, str(device))
+        mask = self._padding_mask_cache.get(key)
+        if mask is None:
+            mask = torch.zeros(batch_size, 1, height, width, dtype=dtype, device=device)
+            self._padding_mask_cache[key] = mask
+        return mask
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
+
+    def build_adaptive_model_fn(self, unet, accelerator, weight_dtype):
+        """Build Anima-compatible model_fn for Algorithm 2 (adaptive timestep sampling).
+
+        Handles:
+        - 5D latent expansion ([B,C,H,W] -> [B,C,1,H,W])
+        - Timestep scaling to [0, 1] range (divided by 1000)
+        - Conditioning expansion to match arbitrary batch sizes from the adaptive sampler
+        - Anima model's full conditioning signature (prompt_embeds, padding_mask, t5_ids, masks)
+        """
+        anima_model: anima_models.Anima = unet
+        text_conds = self._adaptive_last_text_conds
+
+        # Unpack the 4 core conditioning tensors
+        prompt_embeds = text_conds[0].to(accelerator.device, dtype=weight_dtype)
+        attn_mask = text_conds[1].to(accelerator.device) if len(text_conds) > 1 else None
+        t5_input_ids = text_conds[2].to(accelerator.device, dtype=torch.long) if len(text_conds) > 2 else None
+        t5_attn_mask = text_conds[3].to(accelerator.device) if len(text_conds) > 3 else None
+
+        def model_fn(noisy_latents, timesteps, wdtype):
+            """Model forward compatible with AdaptiveTimestepManager's contract.
+
+            Args:
+                noisy_latents: (N, C, H, W) 4D latents, N may differ from training batch
+                timesteps: (N,) integer timesteps in [0, num_train_timesteps)
+                wdtype: weight dtype for model inference
+
+            Returns:
+                model_output: (N, C, H, W) 4D prediction
+            """
+            N = noisy_latents.shape[0]
+
+            # Expand conditioning to match N
+            if prompt_embeds.shape[0] != N:
+                ep = prompt_embeds[:1].expand(N, -1, -1).contiguous()
+            else:
+                ep = prompt_embeds
+
+            if attn_mask is not None:
+                if attn_mask.shape[0] != N:
+                    em = attn_mask[:1].expand(N, -1).contiguous()
+                else:
+                    em = attn_mask
+            else:
+                em = None
+
+            if t5_input_ids is not None:
+                if t5_input_ids.shape[0] != N:
+                    et5 = t5_input_ids[:1].expand(N, -1).contiguous()
+                else:
+                    et5 = t5_input_ids
+            else:
+                et5 = None
+
+            if t5_attn_mask is not None:
+                if t5_attn_mask.shape[0] != N:
+                    et5m = t5_attn_mask[:1].expand(N, -1).contiguous()
+                else:
+                    et5m = t5_attn_mask
+            else:
+                et5m = None
+
+            # Scale timesteps to [0, 1] range for Anima (Anima expects timesteps / 1000).
+            # IMPORTANT: cast to wdtype (bf16/fp16) to match the training path, where
+            # flux_train_utils.get_noisy_model_input_and_timesteps returns timesteps in
+            # weight_dtype. The sinusoidal embedder inherits the timestep dtype, and the
+            # AdaLN block runs with autocast explicitly disabled (enabled=use_fp32), so a
+            # float32 embedding would crash against bf16 AdaLN weights.
+            anima_ts = (timesteps.float() / 1000.0).to(wdtype)
+
+            # 4D to 5D: [N, C, H, W] -> [N, C, 1, H, W]
+            x_5d = noisy_latents.to(wdtype).unsqueeze(2)
+
+            # Create padding mask matching the latent spatial dimensions
+            h_latent = noisy_latents.shape[-2]
+            w_latent = noisy_latents.shape[-1]
+            padding_mask = self.get_padding_mask(N, h_latent, w_latent, wdtype, noisy_latents.device)
+
+            # Autocast is required: the training forward pass runs under
+            # accelerator.autocast(), which casts the float32 timestep embedding to
+            # the model's weight dtype (bf16/fp16). Without it, bf16 AdaLN linear
+            # layers receive float32 inputs and raise a dtype mismatch error.
+            with torch.no_grad(), accelerator.autocast():
+                output = anima_model(
+                    x_5d,
+                    anima_ts,
+                    ep,
+                    padding_mask=padding_mask,
+                    target_input_ids=et5,
+                    target_attention_mask=et5m,
+                    source_attention_mask=em,
+                )
+
+            # 5D to 4D: [N, C, 1, H, W] -> [N, C, H, W]
+            return output.squeeze(2)
+
+        return model_fn
 
     def assert_extra_args(
         self,
@@ -79,7 +205,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if args.cache_text_encoder_outputs:
             assert train_dataset_group.is_text_encoder_output_cacheable(
                 cache_supports_dropout=True
-            ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+            ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used (use --cache_caption_variants for all but token_warmup_step)"
 
         if args.ileco:
             assert not args.addift, "--ileco and --addift cannot be enabled at the same time"
@@ -251,7 +377,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.qwen3_tokenizer]
 
     def get_latents_caching_strategy(self, args):
-        return strategy_anima.AnimaLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check)
+        return strategy_anima.AnimaLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
+        )
 
     def get_text_encoding_strategy(self, args):
         return strategy_anima.AnimaTextEncodingStrategy()
@@ -267,7 +396,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
             return strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
+                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         return None
 
@@ -454,7 +584,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                         continue
                     if os.path.exists(cache_path):
                         try:
-                            data = np.load(cache_path)
+                            data = train_util.load_npz(cache_path)
                             if "latents" in data and "latents_flipped" in data:
                                 continue
                         except Exception:
@@ -482,10 +612,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                         flipped_latents = self.encode_images_to_latents(args, vae, flipped_image_tensor).to("cpu")
 
                     for info, latent, flipped_latent in zip(batch_infos, latents, flipped_latents):
-                        np.savez(
+                        train_util.save_npz(
                             info.addift_conditioning_latents_npz,
-                            latents=latent.float().numpy(),
-                            latents_flipped=flipped_latent.float().numpy(),
+                            {"latents": latent, "latents_flipped": flipped_latent},
+                            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
                         )
         finally:
             if accelerator.is_main_process:
@@ -640,6 +770,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weight_dtype,
         is_train=True,
     ):
+        # iLECO is a teacher-distillation path: the training target is the teacher's
+        # velocity, so there is no analytic clean x0 for the HF token term — skip it.
+        self._hf_noisy_latents = None
+        # Same for the multiscale x0-prediction anchor loss (no analytic clean x0).
+        self._anchor_noisy_latents = None
         anima: anima_models.Anima = unet
 
         if self.ileco_text_encoder_conds is None:
@@ -650,6 +785,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if latents.ndim == 5:
             latents = latents.squeeze(2)
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise)
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
         )
@@ -675,7 +811,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         bs = latents.shape[0]
         h_latent = latents.shape[-2]
         w_latent = latents.shape[-1]
-        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        padding_mask = self.get_padding_mask(bs, h_latent, w_latent, weight_dtype, accelerator.device)
         noisy_model_input = noisy_model_input.unsqueeze(2)
 
         pair_index = torch.randint(len(self.ileco_text_encoder_conds), (1,)).item()
@@ -721,7 +857,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
         weighting = weighting * args.ileco_loss_weight * pair_conds["weight"]
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def get_addift_noise_pred_and_target(
         self,
@@ -736,6 +872,12 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weight_dtype,
         is_train=True,
     ):
+        # ADDifT is a teacher-distillation path: the student regresses the teacher's
+        # velocity (x0_hat converges to a sigma-dependent blend), so there is no analytic
+        # clean x0 for the HF token term — skip it.
+        self._hf_noisy_latents = None
+        # Same for the multiscale x0-prediction anchor loss (no analytic clean x0).
+        self._anchor_noisy_latents = None
         anima: anima_models.Anima = unet
 
         if network is None or not hasattr(network, "set_multiplier"):
@@ -783,6 +925,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 addift_pair_weight = 1.0
 
         noise = torch.randn_like(source_latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise)
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, source_latents, noise, accelerator.device, weight_dtype
         )
@@ -823,7 +966,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         bs = latents.shape[0]
         h_latent = latents.shape[-2]
         w_latent = latents.shape[-1]
-        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        padding_mask = self.get_padding_mask(bs, h_latent, w_latent, weight_dtype, accelerator.device)
         noisy_model_input = noisy_model_input.unsqueeze(2)
         target_noisy_model_input = target_noisy_model_input.unsqueeze(2)
 
@@ -863,7 +1006,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if addift_mask is not None:
             weighting = weighting * addift_mask
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
@@ -944,6 +1087,20 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Sample noise
         if latents.ndim == 5:  # Fallback for 5D latents (old cache)
             latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
+
+        # Adaptive timestep sampling: use Beta distribution sampler if enabled.
+        # Sample timesteps BEFORE noise so we can store all data for Algorithm 2 after noise is computed.
+        adaptive_fixed_timesteps = fixed_timesteps
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None:
+            adaptive_fixed_timesteps = self.adaptive_manager.sample_timesteps(
+                latents, noise_scheduler.config.num_train_timesteps
+            )
+            # Store latents and args for Algorithm 2. Noise will be stored after it is computed.
+            # Only pin tensors when this is an update step to avoid wasting VRAM.
+            if self._adaptive_update_pending:
+                self._adaptive_last_latents = latents.detach()
+                self._adaptive_last_args = args
+
         noise = torch.randn_like(latents)
 
         if getattr(args, "flow_use_ot", False) and latents.size(0) > 1:
@@ -960,21 +1117,36 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 )
                 self._ot_logged = True
 
+        # Antithetic noise pairing (after OT so pair structure matches sigmas)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
+
+        # Now that noise is computed, store it for Algorithm 2
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None and self._adaptive_update_pending:
+            self._adaptive_last_noise = noise.detach()
+
         # Get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, 
-            noise_scheduler, 
-            latents, 
-            noise, 
-            accelerator.device, 
+            args,
+            noise_scheduler,
+            latents,
+            noise,
+            accelerator.device,
             weight_dtype,
-            fixed_timesteps=fixed_timesteps, 
+            fixed_timesteps=adaptive_fixed_timesteps,
             is_train=is_train,
         )
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
         # Must be stored BEFORE unsqueeze to 5D (wavelet DWT expects 4D)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for High-Frequency Token loss (4D, before 5D unsqueeze)
+        if is_train and self.hf_scale > 0.0:
+            self._hf_noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for the multiscale x0-prediction anchor loss (4D, before 5D unsqueeze)
+        if is_train and self.anchor_scale > 0.0:
+            self._anchor_noisy_latents = noisy_model_input.detach()
 
         # Set T-LoRA timestep mask before timestep scaling (mask expects [0, max_timestep] range)
         self.apply_tlora_mask(timesteps)
@@ -1003,7 +1175,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         bs = latents.shape[0]
         h_latent = latents.shape[-2]
         w_latent = latents.shape[-1]
-        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        padding_mask = self.get_padding_mask(bs, h_latent, w_latent, weight_dtype, accelerator.device)
 
         # Call model
         noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, [B, C, H, W] -> [B, C, 1, H, W]
@@ -1176,6 +1348,23 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             metadata["ss_reverse_weight"] = args.reverse_weight
             metadata["ss_addift_min_sigma"] = args.addift_min_sigma
             metadata["ss_addift_max_sigma"] = args.addift_max_sigma
+
+        # Patch Topology Loss config (runs through inherited NetworkTrainer.process_batch)
+        metadata["ss_patch_topology_loss"] = bool(getattr(args, "patch_topology_loss", False))
+        metadata["ss_patch_topology_weight"] = getattr(args, "patch_topology_weight", 1.0)
+        metadata["ss_patch_topology_tau"] = getattr(args, "patch_topology_tau", 0.1)
+        metadata["ss_patch_topology_scale_levels"] = getattr(args, "patch_topology_scale_levels", 2)
+        metadata["ss_patch_topology_loss_type"] = getattr(args, "patch_topology_loss_type", "kl")
+        metadata["ss_patch_topology_disable_timestep_weight"] = bool(
+            getattr(args, "patch_topology_disable_timestep_weight", False)
+        )
+        metadata["ss_patch_topology_chunk_size"] = getattr(args, "patch_topology_chunk_size", 512)
+        metadata["ss_patch_topology_start_step"] = getattr(args, "patch_topology_start_step", 0)
+        metadata["ss_patch_topology_warmup_steps"] = getattr(args, "patch_topology_warmup_steps", 0)
+        metadata["ss_patch_topology_dynamic_weighting"] = getattr(args, "patch_topology_dynamic_weighting", "none")
+        metadata["ss_patch_topology_dwa_temperature"] = getattr(args, "patch_topology_dwa_temperature", 2.0)
+        metadata["ss_patch_topology_gradnorm_alpha"] = getattr(args, "patch_topology_gradnorm_alpha", 1.5)
+        metadata["ss_patch_topology_dynamic_max_weight"] = getattr(args, "patch_topology_dynamic_max_weight", 10.0)
 
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)

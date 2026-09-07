@@ -1,4 +1,5 @@
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+import math
 import torch
 import argparse
 import random
@@ -160,6 +161,568 @@ def apply_snr_weight_for_flow_matching(
     return loss * snr_weight
 
 
+class _QMCSequenceManager:
+    """Manages low-discrepancy (quasi-random) sequences for timestep sampling.
+
+    Sobol and Halton sequences are deterministic low-discrepancy sequences that
+    fill the unit interval more uniformly than pseudo-random numbers, yielding
+    faster convergence of Monte Carlo estimates (variance ~O((log B)^d / B^d)
+    vs ~O(1/B) for iid). Unlike stratified sampling (which resets every batch),
+    a QMC sequence advances across batches so that over many steps the entire
+    timestep range is covered with minimal discrepancy.
+
+    The manager keeps a global draw counter so consecutive calls produce
+    *different* points (the sequence does not restart at 0 each batch). A
+    scrambled Sobol engine is used for randomization, which preserves the
+    low-discrepancy property while allowing unbiased error estimation.
+
+    Multi-GPU (DDP) support
+    ------------------------
+    Each DDP rank is a separate Python process with its own class-level
+    ``_instances`` dict. If every rank used the same ``seed`` they would all
+    draw the *identical* sequence, so the combined effective batch would be the
+    same ``batch_size`` points repeated ``num_processes`` times — destroying the
+    low-discrepancy property across the DDP dimension. To avoid this, callers
+    pass ``rank`` (the DDP process index); the manager offsets the scramble
+    seed by ``rank`` so each rank draws from a *different* scrambled sequence.
+    Scrambling preserves the low-discrepancy property of each individual
+    sequence, so every rank still gets a space-filling set of points, and the
+    combined batch across ranks has no duplicate points. (This is simpler and
+    more robust than fast-forwarding a single global sequence, which would
+    require the total draw count to remain a power of two for Sobol's balance
+    properties.)
+
+    Supported methods:
+        "sobol":  Scrambled Sobol sequence (torch.quasirandom.SobolEngine).
+        "halton": Halton sequence (scipy.stats.qmc.Halton, scrambled).
+        "sobol_jittered": Sobol sequence used as within-stratum jitter; each
+            batch of ``n`` draws is placed one point per equal stratum of
+            [0,1] (strata assignment randomly permuted), combining per-batch
+            stratified coverage with low-discrepancy jitter across batches.
+        "halton_jittered": Same, with a Halton sequence as the jitter source.
+
+    Sobol base-2 alignment
+    ----------------------
+    Sobol sequences only have their optimal balance (low-discrepancy)
+    properties when the *total* number of generated points is a power of two.
+    When a draw of ``n = 2**m`` points is requested and the running total is
+    not a multiple of ``n``, the manager first draws and discards
+    ``(-total) % n`` padding points so every batch is a balanced base-2 block.
+    Padding is counted in ``_draw_count`` so checkpoint save/resume fast-forward
+    reproduces the exact same sequence position.
+
+    Note on performance
+    -------------------
+    Both Sobol (``torch.quasirandom.SobolEngine``) and Halton (``scipy.stats.qmc``)
+    generate points on the CPU; the result is then moved to the target device.
+    For typical batch sizes (1-32) this host->device transfer is negligible, but
+    it is a per-step sync point. There is no native CUDA Sobol/Halton generator
+    in torch, so this cost is unavoidable with the current engines.
+    """
+
+    _instances: dict = {}  # keyed by (method, seed) -> _QMCSequenceManager
+
+    def __new__(cls, method: str = "sobol", seed: int = 0, rank: int = 0):
+        key = (method, seed, rank)
+        if key not in cls._instances:
+            cls._instances[key] = super().__new__(cls)
+            cls._instances[key]._initialized = False
+        return cls._instances[key]
+
+    def __init__(self, method: str = "sobol", seed: int = 0, rank: int = 0):
+        if self._initialized:
+            return
+        self.method = method
+        self.seed = seed
+        self.rank = rank
+        # Total number of points consumed so far (across all draws). Used for
+        # checkpoint save/resume fast-forward (see state_dict/load_state_dict).
+        self._draw_count = 0
+        # Offset the scramble seed by rank so each DDP rank draws from a
+        # different scrambled low-discrepancy sequence (no duplicate points
+        # across ranks, each still space-filling).
+        effective_seed = seed + rank
+        # Jittered variants use the named base sequence as within-stratum
+        # jitter; one point per stratum per batch (stratified-QMC hybrid).
+        self.jittered = method.endswith("_jittered")
+        self._engine_kind = "sobol" if method.startswith("sobol") else ("halton" if method.startswith("halton") else None)
+        if self._engine_kind == "sobol":
+            # Scrambled Sobol for unbiased error estimation; dimension=1 (timestep).
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
+        elif self._engine_kind == "halton":
+            try:
+                from scipy.stats import qmc as scipy_qmc
+            except ImportError as e:
+                raise ImportError(
+                    "Halton QMC timestep sampling requires scipy. Install it with: pip install scipy"
+                ) from e
+            self._scipy_qmc = scipy_qmc
+            self._halton = scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
+        else:
+            raise ValueError(
+                f"Unknown QMC method: {method!r}. Use 'sobol', 'halton', 'sobol_jittered' or 'halton_jittered'."
+            )
+        self._initialized = True
+
+    @classmethod
+    def clear_instances(cls):
+        """Drop all cached singleton instances.
+
+        Useful for test isolation (so one test's drawn-ahead sequence does not
+        leak into the next) and for forcing a fresh sequence on demand. After
+        calling this, subsequent ``_QMCSequenceManager(...)`` constructions build
+        new engines from their seed.
+        """
+        cls._instances.clear()
+
+    def draw(self, n: int, device: Union[str, torch.device] = "cpu") -> torch.Tensor:
+        """Draw the next ``n`` points of the low-discrepancy sequence.
+
+        Returns a tensor of shape (n,) in [0, 1] on ``device``.
+        """
+        if n <= 0:
+            # Guard: a zero/negative draw is a no-op returning an empty tensor.
+            # Avoids passing 0 to SobolEngine.draw / Halton.random (undefined).
+            return torch.empty(0, device=device, dtype=torch.float32)
+        if self._engine_kind == "sobol":
+            # Sobol sequences have optimal low-discrepancy when the *total* number
+            # of generated points is a power of two. When n is a power of two,
+            # pad the running total up to a multiple of n (discarding the
+            # padding points) so every batch is a balanced base-2 block drawn
+            # via draw_base2; otherwise fall back to draw() (always valid, just
+            # slightly less optimal).
+            n_is_pow2 = n > 0 and (n & (n - 1)) == 0
+            if n_is_pow2:
+                # Align the running total to a multiple of n (discarding the
+                # padding points) so every batch is a balanced Sobol block: any
+                # 2^m consecutive points starting at a multiple of 2^m form a
+                # (0,m,1)-net. Use draw_base2 when the cumulative total lands
+                # on a power of two (torch's API requires this); otherwise a
+                # plain aligned draw() is still balanced and always valid.
+                pad = (-self._draw_count) % n
+                if pad:
+                    self._sobol.draw(pad)
+                    self._draw_count += pad
+                total_after = self._draw_count + n
+                if (total_after & (total_after - 1)) == 0:
+                    pts = self._sobol.draw_base2(int(math.log2(n))).squeeze(-1)
+                else:
+                    pts = self._sobol.draw(n).squeeze(-1)
+            else:
+                # SobolEngine draws on CPU; move to target device.
+                pts = self._sobol.draw(n).squeeze(-1)
+            pts = pts.to(dtype=torch.float32)
+        else:
+            # Halton via scipy (CPU), then move to device.
+            pts = torch.from_numpy(self._halton.random(n).squeeze(-1)).to(dtype=torch.float32)
+        self._draw_count += n
+        if self.jittered:
+            # Stratified-QMC hybrid: use each sequence point as the within-
+            # stratum offset and assign points to a random permutation of the n
+            # equal strata, guaranteeing one point per stratum per batch.
+            perm = torch.randperm(n, dtype=torch.float32)
+            pts = (perm + pts) / n
+        return pts.to(device=device)
+
+    def reset(self):
+        """Reset the sequence to the beginning (e.g. for reproducibility)."""
+        self._draw_count = 0
+        effective_seed = self.seed + self.rank
+        if self._engine_kind == "sobol":
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
+        else:
+            self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
+
+    def state_dict(self) -> dict:
+        """Return a serializable snapshot of the sequence position.
+
+        Only the draw count is needed to reconstruct the sequence position
+        (the engine is deterministic given the seed and rank). The rank is
+        re-derived on construction, so it is stored for traceability only.
+        """
+        return {"method": self.method, "seed": self.seed, "rank": self.rank, "draw_count": self._draw_count}
+
+    def load_state_dict(self, state: dict):
+        """Restore the sequence position from a ``state_dict`` snapshot.
+
+        Rebuilds the engine from the (rank-offset) seed and fast-forwards by
+        ``draw_count`` so that subsequent draws continue the sequence exactly
+        where it left off. This makes QMC reproducible across checkpoint resume,
+        preserving the cumulative coverage benefit.
+        """
+        target = int(state.get("draw_count", 0))
+        # Rebuild from scratch so the fast-forward is exact.
+        self._draw_count = 0
+        effective_seed = self.seed + self.rank
+        if self._engine_kind == "sobol":
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
+        else:
+            self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
+        # Fast-forward to the saved position.
+        if target > 0:
+            if self._engine_kind == "sobol":
+                self._sobol.fast_forward(target)
+            else:
+                self._halton.random(target)
+            self._draw_count = target
+
+
+def compute_density_for_timestep_sampling(
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    antithetic: bool = False,
+    stratified: bool = False,
+    qmc: str = None,
+    device: Union[str, torch.device] = "cpu",
+    sigmoid_scale: float = 1.0,
+    qmc_seed: int = 0,
+    rank: int = 0,
+) -> torch.Tensor:
+    """Compute the density for sampling the timesteps when doing SD3/Flux training.
+
+    This is the single canonical implementation shared by the SD3, Flux, Lumina
+    and flow-model (train_util) trainers. It supersedes the per-module copies that
+    previously existed in ``sd3_train_utils``, ``flux_train_utils`` and
+    ``lumina_train_util``.
+
+    Courtesy: This was contributed by Rafie Walker in
+    https://github.com/huggingface/diffusers/pull/8528.
+    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+
+    Variance-reduction methods (precedence order is ``antithetic`` then
+    ``qmc`` then ``stratified``; antithetic and qmc compose, see below):
+
+    * ``antithetic=True``: the base randomness is drawn as mirrored pairs
+      ((z, -z) for logit_normal, (u, 1-u) for mode/uniform) before applying the
+      same deterministic transform, preserving the marginal distribution while
+      reducing sampling variance. Most effective at small batch sizes (4-8).
+      Odd batch sizes are handled by truncating the last mirrored pair.
+
+    * ``qmc="sobol"|"halton"``: use a low-discrepancy (quasi-random) sequence for
+      the base uniform. These sequences fill [0,1] more uniformly than
+      pseudo-random numbers, yielding faster convergence than iid (and often
+      better than stratified at moderate batch sizes). The sequence advances
+      across batches via a global counter, so over many steps the entire
+      timestep range is covered with minimal discrepancy. Composes with the
+      deterministic distribution transform and any shift.
+
+    * ``stratified=True``: the unit interval is partitioned into ``batch_size``
+      equal strata and one uniform is drawn inside each stratum. This guarantees
+      coverage of the whole timestep range every batch and scales better than
+      antithetic as batch size grows (variance ~1/B^3 vs ~1/B). Works for any
+      batch size including odd. Only applies to the *base* uniform variate, so
+      it composes with the deterministic distribution transform and any shift.
+
+    Antithetic + QMC composition
+    ----------------------------
+    Unlike stratified, antithetic and qmc are not mutually exclusive: when
+    both are set, ``batch_size // 2`` low-discrepancy points are drawn and each
+    is mirrored as ``(u, 1-u)`` (for uniform/mode) or ``(z, -z)`` (for
+    logit_normal/sigmoid, where ``z = logit(u)``). This "antithetic QMC"
+    combines Sobol's space-filling property with pairwise variance
+    cancellation, and is strictly better than either method alone in many
+    settings. Odd batch sizes truncate the last mirrored pair. Only ``qmc``
+    and ``stratified`` conflict (qmc wins); a warning is logged in that case.
+
+    Args:
+        weighting_scheme: One of "logit_normal", "mode", "uniform", "sigmoid".
+            ("uniform" and "sigmoid" are accepted for the flow path; the SD3
+            density originally only used logit_normal/mode/uniform.)
+        batch_size: Number of sigmas to draw.
+        logit_mean: Mean of the logit-normal base distribution.
+        logit_std: Std of the logit-normal base distribution.
+        mode_scale: Scale for the "mode" weighting scheme.
+        antithetic: If True, draw mirrored base-variates pairs.
+        stratified: If True, use stratified sampling on the base uniform.
+        qmc: If set to "sobol" or "halton", use a low-discrepancy sequence for
+            the base uniform.
+        device: Device on which to generate the tensor. Defaults to "cpu" for
+            backward compatibility with the original SD3 density, but callers on
+            CUDA should pass the target device to avoid a host->device sync.
+        sigmoid_scale: Scale of the normal base for "sigmoid" sampling.
+        qmc_seed: Seed for the (scrambled) QMC sequence. Only used when ``qmc``
+            is set.
+        rank: DDP process index. When greater than 0, the QMC scramble seed is
+            offset by ``rank`` so each rank draws from a different scrambled
+            low-discrepancy sequence (no duplicate points across ranks, each
+            still space-filling). Only used when ``qmc`` is set.
+
+    Returns:
+        Tensor of shape (batch_size,) of base variates in [0, 1] on ``device``.
+    """
+    # Short-circuit: a single sample cannot benefit from any variance reduction.
+    if batch_size <= 1:
+        antithetic = False
+        stratified = False
+        qmc = None
+
+    # Resolve precedence: antithetic composes with qmc (antithetic-QMC). Only
+    # qmc-vs-stratified and antithetic-vs-stratified conflict (both qmc and
+    # antithetic win over stratified, since stratified replaces the base uniform
+    # entirely and cannot compose with either). Warn on conflicts.
+    if stratified and (qmc is not None or antithetic):
+        winner = "QMC (%s)" % qmc if qmc is not None else "antithetic"
+        logger.warning(
+            "Both %s and stratified timestep sampling were requested; "
+            "%s takes precedence and stratified is ignored." % (winner, winner)
+        )
+        stratified = False
+
+    n_pairs = (batch_size + 1) // 2 if antithetic else batch_size
+
+    # QMC produces base uniforms in [0,1]; apply the same deterministic transform.
+    # When antithetic is also set, draw only n_pairs points and mirror them
+    # (antithetic-QMC composition: combines low-discrepancy coverage with
+    # pairwise variance cancellation).
+    if qmc is not None:
+        qmc_mgr = _QMCSequenceManager(method=qmc, seed=qmc_seed, rank=rank)
+        u_base = qmc_mgr.draw(n_pairs, device=device)
+
+    if weighting_scheme == "logit_normal":
+        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
+        if qmc is not None:
+            # Map the low-discrepancy uniform through the inverse-CDF (logit)
+            # to get a low-discrepancy sample under the logit-normal distribution.
+            z = torch.logit(u_base.clamp(1e-7, 1 - 1e-7))
+            if antithetic:
+                # Antithetic-QMC: mirror the standardized z so the pair is
+                # symmetric about the mean.
+                z = torch.cat([z, -z])[:batch_size]
+            u = torch.nn.functional.sigmoid(logit_mean + logit_std * z)
+        else:
+            # Mirror the standardized z so the pair is symmetric about the mean.
+            z = torch.normal(mean=0.0, std=1.0, size=(n_pairs,), device=device)
+            if antithetic:
+                z = torch.cat([z, -z])[:batch_size]
+            u = torch.nn.functional.sigmoid(logit_mean + logit_std * z)
+    elif weighting_scheme == "mode":
+        if qmc is not None:
+            if antithetic:
+                # Antithetic-QMC: mirror the base uniform before the transform.
+                u_base = torch.cat([u_base, 1.0 - u_base])[:batch_size]
+            u = 1 - u_base - mode_scale * (torch.cos(math.pi * u_base / 2) ** 2 - 1 + u_base)
+        else:
+            u = torch.rand(size=(n_pairs,), device=device)
+            if antithetic:
+                u = torch.cat([u, 1.0 - u])[:batch_size]
+            u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
+    elif weighting_scheme == "sigmoid":
+        # XLabs-AI style: sigma = sigmoid(scale * z).
+        if qmc is not None:
+            z = torch.logit(u_base.clamp(1e-7, 1 - 1e-7))
+            if antithetic:
+                # Antithetic-QMC: mirror the standardized z.
+                z = torch.cat([z, -z])[:batch_size]
+            u = torch.sigmoid(sigmoid_scale * z)
+        else:
+            z = torch.normal(mean=0.0, std=1.0, size=(n_pairs,), device=device)
+            if antithetic:
+                z = torch.cat([z, -z])[:batch_size]
+            u = torch.sigmoid(sigmoid_scale * z)
+    else:
+        # "uniform" (and any unknown scheme falls back to uniform).
+        if qmc is not None:
+            if antithetic:
+                # Antithetic-QMC: mirror the base uniform.
+                u_base = torch.cat([u_base, 1.0 - u_base])[:batch_size]
+            u = u_base
+        elif stratified:
+            # One uniform per equal-width stratum: guarantees full [0,1] coverage.
+            edges = torch.arange(batch_size, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(batch_size, device=device)) / batch_size
+        else:
+            u = torch.rand(size=(n_pairs,), device=device)
+            if antithetic:
+                u = torch.cat([u, 1.0 - u])[:batch_size]
+    return u
+
+
+def compute_antithetic_sigmas(
+    batch_size: int,
+    distribution: str,
+    device: torch.device,
+    logit_mean: float = 0.0,
+    logit_std: float = 1.0,
+    sigmoid_scale: float = 1.0,
+) -> torch.Tensor:
+    """Sample flow-matching sigmas with antithetic pairing for variance reduction.
+
+    .. deprecated::
+        Thin backward-compatible wrapper around
+        :func:`compute_density_for_timestep_sampling` with ``antithetic=True``.
+        New code should call that function directly.
+
+    The batch is filled with mirrored pairs of the *base* randomness, and the
+    configured distribution transform is applied identically to both members of
+    each pair. Because the base variate of a mirrored pair (z, -z) or (u, 1-u)
+    has the same marginal distribution as an i.i.d. draw, the batch remains
+    marginally distributed according to the configured distribution while
+    cancelling a large fraction of sampling variance.
+
+    Supported distributions:
+        "uniform":      u ~ U(0,1);           pair = (u, 1-u)
+        "logit_normal": sigma = sigmoid(mean + std*z), z ~ N(0,1); pair = (z, -z)
+        "sigmoid":      sigma = sigmoid(scale*z), z ~ N(0,1);       pair = (z, -z)
+        "mode":         u ~ U(0,1) transformed; pair = (u, 1-u)
+
+    Any downstream *deterministic* transform of sigma (e.g. the SD3/Flux shift
+    sigma' = s*sigma / (1 + (s-1)*sigma)) may be applied afterwards and still
+    respects the intended final distribution.
+
+    Args:
+        batch_size: Number of sigmas to draw. Odd batch sizes are handled by
+            truncating the last mirrored pair.
+        distribution: One of "uniform", "logit_normal", "sigmoid", "mode".
+        device: Torch device for the returned tensor.
+        logit_mean: Mean of the logit-normal base distribution.
+        logit_std: Std of the logit-normal base distribution.
+        sigmoid_scale: Scale of the normal base for "sigmoid" sampling.
+
+    Returns:
+        Tensor of shape (batch_size,) on ``device``, float32.
+    """
+    # Preserve the strict validation of the original implementation: only the
+    # explicitly supported distributions are accepted here (the canonical
+    # density function falls back to uniform for unknown schemes, which is the
+    # desired behavior for the SD3 weighting_scheme path but not for this
+    # dedicated antithetic helper).
+    _SUPPORTED = ("uniform", "logit_normal", "sigmoid", "mode")
+    if distribution not in _SUPPORTED:
+        raise ValueError(f"Unknown antithetic sigma distribution: {distribution}")
+    return compute_density_for_timestep_sampling(
+        weighting_scheme=distribution,
+        batch_size=batch_size,
+        logit_mean=logit_mean,
+        logit_std=logit_std,
+        mode_scale=1.29,  # SD3 default; only used for "mode"
+        antithetic=True,
+        device=device,
+        sigmoid_scale=sigmoid_scale,
+    )
+
+
+def apply_flow_shift(sigmas: torch.Tensor, shift) -> torch.Tensor:
+    """Apply the SD3/Flux timestep shift: sigma' = s*sigma / (1 + (s-1)*sigma).
+
+    Args:
+        sigmas: Tensor of sigmas in [0, 1].
+        shift: Positive scalar or per-sample tensor of shift ratios.
+    """
+    return (sigmas * shift) / (1.0 + (shift - 1.0) * sigmas)
+
+
+def apply_antithetic_noise_pairing(noise: torch.Tensor) -> torch.Tensor:
+    """Mirror the noise tensor as antithetic pairs along the batch dimension.
+
+    Given a noise tensor of shape (B, ...), the first ``ceil(B/2)`` entries are
+    kept and the remaining entries are replaced by their negation, so sample
+    ``i`` and sample ``i + ceil(B/2)`` form a mirrored pair ``(eps, -eps)``.
+    This matches the pair ordering of
+    :func:`compute_density_for_timestep_sampling` with ``antithetic=True``
+    (base draws first, mirrored copies second), so composing both pairs the
+    timestep *and* the noise of each sample with its partner.
+
+    Because ``-eps`` has the same marginal distribution as ``eps`` for a
+    symmetric Gaussian, the marginal noise distribution is unchanged; only the
+    joint (within-batch) correlation structure is altered, which cancels a
+    large fraction of gradient variance from the flow-matching target
+    ``v = eps - x0``.
+
+    Odd batch sizes truncate the last mirrored pair. Batch sizes <= 1 are a
+    no-op (a single sample cannot benefit from pairing).
+
+    Args:
+        noise: Noise tensor of shape (B, ...).
+
+    Returns:
+        Tensor of the same shape and dtype with mirrored-pair structure.
+    """
+    bsz = noise.shape[0]
+    if bsz <= 1:
+        return noise
+    n_pairs = (bsz + 1) // 2
+    base = noise[:n_pairs]
+    return torch.cat([base, -base], dim=0)[:bsz]
+
+
+def maybe_apply_antithetic_noise_pairing(args, noise: torch.Tensor, is_train: bool = True) -> torch.Tensor:
+    """Apply :func:`apply_antithetic_noise_pairing` when enabled on ``args``.
+
+    Convenience guard for trainer call sites: pairs the noise only during
+    training and only when ``--antithetic_noise_pairing`` is set. Call this
+    immediately after sampling (and any OT reassignment of) the noise, so the
+    paired noise is used both for the noisy input *and* the loss target.
+    """
+    if is_train and getattr(args, "antithetic_noise_pairing", False):
+        return apply_antithetic_noise_pairing(noise)
+    return noise
+
+
+def apply_token_mining(
+    loss: torch.Tensor,
+    sigmas: Optional[torch.Tensor] = None,
+    alpha: float = 1.0,
+    min_weight: float = 0.25,
+    max_weight: float = 4.0,
+    sigma_gate: bool = True,
+) -> torch.Tensor:
+    """Token-level hard-example mining for per-element (spatial) losses.
+
+    Computes a per-token difficulty map from the *detached* per-element loss,
+    converts it to multiplicative weights, and reweights the loss so that hard
+    spatial tokens (edges, textures) contribute more gradient than easy ones
+    (flat regions). Weights are detached, so the model cannot inflate its own
+    mining weights.
+
+    Weight construction per sample:
+        w_i = clamp((L_i / median(L)) ** alpha, min_weight, max_weight)
+    followed by renormalization to mean 1 per sample, so the overall loss scale
+    matches the plain mean reduction.
+
+    When ``sigma_gate`` is enabled and ``sigmas`` are provided, mining strength
+    is gated by g(sigma) = clip(4*sigma*(1-sigma), 0, 1): full strength at
+    mid-schedule, disabled at the sigma extremes (where per-token loss
+    variation is mostly irreducible noise). The gate blends weights toward
+    uniform: w = 1 + g*(w-1), again renormalized to mean 1.
+
+    Args:
+        loss: Per-element loss, shape (B, C, ...) with >= 3 dims (e.g. (B,C,H,W)).
+            Tensors with fewer than 3 dims are returned unchanged.
+        sigmas: Optional per-sample flow-matching sigmas, shape (B,) or (B,1,...).
+        alpha: Difficulty exponent. Higher values concentrate more weight on
+            hard tokens.
+        min_weight / max_weight: Clamp bounds for the mining weights, relative
+            to uniform (1.0).
+        sigma_gate: Enable the sigma-dependent strength gate.
+
+    Returns:
+        Weighted loss tensor, same shape and dtype as ``loss``.
+    """
+    if loss.ndim < 3:
+        return loss
+
+    with torch.no_grad():
+        per_token = loss.detach().to(torch.float32).mean(dim=1)  # (B, ...) e.g. (B,H,W)
+        flat = per_token.flatten(1)  # (B, N)
+        med = flat.median(dim=1, keepdim=True).values.clamp(min=1e-12)
+        w = (flat / med) ** alpha
+        w = w.clamp(min_weight, max_weight)
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-12)
+
+        if sigma_gate and sigmas is not None:
+            s = sigmas.detach().reshape(sigmas.shape[0], -1)[:, 0].to(torch.float32).clamp(0.0, 1.0)
+            g = (4.0 * s * (1.0 - s)).clamp(0.0, 1.0).unsqueeze(1)  # (B, 1)
+            w = 1.0 + g * (w - 1.0)
+            w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-12)
+
+        w = w.view(per_token.shape).unsqueeze(1)  # (B, 1, ...)
+
+    return loss * w.to(dtype=loss.dtype, device=loss.device)
+
+
 def scale_v_prediction_loss_like_noise_prediction(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler):
     scale = get_snr_scale(timesteps, noise_scheduler)
     loss = loss * scale
@@ -251,6 +814,212 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "FFLのスペクトル重み行列のalphaスケーリング係数。"
         "モデルが困難な周波数にどれだけ集中するかを制御する（デフォルト: 1.0）",
     )
+    # Patch Topology Loss arguments
+    parser.add_argument(
+        "--patch_topology_loss",
+        action="store_true",
+        help="Enable VAE-Free Independent Patch Self-Similarity Topology Loss. "
+        "Computes spatial patch affinity matrices on predicted and target representations "
+        "and matches their topology across multi-scale octaves. / "
+        "VAEフリーのパッチ自己類似度トポロジー損失を有効にする。"
+        "予測表現とターゲット表現の空間パッチアフィニティ行列を計算し、"
+        "マルチスケールオクターブ間でトポロジーを一致させる",
+    )
+    parser.add_argument(
+        "--patch_topology_weight",
+        type=float,
+        default=1.0,
+        help="Overall loss weight scaling factor for Patch Topology Loss (default: 1.0) / "
+        "Patch Topology Lossの全体損失重みスケーリング係数（デフォルト: 1.0）",
+    )
+    parser.add_argument(
+        "--patch_topology_tau",
+        type=float,
+        default=0.1,
+        help="Softmax temperature scaling factor for patch affinity distributions (default: 0.1) / "
+        "パッチアフィニティ分布のSoftmax温度スケーリング係数（デフォルト: 0.1）",
+    )
+    parser.add_argument(
+        "--patch_topology_scale_levels",
+        type=int,
+        default=2,
+        help="Number of spatial pyramid octaves for Patch Topology Loss (default: 2) / "
+        "Patch Topology Lossの空間ピラミッドオクターブ数（デフォルト: 2）",
+    )
+    parser.add_argument(
+        "--patch_topology_loss_type",
+        type=str,
+        default="kl",
+        help="Distance metric between patch affinity distributions ('kl', 'ce', 'cosine', 'l2') "
+        "(default: 'kl') / パッチアフィニティ分布間の距離指標（デフォルト: 'kl'）",
+    )
+    parser.add_argument(
+        "--patch_topology_disable_timestep_weight",
+        action="store_true",
+        help="Disable timestep decay weighting (1 - t) in Patch Topology Loss. / "
+        "Patch Topology Lossのタイムステップ減衰重み付け（1 - t）を無効にする",
+    )
+    parser.add_argument(
+        "--patch_topology_chunk_size",
+        type=int,
+        default=512,
+        help="Chunk size for spatial query patches in Patch Topology Loss to limit VRAM usage (default: 512) / "
+        "Patch Topology LossのVRAM使用量を制限するための空間クエリパッチのチャンクサイズ（デフォルト: 512）",
+    )
+    parser.add_argument(
+        "--patch_topology_start_step",
+        type=int,
+        default=0,
+        help="Training step at which to start applying Patch Topology Loss (default: 0). "
+        "Before this step, the loss is skipped entirely. / "
+        "Patch Topology Lossの適用を開始するトレーニングステップ（デフォルト: 0）。"
+        "このステップ以前は損失は完全にスキップされる",
+    )
+    parser.add_argument(
+        "--patch_topology_warmup_steps",
+        type=int,
+        default=0,
+        help="Number of steps to linearly ramp Patch Topology Loss weight from 0 to full weight "
+        "after start_step (default: 0 = no warmup). / "
+        "start_step後にPatch Topology Lossの重みを0から目標重みまで線形に増加させるステップ数"
+        "（デフォルト: 0 = ウォームアップなし）",
+    )
+    parser.add_argument(
+        "--patch_topology_dynamic_weighting",
+        type=str,
+        default="none",
+        choices=["none", "dwa", "gradnorm"],
+        help="Dynamic multi-loss weighting strategy for Patch Topology Loss relative to the base loss. "
+        "'none': static patch_topology_weight; 'dwa': Dynamic Weight Averaging by recent loss decrease rates; "
+        "'gradnorm': direct GradNorm balancing gradient norms on trainable network parameters "
+        "(default: 'none') / "
+        "Patch Topology Lossの動的マルチ損失重み付け戦略。"
+        "'none': 静的な重み、'dwa': 最近の損失減少率による動的重み平均、"
+        "'gradnorm': 勾配ノルムに基づくGradNormバランシング（デフォルト: 'none'）",
+    )
+    parser.add_argument(
+        "--patch_topology_dwa_temperature",
+        type=float,
+        default=2.0,
+        help="Temperature T for DWA dynamic weighting; higher values produce smoother weights (default: 2.0) / "
+        "DWA動的重み付けの温度T。値が大きいほど重みが滑らかになる（デフォルト: 2.0）",
+    )
+    parser.add_argument(
+        "--patch_topology_gradnorm_alpha",
+        type=float,
+        default=1.5,
+        help="Alpha exponent controlling relative training-rate strength for GradNorm weighting (default: 1.5) / "
+        "GradNorm重み付けの相対学習率の強さを制御するalpha指数（デフォルト: 1.5）",
+    )
+    parser.add_argument(
+        "--patch_topology_dynamic_max_weight",
+        type=float,
+        default=10.0,
+        help="Maximum clamp for dynamically-computed Patch Topology Loss weights (default: 10.0) / "
+        "動的に計算されたPatch Topology Loss重みの最大クランプ値（デフォルト: 10.0）",
+    )
+
+    parser.add_argument(
+        "--token_mining",
+        action="store_true",
+        help="Enable token-level hard-example mining on the spatial loss. Reweights latent tokens "
+        "by detached per-token difficulty (median-normalized, clamped, renormalized), so hard "
+        "spatial regions contribute more gradient. Best suited to flow-matching DiT training. / "
+        "空間損失にトークンレベルのハードマイニングを有効にする",
+    )
+    parser.add_argument(
+        "--token_mining_alpha",
+        type=float,
+        default=1.0,
+        help="Difficulty exponent for token mining weights (default: 1.0). Higher concentrates more "
+        "weight on hard tokens. / トークンマイニング重みの難易度指数（デフォルト: 1.0）",
+    )
+    parser.add_argument(
+        "--token_mining_min_weight",
+        type=float,
+        default=0.25,
+        help="Minimum mining weight relative to uniform (default: 0.25) / 一様重みに対する最小マイニング重み",
+    )
+    parser.add_argument(
+        "--token_mining_max_weight",
+        type=float,
+        default=4.0,
+        help="Maximum mining weight relative to uniform (default: 4.0) / 一様重みに対する最大マイニング重み",
+    )
+    parser.add_argument(
+        "--token_mining_no_sigma_gate",
+        action="store_true",
+        help="Disable the sigma-dependent gate (4*sigma*(1-sigma)) that reduces mining strength at "
+        "timestep extremes. / タイムステップ両端でマイニング強度を下げるシグマゲートを無効にする",
+    )
+    parser.add_argument(
+        "--antithetic_timestep_sampling",
+        action="store_true",
+        help="Enable antithetic sigma sampling for flow-matching trainers: the batch is filled with "
+        "mirrored pairs of the base randomness ((u, 1-u) for uniform, (z, -z) for normal-based "
+        "distributions) before applying the configured distribution transform (logit_normal/uniform/"
+        "sigmoid/mode) and any shift. Preserves the marginal timestep distribution while reducing "
+        "sampling variance; most effective at small batch sizes (4-8). Note: with gradient "
+        "accumulation or multi-GPU (DDP) the pairing may be split across micro-batches/ranks, "
+        "reducing the variance-reduction benefit. / "
+        "フローマッチングで対称（アンチセティック）なタイムステップサンプリングを有効にする",
+    )
+    parser.add_argument(
+        "--stratified_timestep_sampling",
+        action="store_true",
+        help="Enable stratified sigma sampling for flow-matching trainers: the unit interval is "
+        "partitioned into batch_size equal strata and one uniform is drawn inside each, guaranteeing "
+        "full coverage of the timestep range every batch. Scales better than antithetic as batch "
+        "size grows (variance ~1/B^3 vs ~1/B) and works for any batch size including odd. Only "
+        "applies to the base uniform variate, so it composes with the distribution transform and "
+        "shift. If both this and --qmc_timestep_sampling are set, qmc takes precedence and "
+        "stratified is ignored. / "
+        "フローマッチングで層化（ストラティファイド）タイムステップサンプリングを有効にする",
+    )
+    parser.add_argument(
+        "--qmc_timestep_sampling",
+        type=str,
+        default=None,
+        choices=["sobol", "halton", "sobol_jittered", "halton_jittered"],
+        help="Enable quasi-Monte Carlo (low-discrepancy) sigma sampling for flow-matching "
+        "trainers: a Sobol or Halton sequence is used for the base uniform instead of "
+        "pseudo-random numbers. These sequences fill [0,1] more uniformly, yielding faster "
+        "convergence than iid (and often better than stratified at moderate batch sizes). "
+        "The sequence advances across batches via a global counter, so over many steps the "
+        "entire timestep range is covered with minimal discrepancy. Composes with the "
+        "distribution transform and shift. Antithetic and qmc compose (antithetic-QMC: "
+        "batch_size//2 low-discrepancy points are drawn and mirrored); only qmc and "
+        "stratified conflict (qmc wins, a warning is logged). DDP-safe: each rank "
+        "offsets its scramble seed by its process index so ranks draw from different "
+        "scrambled sequences (no duplicate points). The sequence position is "
+        "saved/restored across checkpoint resume. 'halton' requires scipy. The "
+        "'*_jittered' variants use the sequence as within-stratum jitter: one "
+        "point per equal stratum of [0,1] per batch (randomly permuted strata), "
+        "combining per-batch stratified coverage with low-discrepancy jitter. "
+        "Sobol draws are base-2 aligned: power-of-two batch sizes always produce "
+        "balanced low-discrepancy blocks. / "
+        "フローマッチングで準モンテカルロ（低差異）タイムステップサンプリングを有効にする",
+    )
+    parser.add_argument(
+        "--qmc_seed",
+        type=int,
+        default=0,
+        help="Seed for the scrambled QMC sequence (default: 0). Only used when "
+        "--qmc_timestep_sampling is set. / QMCシーケンスのシード（デフォルト: 0）",
+    )
+    parser.add_argument(
+        "--antithetic_noise_pairing",
+        action="store_true",
+        help="Mirror the Gaussian noise as antithetic pairs (eps, -eps) along the batch dimension "
+        "for flow-matching trainers, using the same pair ordering as --antithetic_timestep_sampling "
+        "(sample i pairs with sample i + ceil(B/2)). Since -eps has the same marginal distribution "
+        "as eps, this preserves the marginal while cancelling gradient variance from the "
+        "flow-matching target v = eps - x0. Most effective when combined with "
+        "--antithetic_timestep_sampling so each mirrored timestep pair also uses mirrored noise. "
+        "Odd batch sizes truncate the last pair; batch size 1 is a no-op. / "
+        "ガウシアンノイズを対称ペア（eps, -eps）としてミラーリングし、勾配分散を低減する",
+    )
+
     if support_weighted_captions:
         parser.add_argument(
             "--weighted_captions",

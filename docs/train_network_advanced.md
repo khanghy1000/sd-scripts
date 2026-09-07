@@ -92,6 +92,9 @@ Caching is effective for SDXL due to its high computational cost.
 *   `--cache_latents_to_disk`: Used with `--cache_latents` to cache to disk. Particularly effective for large datasets or multiple training runs. Caches are generated on disk during the first run and loaded from there on subsequent runs.
 *   `--cache_text_encoder_outputs`: Caches Text Encoder outputs in memory. Skips Text Encoder computation, reducing VRAM usage and speeding up training. **Note:** Caption augmentations (`shuffle_caption`, `caption_dropout_rate`, etc.) will be disabled. **Also, when using this option, Text Encoder LoRA modules cannot be trained (requires `--network_train_unet_only`).**
 *   `--cache_text_encoder_outputs_to_disk`: Used with `--cache_text_encoder_outputs` to cache to disk.
+*   `--cache_text_encoder_outputs_dtype={auto,fp16,bf16,fp32}`: Controls the floating-point representation used in disk text-encoder caches. `auto` preserves the existing precision; `fp16` provides the largest broadly compatible reduction; `bf16` stores BF16 bit patterns with cache metadata and decodes them transparently; `fp32` is lossless relative to the current cache behavior. Integer token IDs and masks are not converted.
+*   `--cache_latents_dtype={auto,fp16,bf16,fp32}`: Controls the floating-point representation used in disk latent caches. `auto` preserves the existing precision, while `fp16` or `bf16` reduces storage. Existing uncompressed NPZ caches remain readable.
+*   Disk caches are written with DEFLATE compression. Compression is most effective for repeated or low-entropy values; dtype selection is the main size reduction for model outputs.
 *   `--skip_cache_check`: Skips validation of cache file contents. File existence is checked, and if not found, caches are generated. Usually not needed unless intentionally re-caching for debugging, etc.
 
 ### 1.7. Sample Image Generation
@@ -225,6 +228,139 @@ This technique involves merging a pre-trained LoRA into the base model before st
     *   **NaN Loss:** Learning rate might be too high, mixed precision settings incorrect (e.g., `--no_half_vae` not specified with `fp16`), or dataset issues.
     *   **Out of Memory (OOM):** Try the VRAM reduction measures listed above.
     *   **Training not progressing:** Learning rate might be too low, optimizer/scheduler settings incorrect, or dataset issues.
+
+## 2.9 Token-Level Hard Mining and Antithetic Timestep Sampling (Flow Matching)
+
+Two options targeting small-batch (4-8) flow-matching DiT training, where per-batch loss means are noisy and spatially uniform weighting wastes gradient on easy regions.
+
+### Token-Level Hard Mining
+
+`--token_mining` reweights the per-element spatial loss by *detached* per-token difficulty: `w_i = clamp((L_i / median(L))**alpha, min, max)`, renormalized to mean 1 per sample so the overall loss scale matches the plain mean. Hard tokens (edges, textures) get more gradient than flat regions.
+
+*   `--token_mining_alpha` (default 1.0): difficulty exponent; higher concentrates more weight on hard tokens.
+*   `--token_mining_min_weight` / `--token_mining_max_weight` (default 0.25 / 4.0): clamp bounds relative to uniform.
+*   Sigma gate: by default, mining strength is scaled by `clip(4*sigma*(1-sigma), 0, 1)` — full strength mid-schedule, disabled at the sigma extremes where per-token loss variation is mostly irreducible noise. Disable with `--token_mining_no_sigma_gate`.
+
+Composes with masked loss, wavelet masking, min-SNR weighting, and per-sample `loss_weights` (applied after token mining, at the batch level).
+
+### Antithetic, Stratified & QMC Timestep Sampling
+
+`--antithetic_timestep_sampling` fills each batch with mirrored pairs of the base sampling randomness — `(u, 1-u)` for uniform, `(z, -z)` for normal-based distributions — then applies the configured distribution transform and shift identically to both. Because the mirrored variate has the same marginal distribution, the configured timestep distribution (`logit_normal`/`uniform`/`sigmoid`/`mode`, plus `flow_uniform_shift`/`flow_uniform_static_ratio`/`training_shift`/`discrete_flow_shift` and scale parameters) is preserved exactly, while a large fraction of timestep-sampling variance cancels out. Most effective at batch sizes 4-8.
+
+`--stratified_timestep_sampling` is an alternative variance-reduction method: the unit interval `[0,1]` is partitioned into `batch_size` equal-width strata and one uniform is drawn inside each stratum. This guarantees full coverage of the timestep range every batch (no region can be empty or over-sampled). It scales better than antithetic as batch size grows (variance ~1/B³ vs ~1/B), works for any batch size including odd, and is robust to non-monotonic loss landscapes. Only applies to the base uniform variate, so it composes with the distribution transform and shift.
+
+`--qmc_timestep_sampling sobol|halton` enables quasi-Monte Carlo (low-discrepancy sequence) sampling: a Sobol or Halton sequence is used for the base uniform instead of pseudo-random numbers. These sequences fill `[0,1]` more uniformly than pseudo-random draws, yielding faster convergence than iid (and often better than stratified at moderate batch sizes). Unlike stratified (which resets every batch), the QMC sequence **advances across batches** via a global counter, so over many training steps the entire timestep range is covered with minimal discrepancy. The sequence is scrambled (with `--qmc_seed`, default 0) for randomization, which preserves the low-discrepancy property while allowing unbiased error estimation. `halton` requires `scipy`. Composes with the distribution transform and shift. For power-of-two batch sizes (8, 16, 32, ...) the Sobol engine uses `draw_base2`, which gives optimal low-discrepancy. The sequence position is saved to and restored from checkpoints (`qmc_state.json`), so the cumulative coverage benefit is preserved across resume.
+
+**Precedence:** `antithetic` and `qmc` **compose** (antithetic-QMC: `batch_size // 2` low-discrepancy points are drawn and each mirrored as `(u, 1-u)` / `(z, -z)`, combining space-filling coverage with pairwise variance cancellation). Only `qmc` and `stratified` conflict; in that case QMC wins and a warning is logged.
+
+**Caveats:**
+
+* **Gradient accumulation / multi-GPU (DDP):** antithetic assumes each `(u, 1-u)` pair lives in the same loss/gradient aggregation unit. With `--gradient_accumulation_steps > 1` the batch is split into micro-batches, and with DDP it is sharded across ranks — antithetic pairs may be separated, reducing the variance-reduction benefit of antithetic. **QMC is DDP-safe:** each rank offsets its scramble seed by its process index, so each rank draws from a *different* scrambled low-discrepancy sequence (no duplicate points across ranks, each still space-filling). A warning is logged when antithetic is used with gradient accumulation or DDP. For full antithetic benefit, use a single GPU with `gradient_accumulation_steps=1`.
+* **Adaptive timestep sampling:** `--adaptive_timestep_sampling` produces its own timesteps (passed as fixed timesteps), which bypasses the antithetic/stratified/QMC paths entirely. They are mutually exclusive (adaptive takes precedence); a warning is logged if both are enabled.
+
+  **VRAM optimization flags** (new, memory-only — training results are unchanged for defaults):
+  * `--adaptive_sampler_eval_chunk_size` (default 16): batch size for per-timestep loss sweeps in Algorithm 2. The original default was 100, which caused elevated peak VRAM due to large activation allocations. Lower values reduce peak VRAM proportionally at the cost of more sequential forward passes.
+  * `--adaptive_sampler_eval_stride` (default 1, opt-in): stride for the evaluation timestep grid. `stride=1` evaluates all timesteps (paper-faithful). `stride>1` evaluates a coarser grid (e.g. `--adaptive_sampler_eval_stride 4` evaluates every 4th timestep), reducing the number of model forwards proportionally. The queue and F-statistic operate on the coarser grid; selected indices are mapped back to real timesteps. This is an approximation — `stride=1` reproduces the paper exactly.
+  * `--adaptive_sampler_fp32_eval` (escape hatch): keep model outputs and targets in fp32 during sweeps instead of the default bf16/fp16 accumulation with fp32 scalar reduction. Only needed if you observe loss accuracy issues with the default bf16 path.
+  * `--adaptive_sampler_disable_empty_cache` (escape hatch): disable the automatic `torch.cuda.empty_cache()` call after each sampler update. By default, the caching allocator's reserved pool is released after Algorithm 2 sweeps to prevent permanently elevated VRAM. Disable if you experience allocator thrash on multi-GPU or ramtorch setups.
+* **Unsupported branches:** `timestep_sampling=hump` uses a multinomial draw that cannot honor pairing, stratification, or low-discrepancy sequences; the flag(s) are ignored for that branch and a warning is logged.
+
+Supported in: `train_network.py` Rectified Flow path (`--flow_model`), Flux trainers (`--timestep_sampling uniform|sigmoid|shift|flux_shift` and the weighting-scheme density path), SD3 trainers (`--weighting_scheme` density path with `--training_shift`), and Lumina trainers.
+
+## 2.10 High-Frequency Token Latent Loss
+
+An opt-in auxiliary loss term that **concentrates training effort on the image tokens that
+carry fine (high-frequency) detail**. The model's predicted clean estimate (Tweedie `x0_hat`)
+is compared against the clean latent, and the per-token error is weighted by a measure of
+each token's local high-frequency content derived from the **clean target itself**:
+
+```
+L_total = L_mse + hf_scale * L_hf
+L_hf    = mean over batch of  mean over tokens of  w_token * ||x0_hat_token - x0_token||^2
+```
+
+The weights `w_token` are computed per micro-batch, on-GPU, from the clean batch — no cache,
+no extractor network, no RNG draw. `hf_scale == 0` (the default) is bit-identical to the
+loss without the feature.
+
+
+*   `--hf_scale` (default `0.0`, must be `>= 0`): term weight (λ); `0.0` disables the term.
+*   `--hf_exponent` (default `1.0`, must be `> 0`): weight concentration exponent (γ);
+    `1` weights tokens linearly in detail, `> 1` concentrates on the highest-detail tokens,
+    `< 1` flattens toward uniform. The per-sample weights are always renormalized to mean 1,
+    so the term's scale stays comparable to the plain x0-MSE.
+*   `--hf_patch` (default `2`): token patch size; **must equal the model's own patchify size**.
+    Use `2` for all latent-space models (SD1.5/SD2/SDXL/Flux/SD3/Lumina/Hunyuan/Anima) and
+    `16` for pixel-space models such as ChromaRadiance. `H`/`W` must be divisible by the patch.
+*   `--hf_high_noise_snr_cut` (default `0.111111`, equivalent to flow sigma `0.75`): universal
+    SNR cutoff for high-noise HF attenuation. This is used for flow, x0-direct, DDPM v-prediction,
+    and DDPM epsilon-prediction modes.
+*   `--hf_high_noise_min_weight` (default `0.10`): lower bound for the high-noise HF multiplier.
+*   `--hf_high_noise_power` (default `1.0`): attenuation exponent below the SNR cutoff; larger values
+    suppress high-noise HF supervision more sharply. These gates are HF-only and do not modify the main loss.
+
+For flow matching, SNR is computed as `((1 - sigma) / sigma)^2`. The following reference values
+show how quickly SNR falls as the noise level increases:
+
+| Flow sigma | SNR | Signal variance relative to noise | SNR (dB) | Typical interpretation |
+|---:|---:|---:|---:|---|
+| `0.00` | `∞` | infinitely signal-dominant | `∞` | clean endpoint |
+| `0.05` | `361.0000` | 361× | `25.58` | nearly clean |
+| `0.10` | `81.0000` | 81× | `19.08` | very signal-dominant |
+| `0.20` | `16.0000` | 16× | `12.04` | signal-dominant |
+| `0.25` | `9.0000` | 9× | `9.54` | signal-dominant |
+| `0.3333` | `4.0000` | 4× | `6.02` | moderately signal-dominant |
+| `0.40` | `2.2500` | 2.25× | `3.52` | signal still dominant |
+| `0.50` | `1.0000` | 1× | `0.00` | equal signal and noise variance |
+| `0.60` | `0.4444` | 0.444× | `-3.52` | noise-dominant |
+| `0.667` | `0.2498` | 0.250× | `-6.02` | noise substantially dominant |
+| `0.70` | `0.1837` | 0.184× | `-7.36` | high noise |
+| `0.75` | `0.1111` | 0.111× | `-9.54` | default HF cutoff |
+| `0.80` | `0.0625` | 0.0625× | `-12.04` | strongly noise-dominant |
+| `0.90` | `0.0123` | 0.0123× | `-19.08` | almost pure noise |
+| `0.95` | `0.0028` | 0.0028× | `-25.58` | nearly pure noise |
+| `0.99` | `0.0001` | 0.0001× | `-39.91` | effectively pure noise |
+| `1.00` | `0.0000` | 0× | `-∞` | pure-noise endpoint |
+
+The default `hf_high_noise_snr_cut=0.111111` therefore corresponds to flow sigma `0.75`.
+For DDPM modes, use the scheduler-derived `alpha_bar / (1 - alpha_bar)` SNR instead of this
+flow-sigma table; the same SNR cutoff represents the same signal-to-noise ratio, but not necessarily
+the same integer timestep across different DDPM schedules.
+
+**How it works:** the per-token weight is the mean squared Laplacian response of the clean
+latent inside each patch (replication padding — load-bearing: a constant input gives exactly
+0), normalized with a `1e-6` robustness epsilon and renormalized to mean 1 per sample. The
+term regresses the Tweedie reconstruction `x0_hat` (model-class-specific: `noisy - t*v` for
+flow/v-pred, direct x0 for SD3, `noisy - v*(t + 5e-2)` for ChromaRadiance raw) against the
+clean target.
+
+**Behavior & invariants:**
+
+* **RNG-neutral & deterministic**: weights are a pure function of the clean batch; the
+  global RNG stream position is identical whether the term is on or off.
+* **High-noise gate**: supported prediction modes leave high-SNR/low-noise samples unchanged, then apply
+  a one-sided SNR attenuation below `hf_high_noise_snr_cut`. Flow modes derive SNR from sigma, while
+  DDPM modes derive it from scheduler `alpha_bar`. This avoids suppressing the useful low-noise end
+  while limiting the HF contribution where clean reconstruction is least reliable. DDPM epsilon mode
+  uses an effective zero floor for this gate to prevent its inverse-SNR x0 reconstruction factor from
+  becoming unbounded at the pure-noise endpoint.
+  Per-sample timestep importance weights (e.g. the SD3/Flux `weighting_scheme` weights) are still
+  applied to the HF term with the same convention as the main MSE.
+* **Caption-independent**: CFG-dropped rows contribute normally; the term never touches
+  `target_v` or the dropout mask.
+* **Compatible with auxiliary features**: composes with token mining, wavelet masking,
+  FFL, Patch Topology Loss, min-SNR weighting, best-of-K noise exploration (selection stays
+  pure velocity-MSE), stochastic-OT and antithetic noise pairing.
+* **Skips teacher-distillation paths**: on Anima's `--ileco` / `--addift` modes the training
+  target is a teacher's velocity with no analytic clean x0, so the HF term is skipped there.
+* **Logging & metadata**: the scaled contribution is reported as `loss/current_hf`, and
+  `ss_hf_scale`, `ss_hf_exponent`, `ss_hf_patch` are recorded in the saved model metadata.
+
+Reference implementation: `library/hf_token_loss.py` (ported from
+`plans/high-frequency-token-loss (1).md`). Test battery: `tests/test_hf_token_loss.py`.
+
+Supported in: all `train_network` family trainers (base, SDXL, Flux, SD3, Lumina,
+HunyuanImage, Anima).
 
 ## 3. Conclusion / おわりに
 

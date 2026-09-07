@@ -303,6 +303,10 @@ This file can be used with GUI tools that support SDXL, such as AUTOMATIC1111/st
 
 ## 5. Supplement: Main Differences from `train_network.py` / 補足: `train_network.py` との主な違い
 
+* **High-Frequency Token Latent Loss:** `--hf_scale`, `--hf_exponent`, `--hf_patch` are
+  supported (inherited from `train_network.py`). Use `--hf_patch 2` for SDXL latent space.
+  See the [advanced guide](train_network_advanced.md#210-high-frequency-token-latent-loss)
+  for the full specification.
 * **Target Model:** `sdxl_train_network.py` is exclusively for SDXL models.
 * **Text Encoder:** Since SDXL has two Text Encoders, there are differences in learning rate specifications (`--text_encoder_lr1`, `--text_encoder_lr2`), etc.
 * **Caching Features:** `--cache_text_encoder_outputs` is particularly effective for SDXL and is recommended.

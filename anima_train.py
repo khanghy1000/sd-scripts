@@ -37,7 +37,12 @@ from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
 )
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, apply_snr_weight_for_flow_matching
+from library.custom_train_functions import (
+    apply_masked_loss,
+    add_custom_train_arguments,
+    apply_snr_weight_for_flow_matching,
+    maybe_apply_antithetic_noise_pairing,
+)
 
 
 def train(args):
@@ -82,7 +87,8 @@ def train(args):
     # prepare caching strategy: must be set before preparing dataset
     if args.cache_latents:
         latents_caching_strategy = strategy_anima.AnimaLatentsCachingStrategy(
-            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
@@ -152,7 +158,8 @@ def train(args):
         if args.cache_text_encoder_outputs:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(
                 strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False
+                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False,
+                    cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
                 )
             )
         train_dataset_group.set_current_strategies()
@@ -205,7 +212,8 @@ def train(args):
         qwen3_text_encoder.eval()
 
         text_encoder_caching_strategy = strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-            args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, is_partial=False
+            args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check,
+            is_partial=False, cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto")
         )
         strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_caching_strategy)
 
@@ -554,6 +562,9 @@ def train(args):
                         noise_flat = noise.view(b_size, -1)
                         _, (_, col_indices) = train_util.cosine_optimal_transport(lat_flat, noise_flat)
                         noise = noise[col_indices.squeeze(0)]
+
+                # Antithetic noise pairing (after OT so pair structure matches sigmas)
+                noise = maybe_apply_antithetic_noise_pairing(args, noise)
 
                 # Get noisy model input and timesteps
                 noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(

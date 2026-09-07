@@ -626,6 +626,15 @@ python networks/convert_anima_lora_to_comfy.py path/to/source.safetensors path/t
 </details>
 
 
+## 9.5 High-Frequency Token Latent Loss
+
+`--hf_scale`, `--hf_exponent`, `--hf_patch` enable the High-Frequency Token latent loss
+(an opt-in auxiliary term weighting per-token x0-MSE by clean-token detail). Use
+`--hf_patch 2` for Anima latent space. The term is skipped on the `--ileco` / `--addift`
+teacher-distillation paths (no analytic clean x0). See the
+[advanced guide](train_network_advanced.md#210-high-frequency-token-latent-loss) for the
+full specification.
+
 ## 10. Others / その他
 
 ### Metadata Saved in LoRA Models

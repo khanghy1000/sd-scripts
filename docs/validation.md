@@ -150,6 +150,19 @@ There are two primary ways to enable validation:
 
 </details>
 
+### Per-Subset Batch Size and Determinism
+
+A `batch_size` set on a subset applies to validation datasets as well: validation batches are formed per subset with the subset's effective batch size, and a batch never mixes images from different subsets. Batch formation is pure index arithmetic and consumes no RNG state, so validation determinism is unaffected — the validation loop already reads the actual batch size of each batch when averaging the loss, and the per-batch RNG save/restore around the validation dataloader keeps item-level draws (e.g. flip augmentation) deterministic across validation runs.
+
+<details>
+<summary>日本語</summary>
+
+### サブセットごとのバッチサイズと決定性
+
+サブセットに設定した `batch_size` は検証データセットにも適用されます。検証バッチはサブセットごとにそのサブセットの有効なバッチサイズで作成され、異なるサブセットの画像が混ざることはありません。バッチの構成はインデックス計算のみでRNG状態を消費しないため、検証の決定性には影響しません。検証ループは各バッチの実際のバッチサイズを損失の平均時に参照しており、検証データローダー周りのバッチ単位のRNG保存/復元により、項目単位のランダム処理（flip拡張など）も検証実行間で決定的に保たれます。
+
+</details>
+
 ### Viewing the Results
 
 The validation loss is logged to your tracking tool of choice (TensorBoard or Weights & Biases). Look for the metric `loss/validation` to monitor the performance.

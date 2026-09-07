@@ -29,6 +29,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 from library import sd3_models, sd3_utils, strategy_base, train_util
+from library import custom_train_functions
+from library.custom_train_functions import compute_density_for_timestep_sampling  # canonical impl
 
 
 def save_models(
@@ -875,24 +877,41 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    antithetic: bool = False,
+    stratified: bool = False,
+    device=None,
+    **kwargs,
 ):
     """Compute the density for sampling the timesteps when doing SD3 training.
 
-    Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
+    .. note::
+        This is a thin re-export of the canonical implementation in
+        :mod:`library.custom_train_functions`. It is kept here for backward
+        compatibility with code that imports it from this module. New code should
+        import ``compute_density_for_timestep_sampling`` from
+        ``library.custom_train_functions`` directly.
 
-    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    The canonical implementation supports ``antithetic`` (mirrored base-variates
+    pairs), ``stratified`` (one uniform per equal-width stratum), ``mode``
+    distribution, and a ``device`` argument so the tensor is generated on the
+    target device (e.g. CUDA) instead of always on CPU.
     """
-    if weighting_scheme == "logit_normal":
-        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
-        u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
-        u = torch.nn.functional.sigmoid(u)
-    elif weighting_scheme == "mode":
-        u = torch.rand(size=(batch_size,), device="cpu")
-        u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
-    else:
-        u = torch.rand(size=(batch_size,), device="cpu")
-    return u
+    return custom_train_functions.compute_density_for_timestep_sampling(
+        weighting_scheme=weighting_scheme,
+        batch_size=batch_size,
+        logit_mean=logit_mean,
+        logit_std=logit_std,
+        mode_scale=mode_scale,
+        antithetic=antithetic,
+        stratified=stratified,
+        device=device if device is not None else "cpu",
+        **kwargs,
+    )
 
 
 def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
@@ -926,6 +945,12 @@ def get_noisy_model_input_and_timesteps(args, latents, noise, device, dtype, fix
         logit_mean=args.logit_mean,
         logit_std=args.logit_std,
         mode_scale=args.mode_scale,
+        antithetic=getattr(args, "antithetic_timestep_sampling", False) and is_train and fixed_timesteps is None,
+        stratified=getattr(args, "stratified_timestep_sampling", False) and is_train and fixed_timesteps is None,
+        qmc=getattr(args, "qmc_timestep_sampling", None) if (is_train and fixed_timesteps is None) else None,
+        qmc_seed=getattr(args, "qmc_seed", 0),
+        device=device,
+        rank=PartialState().process_index if getattr(args, "qmc_timestep_sampling", None) is not None else 0,
     )
     t_min = args.min_timestep if args.min_timestep is not None else 0
     t_max = args.max_timestep if args.max_timestep is not None else 1000

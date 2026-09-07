@@ -30,7 +30,7 @@ from library import (
     strategy_hunyuan_image,
     train_util,
 )
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.utils import setup_logging
 
 setup_logging()
@@ -314,6 +314,8 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
         self.rotary_pos_emb_cache = {}
+        # HunyuanImage is a flow-matching model: model_pred is velocity, x0_hat = noisy - sigmas * v
+        self.hf_prediction_mode = "flow"
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -431,7 +433,10 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.vlm_tokenizer, tokenize_strategy.byt5_tokenizer]
 
     def get_latents_caching_strategy(self, args):
-        return strategy_hunyuan_image.HunyuanImageLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
+        return strategy_hunyuan_image.HunyuanImageLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, False,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
+        )
 
     def get_text_encoding_strategy(self, args):
         return strategy_hunyuan_image.HunyuanImageTextEncodingStrategy()
@@ -452,7 +457,8 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
             return strategy_hunyuan_image.HunyuanImageTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
+                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None
@@ -551,6 +557,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
         # get noisy model input and timesteps
         noisy_model_input, _, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
@@ -560,6 +567,10 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for High-Frequency Token loss (4D pre-pack; HunyuanImage never packs)
+        if is_train and self.hf_scale > 0.0:
+            self._hf_noisy_latents = noisy_model_input.detach()
 
         # bfloat16 is too low precision for 0-1000 TODO fix get_noisy_model_input_and_timesteps
         timesteps = (sigmas[:, 0, 0, 0] * 1000).to(torch.int64)
@@ -601,7 +612,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
         # differential output preservation is not used for HunyuanImage-2.1 currently
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:

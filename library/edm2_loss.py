@@ -1,10 +1,28 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from diffusers import DDPMScheduler
 import os
 import logging
 logger = logging.getLogger(__name__)
+
+
+def is_flow_matching_scheduler(noise_scheduler) -> bool:
+    """Flow-matching schedulers (e.g. FlowMatchEulerDiscreteScheduler) have no alphas_cumprod."""
+    return not hasattr(noise_scheduler, "alphas_cumprod")
+
+
+def build_flow_matching_sigma_grid(noise_scheduler, device, dtype) -> torch.Tensor:
+    """Per-timestep noise levels for flow matching.
+
+    Training interpolates latents as x_t = (1 - sigma) * x0 + sigma * eps with
+    timesteps = sigma * num_train_timesteps (see
+    flux_train_utils.get_noisy_model_input_and_timesteps), so the sigma for
+    timestep index t is exactly t / num_train_timesteps, regardless of any
+    sampling-time shift. The scheduler's `shift` config only affects the
+    inference sigma schedule, not this training-time mapping.
+    """
+    num_train_timesteps = int(noise_scheduler.config.num_train_timesteps)
+    return torch.arange(num_train_timesteps, device=device, dtype=dtype) / num_train_timesteps
 
 def normalize(x: torch.Tensor, dim=None, eps=1e-4, dtype=torch.float32) -> torch.Tensor:
     if dim is None:
@@ -50,7 +68,7 @@ class NormalizedLinearLayer(torch.nn.Module):
 class AdaptiveLossWeightMLP(nn.Module):
     def __init__(
             self,
-            noise_scheduler: DDPMScheduler,
+            noise_scheduler,
             logvar_channels: int = 128,
             lambda_weights: torch.Tensor = None,
             device='cuda',
@@ -61,27 +79,40 @@ class AdaptiveLossWeightMLP(nn.Module):
             importance_weights: torch.Tensor = None,
         ):
         super().__init__()
-        self.alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=device, dtype=dtype)
+        self.is_flow_matching = is_flow_matching_scheduler(noise_scheduler)
+        self.num_train_timesteps = int(noise_scheduler.config.num_train_timesteps)
+
+        if self.is_flow_matching:
+            # Rectified-flow interpolation x_t = (1 - sigma) * x0 + sigma * eps.
+            # (1 - sigma)^2 is the signal power, i.e. the alphas_cumprod analog,
+            # and SNR(sigma) = ((1 - sigma) / sigma)^2.
+            sigmas = build_flow_matching_sigma_grid(noise_scheduler, device, dtype)
+            self.alphas_cumprod = (1.0 - sigmas) ** 2
+            snr = ((1.0 - sigmas) / sigmas.clamp_min(1e-8)) ** 2
+        else:
+            self.alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=device, dtype=dtype)
+            if hasattr(noise_scheduler, "all_snr"):
+                snr = noise_scheduler.all_snr.to(device=device, dtype=dtype)
+            else:
+                snr = self.alphas_cumprod / (1.0 - self.alphas_cumprod).clamp_min(1e-8)
+
         #self.a_bar_mean = noise_scheduler.alphas_cumprod.mean()
         #self.a_bar_std = noise_scheduler.alphas_cumprod.std()
         self.a_bar_mean = self.alphas_cumprod.mean()
         self.a_bar_std = self.alphas_cumprod.std()
         self.logvar_fourier = FourierFeatureExtractor(logvar_channels, dtype=dtype)
         self.logvar_linear = NormalizedLinearLayer(logvar_channels, 1, kernel=[], dtype=dtype) # kernel = []? (not in code given, added matching edm2)
-        self.lambda_weights = lambda_weights.to(device=device, dtype=dtype) if lambda_weights is not None else torch.ones(1000, device=device)
+        self.lambda_weights = lambda_weights.to(device=device, dtype=dtype) if lambda_weights is not None else torch.ones(self.num_train_timesteps, device=device, dtype=dtype)
         self.noise_scheduler = noise_scheduler
         self.dtype=dtype
 
-        self.use_importance_weights=use_importance_weights,
-        self.importance_weights = importance_weights.to(device=device, dtype=dtype) if importance_weights is not None else torch.ones(1000, device=device, dtype=dtype)
+        self.use_importance_weights = use_importance_weights
+        self.importance_weights = importance_weights.to(device=device, dtype=dtype) if importance_weights is not None else torch.ones(self.num_train_timesteps, device=device, dtype=dtype)
 
         if self.use_importance_weights:
             # min snr importance weights
-            all_timesteps = torch.arange(noise_scheduler.config.num_train_timesteps).to(device=device)
-            snr = torch.stack([noise_scheduler.all_snr[t] for t in all_timesteps])
-
             min_snr_gamma = (
-                (importance_weights_max_weight * (1 + 1 / importance_weights_min_snr_gamma)) * 
+                (importance_weights_max_weight * (1 + 1 / importance_weights_min_snr_gamma)) *
                 torch.minimum(snr, torch.full_like(snr, importance_weights_min_snr_gamma))
                 ) # multiply the torch.minimum by the max weight you want * 2 (i.e multiply by 40 and it'll cap off at 20 loss)
             min_snr_gamma = torch.div(min_snr_gamma, snr + 1).to(dtype=dtype, device=device)
@@ -91,19 +122,44 @@ class AdaptiveLossWeightMLP(nn.Module):
                 min_snr_gamma,
             )
 
+        # Move all parameters/buffers (fourier freqs/phases, linear weight) to the target
+        # device so the model is usable before accelerator.prepare() and in the DeepSpeed path.
+        self.to(device=device)
+
     def _forward(self, timesteps: torch.Tensor):
         #a_bar = self.noise_scheduler.alphas_cumprod[timesteps]
         a_bar = self.alphas_cumprod[timesteps]
         c_noise = a_bar.sub(self.a_bar_mean).div_(self.a_bar_std)
         return self.logvar_linear(self.logvar_fourier(c_noise)).squeeze()
 
-    def forward(self, loss: torch.Tensor, timesteps):
-        timesteps = timesteps.long()
+    def _normalize_timesteps(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """Convert incoming timesteps to valid integer indices into the per-timestep tables."""
+        ts = timesteps.detach().to(dtype=torch.float32).reshape(-1)
+        if self.is_flow_matching:
+            # Flow-matching trainers (anima/flux/sd3/...) may return sigmas in [0, 1]
+            # (e.g. anima divides timesteps by 1000 before returning them) or discrete
+            # timesteps in [0, num_train_timesteps]. Normalize sigmas to indices.
+            # Branchless torch.where (not `if ts.max() <= 1.5:`) so the forward pass
+            # stays traceable by torch.compile (no data-dependent branching graph break).
+            if ts.numel() > 0:
+                ts = torch.where(ts.max() <= 1.5, ts * self.num_train_timesteps, ts)
+            ts = ts.round()
+        return ts.long().clamp(0, self.num_train_timesteps - 1)
+
+    def forward(self, loss: torch.Tensor, timesteps) -> torch.Tensor:
+        """Returns ``loss`` and ``loss_scaled`` stacked along dim 0, i.e. a (2, B) tensor.
+
+        A single stacked tensor is returned instead of a tuple so the output stays
+        traceable by torch.compile through accelerate's ConvertOutputsToFp32 wrapper
+        (dynamo cannot trace accelerate's `tuple(generator)` reconstruction of tuple
+        outputs). Callers can unpack exactly like a tuple: ``loss, loss_scaled = model(...)``.
+        """
+        timesteps = self._normalize_timesteps(timesteps)
         adaptive_loss_weights = self._forward(timesteps)
         loss_scaled = loss * (self.lambda_weights[timesteps] / torch.exp(adaptive_loss_weights)) # type: torch.Tensor
         loss = loss_scaled + (self.importance_weights[timesteps] * adaptive_loss_weights) # type: torch.Tensor
 
-        return loss, loss_scaled
+        return torch.stack([loss, loss_scaled])
     
     def get_trainable_params(self):
         return self.parameters()
@@ -146,7 +202,7 @@ class AdaptiveLossWeightMLP(nn.Module):
         info = self.load_state_dict(weights_sd, False)
         return info
     
-def create_weight_MLP(noise_scheduler: DDPMScheduler, 
+def create_weight_MLP(noise_scheduler,
                     logvar_channels: int = 128, 
                     lambda_weights: torch.tensor = None, 
                     optimizer: torch.optim.Optimizer = torch.optim.AdamW, 
@@ -158,10 +214,10 @@ def create_weight_MLP(noise_scheduler: DDPMScheduler,
                     importance_weights_max_weight: float = 10.0,
                     importance_weights_min_snr_gamma: float = 1.0):
     logger.info("creating weight MLP")
-    lossweightMLP = AdaptiveLossWeightMLP(noise_scheduler, logvar_channels, lambda_weights, device, 
-                                          dtype=dtype, 
-                                          importance_weights_max_weight=importance_weights_max_weight, 
-                                          importance_weights_min_snr_gamma=importance_weights_min_snr_gamma, 
+    lossweightMLP = AdaptiveLossWeightMLP(noise_scheduler, logvar_channels, lambda_weights, device,
+                                          dtype=dtype,
+                                          importance_weights_max_weight=importance_weights_max_weight,
+                                          importance_weights_min_snr_gamma=importance_weights_min_snr_gamma,
                                           use_importance_weights=use_importance_weights)
     MLP_optim = optimizer(lossweightMLP.parameters(), lr=lr, **optimizer_args)
     return lossweightMLP, MLP_optim

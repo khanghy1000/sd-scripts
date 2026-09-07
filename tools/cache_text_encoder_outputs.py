@@ -159,7 +159,9 @@ def cache_to_disk(args: argparse.Namespace) -> None:
     # build text encoder outputs caching strategy
     if is_sdxl:
         text_encoder_outputs_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-            args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
+            args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check,
+            is_weighted=args.weighted_captions,
+            cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
         )
     else:
         text_encoder_outputs_caching_strategy = strategy_flux.FluxTextEncoderOutputsCachingStrategy(
@@ -168,6 +170,7 @@ def cache_to_disk(args: argparse.Namespace) -> None:
             args.skip_cache_check,
             is_partial=False,
             apply_t5_attn_mask=args.apply_t5_attn_mask,
+            cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
         )
     strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
 
@@ -221,7 +224,9 @@ def cache_to_disk(args: argparse.Namespace) -> None:
                 b_input_ids1 = torch.stack([image_info.input_ids1 for image_info in image_infos])
                 b_input_ids2 = torch.stack([image_info.input_ids2 for image_info in image_infos])
                 train_util.cache_batch_text_encoder_outputs(
-                    image_infos, tokenizers, text_encoders, args.max_token_length, args.use_zero_cond_dropout, True, b_input_ids1, b_input_ids2, weight_dtype
+                    image_infos, tokenizers, text_encoders, args.max_token_length, True, args.use_zero_cond_dropout,
+                    b_input_ids1, b_input_ids2, weight_dtype,
+                    getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
                 )
     else:
         train_dataset_group.new_cache_text_encoder_outputs(text_encoders, accelerator)

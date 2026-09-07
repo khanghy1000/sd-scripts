@@ -343,6 +343,14 @@ When training finishes, a LoRA model file (e.g. `my_sd3_lora.safetensors`) is sa
 </details>
 
 
+## 6.5 High-Frequency Token Latent Loss
+
+`--hf_scale`, `--hf_exponent`, `--hf_patch` enable the High-Frequency Token latent loss
+(an opt-in auxiliary term weighting per-token x0-MSE by clean-token detail; SD3's
+preconditioning yields x0 directly). Use `--hf_patch 2` for SD3 latent space. See the
+[advanced guide](train_network_advanced.md#210-high-frequency-token-latent-loss) for the
+full specification.
+
 ## 7. Others / その他
 
 `sd3_train_network.py` shares many features with `train_network.py`, such as sample image generation (`--sample_prompts`, etc.) and detailed optimizer settings. For these, see the [train_network.py guide](train_network.md#5-other-features--その他の機能) or run `python sd3_train_network.py --help`.

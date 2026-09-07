@@ -317,6 +317,11 @@ This file can be used with GUI tools such as AUTOMATIC1111/stable-diffusion-webu
 * More detailed optimizer settings (`--optimizer_args`, etc.)
 * Caption preprocessing (`--shuffle_caption`, `--keep_tokens`, etc.)
 * Additional network settings (`--network_args`, etc.)
+* High-Frequency Token latent loss (`--hf_scale`, `--hf_exponent`, `--hf_patch`) — an
+  opt-in auxiliary term that concentrates training on detail-rich tokens by weighting the
+  per-token x0-MSE with clean-token Laplacian detail. See the
+  [advanced guide](train_network_advanced.md#210-high-frequency-token-latent-loss) for the
+  full specification.
 
 For these features, please refer to the script's help (`python train_network.py --help`) or other documents in the repository.
 

@@ -697,6 +697,14 @@ Several related scripts are provided for models trained with `flux_train_network
 
 </details>
 
+## 8.5 High-Frequency Token Latent Loss
+
+`--hf_scale`, `--hf_exponent`, `--hf_patch` enable the High-Frequency Token latent loss
+(an opt-in auxiliary term weighting per-token x0-MSE by clean-token detail). Use
+`--hf_patch 2` for latent-space Flux/Chroma; use `--hf_patch 16` for the pixel-space
+ChromaRadiance path. See the [advanced guide](train_network_advanced.md#210-high-frequency-token-latent-loss)
+for the full specification.
+
 ## 9. Others / その他
 
 `flux_train_network.py` includes many features common with `train_network.py`, such as sample image generation (`--sample_prompts`, etc.) and detailed optimizer settings. For these features, refer to the [`train_network.py` guide](train_network.md#5-other-features--その他の機能) or the script help (`python flux_train_network.py --help`).

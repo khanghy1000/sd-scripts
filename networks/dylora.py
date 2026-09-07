@@ -13,6 +13,7 @@ import math
 import os
 import random
 from typing import Dict, List, Optional, Tuple, Type, Union
+from networks.network_base import _tag_all_network_params
 from diffusers import AutoencoderKL
 from transformers import CLIPTextModel
 import torch
@@ -469,6 +470,7 @@ class DyLoRANetwork(torch.nn.Module):
                                  apply_orthograd: bool, 
                                  orthograd_targets: list[str]):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
         all_params = []
 
         def assemble_params(loras, lr, ratio):
@@ -522,6 +524,7 @@ class DyLoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

@@ -3,6 +3,7 @@
 import os
 from typing import Dict, List, Optional, Union
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from accelerate.utils import set_module_tensor_to_device  # kept for potential future use
 from accelerate import init_empty_weights
@@ -27,6 +28,27 @@ logger = logging.getLogger(__name__)
 FP8_OPTIMIZATION_TARGET_KEYS = ["blocks", ""]
 # ".embed." excludes Embedding in LLMAdapter
 FP8_OPTIMIZATION_EXCLUDE_KEYS = ["_embedder", "norm", "adaln", "final_layer", ".embed."]
+
+def _rename_hook(k: str) -> str:
+    if k.startswith("model.diffusion_model."):
+        return k[len("model.diffusion_model."):]
+    if k.startswith("net."):
+        return k[len("net."):]
+    return k
+
+def count_blocks(state_dict_keys: list[str], prefix_string: str) -> int:
+    count = 0
+    while True:
+        c = False
+        for k in state_dict_keys:
+            if k.startswith(prefix_string.format(count)):
+                c = True
+                break
+        if c == False:
+            break
+        count += 1
+    logger.info(f"Provided Anima model has {count} blocks.")
+    return count
 
 def load_anima_model(
     device: Union[str, torch.device],
@@ -63,6 +85,15 @@ def load_anima_model(
     loading_device = torch.device(loading_device)
 
     # We currently support fixed DiT config for Anima models
+    # Detect block.39 from the checkpoint
+    key_prefix = ""
+    with safe_open(dit_path, framework="pt") as f:
+        state_dict_keys = list(f.keys())
+        if any(k.startswith("model.diffusion_model.") for k in state_dict_keys):
+            key_prefix = "model.diffusion_model."
+        elif any(k.startswith("net.") for k in state_dict_keys):
+            key_prefix = "net."
+
     dit_config = {
         "max_img_h": 512,
         "max_img_w": 512,
@@ -81,7 +112,7 @@ def load_anima_model(
         "max_fps": 30,
         "use_adaln_lora": True,
         "adaln_lora_dim": 256,
-        "num_blocks": 28,
+        "num_blocks": count_blocks(state_dict_keys, "{}blocks.".format(key_prefix) + "{}."),
         "num_heads": 16,
         "extra_per_block_abs_pos_emb": False,
         "rope_h_extrapolation_ratio": 4.0,
@@ -102,7 +133,8 @@ def load_anima_model(
 
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
-    rename_hooks = WeightTransformHooks(rename_hook=lambda k: k[len("net.") :] if k.startswith("net.") else k)
+
+    rename_hooks = WeightTransformHooks(rename_hook=_rename_hook)
     sd = load_safetensors_with_lora_and_fp8(
         model_files=dit_path,
         lora_weights_list=lora_weights_list,

@@ -1,13 +1,16 @@
 # base class for platform strategies. this file defines the interface for strategies
 
+import hashlib
+import json
 import os
 import re
-from typing import Any, List, Optional, Tuple, Union, Callable
+from typing import Any, Dict, List, Optional, Tuple, Union, Callable
 
 import numpy as np
 import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 from library.offline_utils import safe_from_pretrained
+from library.cache_utils import load_npz, normalize_cache_dtype, save_npz
 
 
 # TODO remove circular import by moving ImageInfo to a separate file
@@ -19,6 +22,35 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# Schema version for cached augmentation variants. Bump when the npz key layout changes.
+AUG_VARIANT_SCHEMA_VERSION = 1
+
+
+def variant_key(base: str, variant: int) -> str:
+    """Return the npz key for a cached augmentation variant.
+
+    Variant 0 is the canonical (un-augmented) sample and uses the legacy un-suffixed
+    key, so existing caches remain valid and older code can read variant-0 data.
+    Variants >= 1 use a ``_v{k}`` suffix, composed before any resolution suffix,
+    e.g. ``latents_v3_32x64``.
+    """
+    if variant <= 0:
+        return base
+    return f"{base}_v{variant}"
+
+
+def compute_aug_config_hash(config: Dict[str, Any]) -> str:
+    """Compute a stable hash over an augmentation config dict.
+
+    The variant counts (K) themselves must NOT be included in ``config``: validity
+    compares the stored variant count separately (a superset cache stays valid when
+    the requested K is lowered). Changing any augmentation parameter changes the
+    hash and therefore invalidates previously written caches.
+    """
+    payload = {"schema": AUG_VARIANT_SCHEMA_VERSION, "config": config}
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 class TokenizeStrategy:
@@ -428,12 +460,14 @@ class TextEncoderOutputsCachingStrategy:
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
         is_weighted: bool = False,
+        cache_dtype: str = "auto",
     ) -> None:
         self._cache_to_disk = cache_to_disk
         self._batch_size = batch_size
         self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
         self._is_partial = is_partial
         self._is_weighted = is_weighted
+        self.cache_dtype = normalize_cache_dtype(cache_dtype)
 
     @classmethod
     def set_strategy(cls, strategy):
@@ -464,16 +498,66 @@ class TextEncoderOutputsCachingStrategy:
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         raise NotImplementedError
 
-    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
+    def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
         raise NotImplementedError
 
-    def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
+    def is_disk_cached_outputs_expected(self, npz_path: str, num_caption_variants: int = 0, caption_aug_hash: Optional[str] = None) -> bool:
         raise NotImplementedError
 
     def cache_batch_outputs(
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List
     ):
         raise NotImplementedError
+
+    def _get_variant_caption_groups(self, infos: List) -> Tuple[List[str], List[List[Tuple[int, str]]]]:
+        """Split infos' captions into canonical captions and per-variant (info_index, caption) groups.
+
+        Requires infos to optionally have ``caption_variants`` (index 0 = canonical). Infos
+        without variants only appear in the canonical captions.
+
+        Returns:
+            Tuple[List[str], List[List[Tuple[int, str]]]]: canonical captions (one per info),
+                and for each variant index k >= 1 a list of (info_index, caption).
+        """
+        canonical_captions = [(info.caption_variants[0] if getattr(info, "caption_variants", None) else info.caption) for info in infos]
+        max_variant = 0
+        for info in infos:
+            if getattr(info, "caption_variants", None):
+                max_variant = max(max_variant, len(info.caption_variants) - 1)
+        variant_groups = []
+        for k in range(1, max_variant + 1):
+            group = [
+                (i, info.caption_variants[k])
+                for i, info in enumerate(infos)
+                if getattr(info, "caption_variants", None) and len(info.caption_variants) > k
+            ]
+            variant_groups.append(group)
+        return canonical_captions, variant_groups
+
+    def _check_cached_variant_keys(self, npz, required_keys, num_caption_variants: int, caption_aug_hash: Optional[str]) -> bool:
+        """Shared validity check for cached caption variants in *_te.npz files."""
+        if num_caption_variants is None or num_caption_variants <= 1:
+            return True
+        if "caption_variants" not in npz or "caption_aug_hash" not in npz:
+            return False
+        if int(npz["caption_variants"]) < num_caption_variants:
+            return False
+        if caption_aug_hash is not None and str(npz["caption_aug_hash"].tolist()) != caption_aug_hash:
+            return False
+        for k in range(1, num_caption_variants):
+            for key in required_keys:
+                if variant_key(key, k) not in npz:
+                    return False
+        return True
+
+    @staticmethod
+    def _npz_get(npz, key: str, variant: int = 0):
+        """Get a (possibly variant-suffixed) npz entry, falling back to the legacy key."""
+        if variant > 0:
+            vkey = variant_key(key, variant)
+            if vkey in npz:
+                return npz[vkey]
+        return npz[key]
 
 
 class LatentsCachingStrategy:
@@ -483,10 +567,17 @@ class LatentsCachingStrategy:
 
     _warned_fallback_to_old_npz = False  # to avoid spamming logs about fallback
 
-    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
+    def __init__(
+        self,
+        cache_to_disk: bool,
+        batch_size: int,
+        skip_disk_cache_validity_check: bool,
+        cache_dtype: str = "auto",
+    ) -> None:
         self._cache_to_disk = cache_to_disk
         self._batch_size = batch_size
         self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
+        self.cache_dtype = normalize_cache_dtype(cache_dtype)
 
     @classmethod
     def set_strategy(cls, strategy):
@@ -518,11 +609,28 @@ class LatentsCachingStrategy:
         raise NotImplementedError
 
     def is_disk_cached_latents_expected(
-        self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool
+        self,
+        bucket_reso: Tuple[int, int],
+        npz_path: str,
+        flip_aug: bool,
+        alpha_mask: bool,
+        num_aug_variants: int = 0,
+        aug_config_hash: Optional[str] = None,
     ) -> bool:
         raise NotImplementedError
 
-    def cache_batch_latents(self, model: Any, batch: List, flip_aug: bool, alpha_mask: bool, random_crop: bool, random_crop_padding_percent: float = 0.05):
+    def cache_batch_latents(
+        self,
+        model: Any,
+        batch: List,
+        flip_aug: bool,
+        alpha_mask: bool,
+        random_crop: bool,
+        random_crop_padding_percent: float = 0.05,
+        num_aug_variants: int = 0,
+        augmentor: Optional[Callable] = None,
+        aug_config_hash: Optional[str] = None,
+    ):
         raise NotImplementedError
 
     def _default_is_disk_cached_latents_expected(
@@ -533,6 +641,8 @@ class LatentsCachingStrategy:
         flip_aug: bool,
         apply_alpha_mask: bool,
         multi_resolution: bool = False,
+        num_aug_variants: int = 0,
+        aug_config_hash: Optional[str] = None,
     ) -> bool:
         """
         Args:
@@ -542,6 +652,8 @@ class LatentsCachingStrategy:
             flip_aug: whether to flip images
             apply_alpha_mask: whether to apply alpha mask
             multi_resolution: whether to use multi-resolution latents
+            num_aug_variants: number of augmentation variants expected (0 = legacy cache)
+            aug_config_hash: expected augmentation config hash (None = do not check)
 
         Returns:
             bool
@@ -559,16 +671,33 @@ class LatentsCachingStrategy:
         key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}" if multi_resolution else ""
 
         try:
-            npz = np.load(npz_path)
+            npz = load_npz(npz_path)
 
             # In old SD/SDXL npz files, if the actual latents shape does not match the expected shape, it doesn't raise an error as long as "latents" key exists (backward compatibility)
             # In non-SD/SDXL npz files (multi-resolution support), the latents key always has the resolution suffix, and no latents key without suffix exists, so it raises an error if the expected resolution suffix key is not found (this doesn't change the behavior for non-SD/SDXL npz files).
             if "latents" + key_reso_suffix not in npz and "latents" not in npz:
                 return False
-            if flip_aug and ("latents_flipped" + key_reso_suffix not in npz and "latents_flipped" not in npz):
+            if flip_aug and num_aug_variants <= 0 and ("latents_flipped" + key_reso_suffix not in npz and "latents_flipped" not in npz):
                 return False
             if apply_alpha_mask and ("alpha_mask" + key_reso_suffix not in npz and "alpha_mask" not in npz):
                 return False
+
+            if num_aug_variants > 0:
+                # variant caches must carry metadata, enough variants, a matching
+                # augmentation config hash, and all per-variant keys
+                if "aug_variants" not in npz or "aug_config_hash" not in npz:
+                    return False
+                if int(npz["aug_variants"]) < num_aug_variants:
+                    return False
+                if aug_config_hash is not None and str(npz["aug_config_hash"].tolist()) != aug_config_hash:
+                    return False
+                for k in range(1, num_aug_variants):
+                    if variant_key("latents", k) + key_reso_suffix not in npz:
+                        return False
+                    if variant_key("crop_ltrb", k) + key_reso_suffix not in npz:
+                        return False
+                    if apply_alpha_mask and variant_key("alpha_mask", k) + key_reso_suffix not in npz:
+                        return False
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
             raise e
@@ -587,6 +716,9 @@ class LatentsCachingStrategy:
         random_crop: bool,
         multi_resolution: bool = False,
         random_crop_padding_percent: float = 0.05,
+        num_aug_variants: int = 0,
+        augmentor: Optional[Callable] = None,
+        aug_config_hash: Optional[str] = None,
     ):
         """
         Default implementation for cache_batch_latents. Image loading, VAE, flipping, alpha mask handling are common.
@@ -600,11 +732,31 @@ class LatentsCachingStrategy:
             apply_alpha_mask: whether to apply alpha mask
             random_crop: whether to random crop images
             multi_resolution: whether to use multi-resolution latents
+            num_aug_variants: number of augmentation variants to cache (>1 enables variant caching)
+            augmentor: color/gamma augmentor (from AugHelper.get_augmentor), applied per variant in pixel space
+            aug_config_hash: augmentation config hash stored in the npz for cache invalidation
 
         Returns:
             None
         """
         from library import train_util  # import here to avoid circular import
+
+        if num_aug_variants is not None and num_aug_variants > 1:
+            self._default_cache_batch_latents_with_variants(
+                encode_by_vae,
+                vae_device,
+                vae_dtype,
+                image_infos,
+                flip_aug,
+                apply_alpha_mask,
+                random_crop,
+                multi_resolution,
+                random_crop_padding_percent,
+                num_aug_variants,
+                augmentor,
+                aug_config_hash,
+            )
+            return
 
         img_tensor, alpha_masks, original_sizes, crop_ltrbs = train_util.load_images_and_masks_for_caching(
             image_infos, apply_alpha_mask, random_crop, random_crop_padding_percent=random_crop_padding_percent
@@ -644,15 +796,108 @@ class LatentsCachingStrategy:
                     info.latents_flipped = flipped_latent
                 info.alpha_mask = alpha_mask
 
+    def _default_cache_batch_latents_with_variants(
+        self,
+        encode_by_vae: Callable,
+        vae_device: torch.device,
+        vae_dtype: torch.dtype,
+        image_infos: List,
+        flip_aug: bool,
+        apply_alpha_mask: bool,
+        random_crop: bool,
+        multi_resolution: bool,
+        random_crop_padding_percent: float,
+        num_aug_variants: int,
+        augmentor: Optional[Callable],
+        aug_config_hash: Optional[str],
+    ):
+        """
+        Cache K augmentation variants per image. All augmentations (random crop, flip,
+        color/gamma) are applied in pixel space BEFORE VAE encoding, so every cached
+        latent is exact (crop-then-encode, flip-then-encode). Variant 0 is canonical
+        (center crop, unflipped, no color/gamma aug) and is stored under the legacy keys.
+
+        Args:
+            encode_by_vae: function to encode images by VAE
+            vae_device: device to use for VAE
+            vae_dtype: dtype to use for VAE
+            image_infos: list of ImageInfo
+            flip_aug: whether variants may be flipped (baked into variant pixels)
+            apply_alpha_mask: whether to apply alpha mask
+            random_crop: whether variants use random crop offsets
+            multi_resolution: whether to use multi-resolution latents
+            random_crop_padding_percent: padding percent for random crop resize
+            num_aug_variants: total number of variants K (including canonical variant 0)
+            augmentor: color/gamma augmentor, applied per variant in pixel space
+            aug_config_hash: augmentation config hash stored in the npz for cache invalidation
+
+        Returns:
+            None
+        """
+        from library import train_util  # import here to avoid circular import
+
+        images_per_variant, alpha_masks_per_variant, original_sizes, crop_ltrbs_per_variant, flippeds_per_variant = (
+            train_util.load_image_variants_for_caching(
+                image_infos, num_aug_variants, apply_alpha_mask, flip_aug, augmentor, random_crop, random_crop_padding_percent
+            )
+        )
+
+        latents_per_variant: List[torch.Tensor] = []
+        for k in range(num_aug_variants):
+            img_tensor = images_per_variant[k].to(device=vae_device, dtype=vae_dtype)
+            with torch.no_grad():
+                latents_k = encode_by_vae(img_tensor).to("cpu")
+            latents_per_variant.append(latents_k)
+            del img_tensor
+
+        for i in range(len(image_infos)):
+            info = image_infos[i]
+            latents = latents_per_variant[0][i]
+            original_size = original_sizes[i]
+
+            latents_size = latents.shape[-2:]  # H, W (supports both 4D and 5D latents)
+            key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}" if multi_resolution else ""  # e.g. "_32x64", HxW
+
+            aug_variants = [
+                {
+                    "latents": latents_per_variant[k][i],
+                    "crop_ltrb": crop_ltrbs_per_variant[k][i],
+                    "flipped": flippeds_per_variant[k][i],
+                    "alpha_mask": alpha_masks_per_variant[k][i],
+                }
+                for k in range(1, num_aug_variants)
+            ]
+
+            if self.cache_to_disk:
+                self.save_latents_to_disk(
+                    info.latents_npz,
+                    latents,
+                    original_size,
+                    crop_ltrbs_per_variant[0][i],
+                    None,  # no separate flipped latents: flip is baked into variants
+                    alpha_masks_per_variant[0][i],
+                    key_reso_suffix,
+                    aug_variants=aug_variants,
+                    aug_config_hash=aug_config_hash,
+                )
+            else:
+                info.latents_original_size = original_size
+                info.latents_crop_ltrb = crop_ltrbs_per_variant[0][i]
+                info.latents = latents
+                info.latents_flipped = None  # flip is baked into variants, not cached separately
+                info.alpha_mask = alpha_masks_per_variant[0][i]
+                info.latents_aug_variants = aug_variants
+
     def load_latents_from_disk(
-        self, npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+        self, npz_path: str, bucket_reso: Tuple[int, int], variant: int = 0
+    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray], Optional[bool]]:
         """
         For single resolution architectures (currently no architecture is single resolution specific). Kept for reference.
 
         Args:
             npz_path (str): Path to the npz file.
             bucket_reso (Tuple[int, int]): The resolution of the bucket.
+            variant (int): Augmentation variant index (0 = canonical/legacy).
 
         Returns:
             Tuple[
@@ -660,19 +905,22 @@ class LatentsCachingStrategy:
                 Optional[List[int]],
                 Optional[List[int]],
                 Optional[np.ndarray],
-                Optional[np.ndarray]
-            ]: Latent np tensors, original size, crop (left top, right bottom), flipped latents, alpha mask
+                Optional[np.ndarray],
+                Optional[bool]
+            ]: Latent np tensors, original size, crop (left top, right bottom), flipped latents, alpha mask,
+                variant flipped flag (None for variant 0 / legacy caches)
         """
-        return self._default_load_latents_from_disk(None, npz_path, bucket_reso)
+        return self._default_load_latents_from_disk(None, npz_path, bucket_reso, variant=variant)
 
     def _default_load_latents_from_disk(
-        self, latents_stride: Optional[int], npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+        self, latents_stride: Optional[int], npz_path: str, bucket_reso: Tuple[int, int], variant: int = 0
+    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray], Optional[bool]]:
         """
         Args:
             latents_stride (Optional[int]): Stride for latents. If None, load all latents.
             npz_path (str): Path to the npz file.
             bucket_reso (Tuple[int, int]): The resolution of the bucket.
+            variant (int): Augmentation variant index (0 = canonical/legacy).
 
         Returns:
             Tuple[
@@ -680,8 +928,10 @@ class LatentsCachingStrategy:
                 Optional[List[int]],
                 Optional[List[int]],
                 Optional[np.ndarray],
-                Optional[np.ndarray]
-            ]: Latent np tensors, original size, crop (left top, right bottom), flipped latents, alpha mask
+                Optional[np.ndarray],
+                Optional[bool]
+            ]: Latent np tensors, original size, crop (left top, right bottom), flipped latents, alpha mask,
+                variant flipped flag (None for variant 0 / legacy caches, bool for variant >= 1)
         """
         if latents_stride is None:
             key_reso_suffix = ""
@@ -689,8 +939,11 @@ class LatentsCachingStrategy:
             expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
             key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"  # e.g. "_32x64", HxW
 
-        npz = np.load(npz_path)
-        if "latents" + key_reso_suffix not in npz:
+        npz = load_npz(npz_path)
+        latents_key = variant_key("latents", variant) + key_reso_suffix
+        if latents_key not in npz:
+            if variant > 0:
+                raise ValueError(f"{latents_key} not found in {npz_path} (augmentation variant {variant} is not cached)")
             # raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
             # Fallback to old npz without resolution suffix
             if "latents" not in npz:
@@ -701,13 +954,29 @@ class LatentsCachingStrategy:
                 )
                 self._warned_fallback_to_old_npz = True
             key_reso_suffix = ""
+            latents_key = "latents"
 
-        latents = npz["latents" + key_reso_suffix]
-        original_size = npz["original_size" + key_reso_suffix].tolist()
-        crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
-        flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
-        alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
-        return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
+        latents = npz[latents_key]
+        original_size = npz[variant_key("original_size", variant) + key_reso_suffix].tolist()
+        crop_ltrb = npz[variant_key("crop_ltrb", variant) + key_reso_suffix].tolist()
+
+        variant_flipped: Optional[bool] = None
+        if variant > 0:
+            # flip is baked into variant latents (pixels are flipped before VAE encoding);
+            # only the flag is needed for size conditioning
+            flipped_key = variant_key("flipped", variant) + key_reso_suffix
+            variant_flipped = bool(npz[flipped_key].tolist()) if flipped_key in npz else False
+            flipped_latents = None
+        else:
+            if "aug_variants" in npz:
+                # variant cache: flip is baked into the variants; the canonical variant is
+                # unflipped and no separate flipped latents are stored for it
+                variant_flipped = False
+            flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
+
+        alpha_mask_key = variant_key("alpha_mask", variant) + key_reso_suffix
+        alpha_mask = npz[alpha_mask_key] if alpha_mask_key in npz else None
+        return latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped
 
     def save_latents_to_disk(
         self,
@@ -718,16 +987,22 @@ class LatentsCachingStrategy:
         flipped_latents_tensor=None,
         alpha_mask=None,
         key_reso_suffix="",
+        aug_variants: Optional[List[Dict[str, Any]]] = None,
+        aug_config_hash: Optional[str] = None,
     ):
         """
         Args:
             npz_path (str): Path to the npz file.
-            latents_tensor (torch.Tensor): Latent tensor
+            latents_tensor (torch.Tensor): Latent tensor (canonical / variant 0)
             original_size (List[int]): Original size of the image
-            crop_ltrb (List[int]): Crop left top right bottom
-            flipped_latents_tensor (Optional[torch.Tensor]): Flipped latent tensor
-            alpha_mask (Optional[torch.Tensor]): Alpha mask
+            crop_ltrb (List[int]): Crop left top right bottom (canonical)
+            flipped_latents_tensor (Optional[torch.Tensor]): Flipped latent tensor (legacy flip cache, variant 0 only)
+            alpha_mask (Optional[torch.Tensor]): Alpha mask (canonical)
             key_reso_suffix (str): Key resolution suffix
+            aug_variants (Optional[List[Dict[str, Any]]]): augmentation variants 1..K-1, each a dict with
+                keys ``latents`` (tensor), ``crop_ltrb``, ``flipped`` (bool) and optional ``alpha_mask``.
+                Flip is baked into the variant latents (pixels are flipped before encoding).
+            aug_config_hash (Optional[str]): augmentation config hash for cache invalidation
 
         Returns:
             None
@@ -736,9 +1011,7 @@ class LatentsCachingStrategy:
 
         if os.path.exists(npz_path):
             # load existing npz and update it
-            npz = np.load(npz_path)
-            for key in npz.files:
-                kwargs[key] = npz[key]
+            kwargs.update(load_npz(npz_path))
 
         # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
         kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
@@ -748,4 +1021,17 @@ class LatentsCachingStrategy:
             kwargs["latents_flipped" + key_reso_suffix] = flipped_latents_tensor.float().cpu().numpy()
         if alpha_mask is not None:
             kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
-        np.savez(npz_path, **kwargs)
+
+        if aug_variants:
+            for k, var in enumerate(aug_variants, start=1):
+                kwargs[variant_key("latents", k) + key_reso_suffix] = var["latents"].float().cpu().numpy()
+                kwargs[variant_key("original_size", k) + key_reso_suffix] = np.array(original_size)
+                kwargs[variant_key("crop_ltrb", k) + key_reso_suffix] = np.array(var["crop_ltrb"])
+                kwargs[variant_key("flipped", k) + key_reso_suffix] = np.array(bool(var.get("flipped", False)))
+                if var.get("alpha_mask") is not None:
+                    kwargs[variant_key("alpha_mask", k) + key_reso_suffix] = var["alpha_mask"].float().cpu().numpy()
+            kwargs["aug_variants"] = np.array(len(aug_variants) + 1)
+        if aug_config_hash is not None:
+            kwargs["aug_config_hash"] = np.array(aug_config_hash)
+
+        save_npz(npz_path, kwargs, cache_dtype=self.cache_dtype)

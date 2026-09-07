@@ -311,7 +311,8 @@ def train(args):
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
-            False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
@@ -544,7 +545,9 @@ def train(args):
         if args.cache_text_encoder_outputs:
             # Text Encodes are eval and no grad
             text_encoder_output_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, None, False, is_weighted=args.weighted_captions
+                args.cache_text_encoder_outputs_to_disk, None, False,
+                is_weighted=args.weighted_captions,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_output_caching_strategy)
 

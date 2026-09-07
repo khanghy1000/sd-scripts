@@ -14,7 +14,7 @@ from library.safetensors_utils import load_safetensors
 init_ipex()
 
 from library import flux_models, flux_train_utils, flux_utils, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3, train_util
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 import train_network
 from library import utils
 from library.utils import setup_logging
@@ -29,6 +29,8 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        # SD3 preconditioning yields x0 directly: model_pred * (-sigmas) + noisy
+        self.hf_prediction_mode = "x0_direct"
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -54,7 +56,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         if args.cache_text_encoder_outputs:
             assert (
                 train_dataset_group.is_text_encoder_output_cacheable()
-            ), "when caching Text Encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / Text Encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
+            ), "when caching Text Encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used (use --cache_caption_variants for all but token_warmup_step) / Text Encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません（token_warmup_step以外は--cache_caption_variantsで対応可能です）"
 
         # prepare CLIP-L/CLIP-G/T5XXL training flags
         self.train_clip = not args.network_train_unet_only
@@ -170,7 +172,8 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
     def get_latents_caching_strategy(self, args):
         latents_caching_strategy = strategy_sd3.Sd3LatentsCachingStrategy(
-            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         return latents_caching_strategy
 
@@ -214,6 +217,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
                 is_partial=self.train_clip or self.train_t5xxl,
                 apply_lg_attn_mask=args.apply_lg_attn_mask,
                 apply_t5_attn_mask=args.apply_t5_attn_mask,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None
@@ -347,6 +351,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = sd3_train_utils.get_noisy_model_input_and_timesteps(
@@ -356,6 +361,10 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for High-Frequency Token loss (4D pre-pack; SD3 never packs)
+        if is_train and self.hf_scale > 0.0:
+            self._hf_noisy_latents = noisy_model_input.detach()
 
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
@@ -420,7 +429,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:

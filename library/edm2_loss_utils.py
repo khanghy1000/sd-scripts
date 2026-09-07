@@ -113,7 +113,7 @@ def plot_edm2_loss_weighting(args, step: int, model, num_timesteps: int = 1000, 
 
     with torch.inference_mode():
         unwrapped_model.train(False)
-        timesteps = torch.arange(0, 1000, device=device, dtype=torch.long)
+        timesteps = torch.arange(0, num_timesteps, device=device, dtype=torch.long)
         learnedweights = unwrapped_model._forward(timesteps).cpu().numpy()
         lambdas = unwrapped_model.lambda_weights.cpu().numpy()
         learnedweights = lambdas/np.exp(learnedweights)

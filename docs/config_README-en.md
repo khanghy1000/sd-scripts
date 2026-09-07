@@ -15,7 +15,7 @@ By passing a configuration file, users can make detailed settings.
    * In training methods that support both the DreamBooth approach and the fine-tuning approach, datasets of the DreamBooth method and the fine-tuning method can be mixed.
 * Settings can be changed for each subset
    * A subset is a partition of the dataset by image directory or metadata. Several subsets make up a dataset.
-   * Options such as `keep_tokens` and `flip_aug` can be set for each subset. On the other hand, options such as `resolution` and `batch_size` can be set for each dataset, and their values are common among subsets belonging to the same dataset. More details will be provided later.
+   * Options such as `keep_tokens` and `flip_aug` can be set for each subset. `resolution`, `min_bucket_reso`, `max_bucket_reso`, and `batch_size` can override the parent dataset values for an individual subset. More details will be provided later.
 
 The configuration file format can be JSON or TOML. Considering the ease of writing, it is recommended to use [TOML](https://toml.io/ja/v1.0.0-rc.2). The following explanation assumes the use of TOML.
 
@@ -110,7 +110,7 @@ These are options that can be specified regardless of the learning method.
 
 #### Data set specific options
 
-These are options related to the configuration of the data set. They cannot be described in `datasets.subsets`.
+These are options related to the configuration of the data set. Most of them cannot be described in `datasets.subsets`; `resolution`, `min_bucket_reso`, `max_bucket_reso`, and `batch_size` are also available there as overrides.
 
 
 | Option Name | Example Setting | `[general]` | `[[datasets]]` |
@@ -124,15 +124,60 @@ These are options related to the configuration of the data set. They cannot be d
 | `resolution` | `256`, `[512, 512]` | o | o |
 | `skip_image_resolution` | `768`, `[512, 768]` | o | o |
 
+The following dataset options can be overridden in `[[datasets.subsets]]`:
+
+| Option Name | Example Setting | `[[datasets.subsets]]` |
+| ---- | ---- | ---- |
+| `resolution` | `256`, `[512, 512]` | o |
+| `min_bucket_reso` | `128` | o |
+| `max_bucket_reso` | `1024` | o |
+| `batch_size` | `2` | o |
+
 * `batch_size`
     * This corresponds to the command-line argument `--train_batch_size`.
+    * When set on a subset, batches for that subset are formed with this size instead of the dataset-level `batch_size`. Batches never mix images from different subsets, so a per-subset batch size changes the number of steps per epoch and the relative contribution of each subset to training.
 * `max_bucket_reso`, `min_bucket_reso`
     * Specify the maximum and minimum resolutions of the bucket. It must be divisible by `bucket_reso_steps`.
 * `skip_image_resolution`
     * Images whose original resolution (area) is equal to or smaller than the specified resolution will be skipped. Specify as `'size'` or `[width, height]`. This corresponds to the command-line argument `--skip_image_resolution`.
     * Useful when sharing the same image directory across multiple datasets with different resolutions, to exclude low-resolution source images from higher-resolution datasets.
 
-These settings are fixed per dataset. That means that subsets belonging to the same dataset will share these settings. For example, if you want to prepare datasets with different resolutions, you can define them as separate datasets as shown in the example above, and set different resolutions for each.
+By default, these settings are inherited by subsets from their parent dataset. `resolution`, `min_bucket_reso`, `max_bucket_reso`, and `batch_size` can also be overridden for an individual subset. Other settings in this table remain fixed per dataset, so subsets belonging to the same dataset share them.
+
+For example, the following dataset uses the parent settings for the first subset and overrides the training resolution and bucket bounds for the second subset:
+
+```toml
+[[datasets]]
+resolution = 768
+min_bucket_reso = 256
+max_bucket_reso = 1024
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+
+  [[datasets.subsets]]
+  image_dir = 'C:\fuga'
+  resolution = 1024
+  min_bucket_reso = 512
+  max_bucket_reso = 1536
+```
+
+When `enable_bucket = true`, each subset is assigned buckets using its effective resolution and bucket bounds. Batches are formed per subset with the subset's effective `batch_size` (inherited from the dataset unless overridden), so a batch never mixes images from different subsets:
+
+```toml
+[[datasets]]
+resolution = 768
+batch_size = 4
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+
+  [[datasets.subsets]]
+  image_dir = 'C:\fuga'
+  batch_size = 1
+```
+
+In this example, images from `C:\hoge` are trained in batches of 4 while images from `C:\fuga` are trained one at a time.
 
 #### Options for Subsets
 

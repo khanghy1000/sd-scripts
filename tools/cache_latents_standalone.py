@@ -23,6 +23,7 @@ from tqdm import tqdm
 import hashlib
 
 from library import config_util, model_util, sdxl_train_util, train_util
+from library.cache_utils import load_npz, save_npz
 from library.config_util import BlueprintGenerator, ConfigSanitizer
 from copy import deepcopy
 
@@ -65,6 +66,7 @@ def save_latents_to_disk(
     flipped_latents_tensor=None,
     alpha_mask=None,
     key_reso_suffix="",
+    cache_dtype="auto",
 ):
     """
     Args:
@@ -83,9 +85,7 @@ def save_latents_to_disk(
 
     if os.path.exists(npz_path):
         # load existing npz and update it
-        npz = np.load(npz_path)
-        for key in npz.files:
-            kwargs[key] = npz[key]
+        kwargs.update(load_npz(npz_path))
 
     # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
     kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
@@ -95,7 +95,7 @@ def save_latents_to_disk(
         kwargs["latents_flipped" + key_reso_suffix] = flipped_latents_tensor.float().cpu().numpy()
     if alpha_mask is not None:
         kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
-    np.savez(npz_path, **kwargs)
+    save_npz(npz_path, kwargs, cache_dtype=cache_dtype)
 
 
 class ShardSampler(Sampler[int]):
@@ -315,6 +315,7 @@ def cache_latents_fast(dataset, vae, accelerator, args):
                 crop_ltrb,
                 flipped_latents_cpu[i] if flipped_latents_cpu is not None else None,
                 alpha_mask,
+                cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
             )
 
         if stop_event.is_set():
@@ -420,6 +421,7 @@ def cache_latents_for_dataset(dataset, vae, accelerator, args):
                 crop_ltrb,
                 flipped_latents_cpu[i] if flipped_latents_cpu is not None else None,
                 alpha_mask,
+                cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
             )
 
         if stop_event.is_set():
@@ -521,6 +523,24 @@ def cache_latents(args: argparse.Namespace) -> None:
             if filtered:
                 new_buckets.append(filtered)
         dataset.bucket_manager.buckets = new_buckets
+
+        # keep the subset-scoped batching buckets and batch indices consistent with the filtered image set
+        new_batch_buckets = []
+        new_batch_bucket_subsets = []
+        for bucket, subset in zip(dataset.batch_buckets, dataset.batch_bucket_subsets):
+            filtered = [k for k in bucket if k in my_keys]
+            if filtered:
+                new_batch_buckets.append(filtered)
+                new_batch_bucket_subsets.append(subset)
+        dataset.batch_buckets = new_batch_buckets
+        dataset.batch_bucket_subsets = new_batch_bucket_subsets
+        dataset.buckets_indices = []
+        for bucket_index, bucket in enumerate(dataset.batch_buckets):
+            bucket_batch_size = dataset.get_subset_batch_size(dataset.batch_bucket_subsets[bucket_index])
+            batch_count = math.ceil(len(bucket) / bucket_batch_size)
+            for batch_index in range(batch_count):
+                dataset.buckets_indices.append(train_util.BucketBatchIndex(bucket_index, bucket_batch_size, batch_index))
+        dataset._length = len(dataset.buckets_indices)
 
         # allow every rank to write its shard
         dataset.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, True)

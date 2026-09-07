@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import re
 from library.utils import setup_logging
 from networks.ramtorch_utils import transfer_ramtensor_to_device
+from networks.network_base import _tag_all_network_params
 
 setup_logging()
 import logging
@@ -384,6 +385,7 @@ class OFTNetwork(torch.nn.Module):
                                  apply_orthograd: bool, 
                                  orthograd_targets: list[str]):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
         all_params = []
 
         def enumerate_params(ofts):
@@ -411,6 +413,7 @@ class OFTNetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        _tag_all_network_params(self)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()

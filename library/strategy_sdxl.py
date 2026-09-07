@@ -4,7 +4,8 @@ from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
-from library.strategy_base import TokenizeStrategy, TextEncodingStrategy, TextEncoderOutputsCachingStrategy
+from library.cache_utils import load_npz, save_npz
+from library.strategy_base import TokenizeStrategy, TextEncodingStrategy, TextEncoderOutputsCachingStrategy, variant_key
 
 
 from library.utils import setup_logging
@@ -331,14 +332,15 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         is_partial: bool = False,
         is_weighted: bool = False,
         use_attention_mask: bool = True,
+        cache_dtype: str = "auto",
     ) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, is_weighted)
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, is_weighted, cache_dtype)
         self.use_attention_mask = use_attention_mask
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return os.path.splitext(image_abs_path)[0] + SdxlTextEncoderOutputsCachingStrategy.SDXL_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
 
-    def is_disk_cached_outputs_expected(self, npz_path: str):
+    def is_disk_cached_outputs_expected(self, npz_path: str, num_caption_variants: int = 0, caption_aug_hash: Optional[str] = None):
         if not self.cache_to_disk:
             return False
         if not os.path.exists(npz_path):
@@ -347,11 +349,13 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             return True
 
         try:
-            npz = np.load(npz_path)
+            npz = load_npz(npz_path)
             required_keys = {"hidden_state1", "hidden_state2", "pool2"}
             if self.use_attention_mask:
                 required_keys.update({"attention_mask1", "attention_mask2"})
-            if not required_keys.issubset(npz.files):
+            if not required_keys.issubset(npz.keys()):
+                return False
+            if not self._check_cached_variant_keys(npz, required_keys, num_caption_variants, caption_aug_hash):
                 return False
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
@@ -359,14 +363,14 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
 
         return True
 
-    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
-        data = np.load(npz_path)
-        hidden_state1 = data["hidden_state1"]
-        hidden_state2 = data["hidden_state2"]
-        pool2 = data["pool2"]
+    def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
+        data = load_npz(npz_path)
+        hidden_state1 = self._npz_get(data, "hidden_state1", variant)
+        hidden_state2 = self._npz_get(data, "hidden_state2", variant)
+        pool2 = self._npz_get(data, "pool2", variant)
         if self.use_attention_mask and "attention_mask1" in data and "attention_mask2" in data:
-            attention_mask1 = data["attention_mask1"]
-            attention_mask2 = data["attention_mask2"]
+            attention_mask1 = self._npz_get(data, "attention_mask1", variant)
+            attention_mask2 = self._npz_get(data, "attention_mask2", variant)
             return [hidden_state1, hidden_state2, pool2, attention_mask1, attention_mask2]
         return [hidden_state1, hidden_state2, pool2]
 
@@ -374,64 +378,81 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
     ):
         sdxl_text_encoding_strategy = text_encoding_strategy  # type: SdxlTextEncodingStrategy
-        captions = [info.caption for info in infos]
 
-        if self.is_weighted:
-            tokens_list, weights_list = tokenize_strategy.tokenize_with_weights(captions)
-            with torch.no_grad():
-                hidden_state1, hidden_state2, pool2 = sdxl_text_encoding_strategy.encode_tokens_with_weights(
-                    tokenize_strategy, models, tokens_list, weights_list
-                )
-        else:
-            tokens_and_masks = tokenize_strategy.tokenize(captions)
-            (tokens1, tokens2), mask_pair = tokens_and_masks
-            mask1, mask2 = mask_pair
-            if mask1 is not None and mask1.dim() == 2:
-                mask1 = mask1.unsqueeze(0)
-            if mask2 is not None and mask2.dim() == 2:
-                mask2 = mask2.unsqueeze(0)
-            mask_args: Optional[list[Optional[torch.Tensor]]] = None
-            if mask1 is not None or mask2 is not None:
-                mask_args = [mask1, mask2]
-            with torch.no_grad():
-                encoded, attn = sdxl_text_encoding_strategy.encode_tokens(
-                    tokenize_strategy, models, [tokens1, tokens2], mask_args
-                )
-                hidden_state1, hidden_state2, pool2 = encoded
-                attn1, attn2 = attn
+        canonical_captions, variant_groups = self._get_variant_caption_groups(infos)
 
-        if hidden_state1.dtype == torch.bfloat16:
-            hidden_state1 = hidden_state1.float()
-        if hidden_state2.dtype == torch.bfloat16:
-            hidden_state2 = hidden_state2.float()
-        if pool2.dtype == torch.bfloat16:
-            pool2 = pool2.float()
+        def encode_captions(captions: List[str]) -> dict:
+            if self.is_weighted:
+                tokens_list, weights_list = tokenize_strategy.tokenize_with_weights(captions)
+                with torch.no_grad():
+                    hidden_state1, hidden_state2, pool2 = sdxl_text_encoding_strategy.encode_tokens_with_weights(
+                        tokenize_strategy, models, tokens_list, weights_list
+                    )
+                attn1 = attn2 = None
+            else:
+                tokens_and_masks = tokenize_strategy.tokenize(captions)
+                (tokens1, tokens2), mask_pair = tokens_and_masks
+                mask1, mask2 = mask_pair
+                if mask1 is not None and mask1.dim() == 2:
+                    mask1 = mask1.unsqueeze(0)
+                if mask2 is not None and mask2.dim() == 2:
+                    mask2 = mask2.unsqueeze(0)
+                mask_args: Optional[list[Optional[torch.Tensor]]] = None
+                if mask1 is not None or mask2 is not None:
+                    mask_args = [mask1, mask2]
+                with torch.no_grad():
+                    encoded, attn = sdxl_text_encoding_strategy.encode_tokens(
+                        tokenize_strategy, models, [tokens1, tokens2], mask_args
+                    )
+                    hidden_state1, hidden_state2, pool2 = encoded
+                    attn1, attn2 = attn
 
-        hidden_state1 = hidden_state1.cpu().numpy()
-        hidden_state2 = hidden_state2.cpu().numpy()
-        pool2 = pool2.cpu().numpy()
-        attn1_np = attn1.cpu().numpy() if attn1 is not None else None
-        attn2_np = attn2.cpu().numpy() if attn2 is not None else None
+            if hidden_state1.dtype == torch.bfloat16:
+                hidden_state1 = hidden_state1.float()
+            if hidden_state2.dtype == torch.bfloat16:
+                hidden_state2 = hidden_state2.float()
+            if pool2.dtype == torch.bfloat16:
+                pool2 = pool2.float()
+
+            return {
+                "hidden_state1": hidden_state1.cpu().numpy(),
+                "hidden_state2": hidden_state2.cpu().numpy(),
+                "pool2": pool2.cpu().numpy(),
+                "attention_mask1": attn1.cpu().numpy() if attn1 is not None else None,
+                "attention_mask2": attn2.cpu().numpy() if attn2 is not None else None,
+            }
+
+        batched = encode_captions(canonical_captions)
+        variant_batched = [(group, encode_captions([c for _, c in group])) for group in variant_groups]
+
+        base_keys = ["hidden_state1", "hidden_state2", "pool2"]
+        if batched["attention_mask1"] is not None and batched["attention_mask2"] is not None:
+            base_keys = base_keys + ["attention_mask1", "attention_mask2"]
 
         for i, info in enumerate(infos):
-            hidden_state1_i = hidden_state1[i]
-            hidden_state2_i = hidden_state2[i]
-            pool2_i = pool2[i]
-            attn1_i = attn1_np[i] if attn1_np is not None else None
-            attn2_i = attn2_np[i] if attn2_np is not None else None
+            n_variants = len(info.caption_variants) if getattr(info, "caption_variants", None) else 0
 
             if self.cache_to_disk:
-                save_kwargs = {
-                    "hidden_state1": hidden_state1_i,
-                    "hidden_state2": hidden_state2_i,
-                    "pool2": pool2_i,
-                }
-                if attn1_i is not None and attn2_i is not None:
-                    save_kwargs["attention_mask1"] = attn1_i
-                    save_kwargs["attention_mask2"] = attn2_i
-                np.savez(info.text_encoder_outputs_npz, **save_kwargs)
+                save_kwargs = {key: batched[key][i] for key in base_keys}
+                for k, (group, vb) in enumerate(variant_batched, start=1):
+                    idxs = [idx for idx, _ in group]
+                    if i not in idxs:
+                        continue
+                    j = idxs.index(i)
+                    for key in base_keys:
+                        save_kwargs[variant_key(key, k)] = vb[key][j]
+                if n_variants > 1:
+                    save_kwargs["caption_variants"] = np.array(n_variants)
+                    save_kwargs["caption_aug_hash"] = np.array(getattr(info, "caption_aug_hash", None) or "")
+                save_npz(info.text_encoder_outputs_npz, save_kwargs, cache_dtype=self.cache_dtype)
             else:
-                if attn1_i is not None and attn2_i is not None:
-                    info.text_encoder_outputs = [hidden_state1_i, hidden_state2_i, pool2_i, attn1_i, attn2_i]
-                else:
-                    info.text_encoder_outputs = [hidden_state1_i, hidden_state2_i, pool2_i]
+                info.text_encoder_outputs = [batched[key][i] for key in base_keys]
+                if n_variants > 1:
+                    variants_outputs = []
+                    for k, (group, vb) in enumerate(variant_batched, start=1):
+                        idxs = [idx for idx, _ in group]
+                        if i not in idxs:
+                            continue
+                        j = idxs.index(i)
+                        variants_outputs.append([vb[key][j] for key in base_keys])
+                    info.text_encoder_outputs_variants = variants_outputs

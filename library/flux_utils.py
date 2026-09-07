@@ -24,6 +24,7 @@ MODEL_VERSION_FLUX_V1 = "flux1"
 MODEL_NAME_DEV = "dev"
 MODEL_NAME_SCHNELL = "schnell"
 MODEL_VERSION_CHROMA = "chroma"
+MODEL_VERSION_CHROMA_RADIANCE = "chroma_radiance"
 
 
 def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int], List[str]]:
@@ -169,8 +170,36 @@ def load_flow_model(
         is_schnell = False  # Chroma is not schnell
         return is_schnell, model
 
+    elif model_type == "chroma_radiance":
+        from . import chroma_radiance_models
+
+        # build model
+        logger.info("Building ChromaRadiance model")
+        with torch.device("meta"):
+            model = chroma_radiance_models.ChromaRadiance(
+                chroma_radiance_models.chroma_radiance_params
+            )
+            if dtype is not None:
+                model = model.to(dtype)
+
+        # load_sft doesn't support torch.device
+        logger.info(f"Loading state dict from {ckpt_path}")
+        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+
+        # if the key has annoying prefix, remove it
+        for key in list(sd.keys()):
+            new_key = key.replace("model.diffusion_model.", "")
+            if new_key == key:
+                break  # the model doesn't have annoying prefix
+            sd[new_key] = sd.pop(key)
+
+        info = model.load_state_dict(sd, strict=False, assign=True)
+        logger.info(f"Loaded ChromaRadiance: {info}")
+        is_schnell = False  # ChromaRadiance is not schnell
+        return is_schnell, model
+
     else:
-        raise ValueError(f"Unsupported model_type: {model_type}. Supported types are 'flux' and 'chroma'.")
+        raise ValueError(f"Unsupported model_type: {model_type}. Supported types are 'flux', 'chroma', and 'chroma_radiance'.")
 
 
 def load_ae(
@@ -242,6 +271,28 @@ class DummyCLIPL(torch.nn.Module):
         """
         batch_size = args[0].shape[0] if args else 1
         return {"pooler_output": torch.zeros(batch_size, *self.output_shape, device=self.device, dtype=self.dtype)}
+
+
+class _DummyVAE(torch.nn.Module):
+    """Stub VAE for pixel-space models that don't need encoding."""
+
+    def __init__(self, dtype: torch.dtype, device: torch.device):
+        super().__init__()
+        self.dummy_param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    @property
+    def device(self):
+        return self.dummy_param.device
+
+    @property
+    def dtype(self):
+        return self.dummy_param.dtype
+
+    def encode(self, x):
+        return x
+
+    def decode(self, x):
+        return x
 
 
 def load_clip_l(

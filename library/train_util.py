@@ -42,7 +42,14 @@ from packaging.version import Version
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
+from library.cache_utils import CACHE_DTYPE_CHOICES, load_npz, save_npz
+from library.strategy_base import (
+    LatentsCachingStrategy,
+    TokenizeStrategy,
+    TextEncoderOutputsCachingStrategy,
+    TextEncodingStrategy,
+    compute_aug_config_hash,
+)
 from library.strategy_sdxl import SdxlTokenizeStrategy
 
 init_ipex()
@@ -225,6 +232,16 @@ class ImageInfo:
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
         self.resize_interpolation: Optional[str] = None
+        self.latents_aug_variants: Optional[List[Dict[str, Any]]] = None  # cached augmentation variants 1..K-1 (in-RAM path)
+        self.caption_variants: Optional[List[str]] = None  # processed caption variants (index 0 = canonical)
+        self.caption_aug_hash: Optional[str] = None  # caption augmentation config hash for cache invalidation
+        self.text_encoder_outputs_variants: Optional[List[Any]] = None  # per-variant TE outputs for k=1..K-1 (in-RAM path)
+
+        # resolution jitter: per-jitter-resolution bucket assignment {(reso_side): (bucket_reso, resized_size)}
+        self.jitter_bucket_info: Optional[Dict[int, Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+        # resolution jitter: in-memory latents per jitter resolution
+        # {(reso_side): (latents, latents_flipped, alpha_mask, original_size, crop_ltrb)}
+        self.latents_by_reso: Dict[int, tuple] = {}
 
 
 class BucketManager:
@@ -472,6 +489,13 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -508,6 +532,15 @@ class BaseSubset:
         self.validation_split = float(validation_split) if validation_split is not None else 0.0
 
         self.resize_interpolation = resize_interpolation
+        self.resolution = resolution
+        self.min_bucket_reso = min_bucket_reso
+        self.max_bucket_reso = max_bucket_reso
+        self.batch_size = batch_size
+
+        # resolution jitter (None = inherit from dataset / inactive)
+        self.resolution_jitter_resolutions = resolution_jitter_resolutions
+        self.resolution_jitter_batch_sizes = resolution_jitter_batch_sizes
+        self.resolution_jitter_weights = resolution_jitter_weights
 
 
 class DreamBoothSubset(BaseSubset):
@@ -547,6 +580,13 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -580,6 +620,13 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            resolution=resolution,
+            min_bucket_reso=min_bucket_reso,
+            max_bucket_reso=max_bucket_reso,
+            batch_size=batch_size,
+            resolution_jitter_resolutions=resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes=resolution_jitter_batch_sizes,
+            resolution_jitter_weights=resolution_jitter_weights,
         )
 
         self.is_reg = is_reg
@@ -629,6 +676,13 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -662,6 +716,13 @@ class FineTuningSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            resolution=resolution,
+            min_bucket_reso=min_bucket_reso,
+            max_bucket_reso=max_bucket_reso,
+            batch_size=batch_size,
+            resolution_jitter_resolutions=resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes=resolution_jitter_batch_sizes,
+            resolution_jitter_weights=resolution_jitter_weights,
         )
 
         self.metadata_file = metadata_file
@@ -708,6 +769,13 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -741,6 +809,13 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            resolution=resolution,
+            min_bucket_reso=min_bucket_reso,
+            max_bucket_reso=max_bucket_reso,
+            batch_size=batch_size,
+            resolution_jitter_resolutions=resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes=resolution_jitter_batch_sizes,
+            resolution_jitter_weights=resolution_jitter_weights,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -757,6 +832,29 @@ class ControlNetSubset(BaseSubset):
         return self.image_dir == other.image_dir and self.conditioning_data_dir == other.conditioning_data_dir
 
 
+def convert_te_output_for_batch(x):
+    """Convert one cached text-encoder output to a torch tensor for batch stacking.
+
+    Preserves compact bf16 caches (e.g. Anima) end-to-end instead of widening to
+    fp32; all other inputs keep the historical ``torch.FloatTensor`` behavior.
+    """
+    if isinstance(x, torch.Tensor) and x.dtype == torch.bfloat16:
+        return x
+    return torch.FloatTensor(x)
+
+
+def target_size_from_latents(latents, vae_scale_factor: int = 8):
+    """Pixel-space target size ``(W, H)`` for a cached latent tensor.
+
+    Latents are channels-first with spatial dims trailing: ``[B, C, H, W]``
+    (4D) or ``[B, C, 1, H, W]`` (5D, e.g. Anima). The last two dims are always
+    ``(H, W)`` in both layouts — the same invariant the cache-key resolution
+    relies on (see ``LatentsCachingStrategy``). Returns width-first ``(W, H)``
+    to match the image-path convention in ``BaseDataset.__getitem__``.
+    """
+    return (latents.shape[-1] * vae_scale_factor, latents.shape[-2] * vae_scale_factor)
+
+
 class BaseDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -766,6 +864,9 @@ class BaseDataset(torch.utils.data.Dataset):
         debug_dataset: bool,
         resize_interpolation: Optional[str] = None,
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
 
@@ -775,6 +876,9 @@ class BaseDataset(torch.utils.data.Dataset):
         self.debug_dataset = debug_dataset
         self.log_caption_tag_dropout = False
         self.log_caption_dropout = False
+        self.latents_aug_variant_count = 0  # >1 enables cached augmentation variants for latents
+        self.caption_aug_variant_count = 0  # >1 enables cached caption variants for text encoder outputs
+        self.aug_refresh_epochs = 0  # >0 enables per-epoch in-memory variant regeneration
 
         self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
 
@@ -785,6 +889,21 @@ class BaseDataset(torch.utils.data.Dataset):
 
         self.enable_bucket = False
         self.bucket_manager: BucketManager = None  # not initialized
+        # subset-scoped buckets used for batch formation: each bucket holds image keys
+        # from a single subset so that per-subset batch sizes can be applied
+        self.batch_buckets: List[List[str]] = []
+        self.batch_bucket_subsets: List[BaseSubset] = []
+        # parallel to batch_buckets: jitter resolution side (int) for jitter pools, None otherwise
+        self.batch_bucket_jitter_resos: List[Optional[int]] = []
+        # parallel to batch_buckets: jitter selection weight for the bucket's resolution (None = non-jitter)
+        self.batch_bucket_weights: List[Optional[float]] = []
+        self.has_resolution_jitter: bool = False
+        self.all_buckets_indices: List[BucketBatchIndex] = []
+
+        # dataset-level resolution jitter (subsets defer to these when unset)
+        self.resolution_jitter_resolutions = resolution_jitter_resolutions
+        self.resolution_jitter_batch_sizes = resolution_jitter_batch_sizes
+        self.resolution_jitter_weights = resolution_jitter_weights
         self.min_bucket_reso = None
         self.max_bucket_reso = None
         self.bucket_reso_steps = None
@@ -824,6 +943,17 @@ class BaseDataset(torch.utils.data.Dataset):
         self.tokenize_strategy = None
         self.text_encoder_output_caching_strategy = None
         self.latents_caching_strategy = None
+
+    def set_aug_variant_config(self, latents_aug_variants: int = 0, caption_aug_variants: int = 0):
+        """Configure K-variant sampled augmentation caching.
+
+        Args:
+            latents_aug_variants: number of latent augmentation variants K (0/1 = legacy caching)
+            caption_aug_variants: number of caption augmentation variants K (0/1 = legacy caching)
+        """
+        self.latents_aug_variant_count = int(latents_aug_variants) if latents_aug_variants else 0
+        self.caption_aug_variant_count = int(caption_aug_variants) if caption_aug_variants else 0
+        self.aug_refresh_epochs = 0  # >0 enables per-epoch in-memory variant regeneration
 
     def set_current_strategies(self):
         self.tokenize_strategy = TokenizeStrategy.get_strategy()
@@ -1069,6 +1199,263 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return caption
 
+    def process_caption_canonical(self, subset: BaseSubset, caption: str) -> str:
+        """Deterministic caption processing for the canonical variant (variant 0).
+
+        Applies prefix/suffix, secondary separator and replacements, takes the first line of
+        multiline captions and the first option of wildcards, and skips all stochastic
+        processing (dropout, shuffle, tag dropout, random wildcard/line selection).
+        """
+        if subset.caption_prefix:
+            caption = subset.caption_prefix + " " + caption
+        if subset.caption_suffix:
+            caption = caption + " " + subset.caption_suffix
+
+        # multiline: first line (matches the non-wildcard behavior of process_caption)
+        caption = caption.split("\n")[0]
+
+        # wildcards: deterministic first option, with the same escaping as process_caption
+        replacer1 = "⦅"
+        replacer2 = "⦆"
+        while replacer1 in caption or replacer2 in caption:
+            replacer1 += "⦅"
+            replacer2 += "⦆"
+        caption = caption.replace("{{", replacer1).replace("}}", replacer2)
+        caption = re.sub(r"\{([^}]+)\}", lambda m: m.group(1).split("|")[0], caption)
+        caption = caption.replace(replacer1, "{").replace(replacer2, "}")
+
+        # process secondary separator
+        if subset.secondary_separator:
+            caption = caption.replace(subset.secondary_separator, subset.caption_separator)
+
+        # textual inversion対応 (deterministic: first candidate for list replacements)
+        for str_from, str_to in self.replacements.items():
+            if str_from == "":
+                caption = str_to[0] if type(str_to) == list else str_to
+            else:
+                caption = caption.replace(str_from, str_to)
+
+        return caption
+
+    def get_effective_caption_variant_count(self, subset: BaseSubset) -> int:
+        """Number of caption variants to cache for the subset (0 = legacy caching).
+
+        Variants are only worthwhile when a stochastic caption augmentation is enabled
+        (shuffle, full dropout, tag dropout or wildcards); otherwise the canonical
+        caption is the only possible outcome of process_caption.
+        """
+        if self.caption_aug_variant_count <= 1:
+            return 0
+        if subset.shuffle_caption or subset.caption_dropout_rate > 0 or subset.caption_tag_dropout_rate > 0 or subset.enable_wildcard:
+            return self.caption_aug_variant_count
+        return 0
+
+    def get_caption_aug_config_hash(self, subset: BaseSubset) -> str:
+        """Hash of the subset's caption augmentation config (excludes the variant count itself)."""
+        return compute_aug_config_hash(
+            {
+                "shuffle_caption": subset.shuffle_caption,
+                "keep_tokens": subset.keep_tokens,
+                "keep_tokens_separator": getattr(subset, "keep_tokens_separator", None),
+                "caption_dropout_rate": subset.caption_dropout_rate,
+                "caption_tag_dropout_rate": subset.caption_tag_dropout_rate,
+                "caption_prefix": subset.caption_prefix,
+                "caption_suffix": subset.caption_suffix,
+                "caption_separator": subset.caption_separator,
+                "secondary_separator": subset.secondary_separator,
+                "enable_wildcard": subset.enable_wildcard,
+                "replacements": self.replacements,
+            }
+        )
+
+    def build_caption_variants(self):
+        """Build processed caption variants for every image (info.caption_variants).
+
+        Variant 0 is canonical (deterministic). Variants >= 1 are sampled with
+        process_caption. Epoch/step-dependent triggers (caption_dropout_every_n_epochs,
+        token_warmup_step) are neutralized during sampling because a cache is a static
+        snapshot; token_warmup_step remains incompatible with TE output caching.
+        """
+        for info in self.image_data.values():
+            subset = self.image_to_subset[info.image_key]
+            num_variants = self.get_effective_caption_variant_count(subset)
+            if num_variants <= 1:
+                info.caption_variants = None
+                continue
+
+            variants = [self.process_caption_canonical(subset, info.caption)]
+
+            saved_every_n = subset.caption_dropout_every_n_epochs
+            saved_warmup = subset.token_warmup_step
+            subset.caption_dropout_every_n_epochs = 0
+            subset.token_warmup_step = 0
+            try:
+                for _ in range(num_variants - 1):
+                    variants.append(self.process_caption(subset, info.caption))
+            finally:
+                subset.caption_dropout_every_n_epochs = saved_every_n
+                subset.token_warmup_step = saved_warmup
+
+            info.caption_variants = variants
+
+    def refresh_latent_variants(self, vae_encode_fn, device, dtype):
+        """Regenerate K latent augmentation variants in-memory using VAE.
+
+        Called at epoch boundaries when --cache_aug_refresh_epochs > 0. Moves pixel
+        data through load_image_variants_for_caching + VAE encode to produce fresh
+        augmented latents each epoch. Variant 0 (canonical) is left on disk; only
+        the in-memory ``info.latents_aug_variants`` list is populated.
+
+        Args:
+            vae_encode_fn: callable (img_tensor [B,C,H,W]) -> latents [B,C',H',W']
+            device: torch.device for VAE encoding
+            dtype: torch.dtype for VAE encoding
+        """
+        K = self.latents_aug_variant_count
+        if K <= 1:
+            return
+
+        logger.info(f"Refreshing {K} latent augmentation variants in-memory...")
+        for info in tqdm(self.image_data.values(), desc="Refreshing latent variants"):
+            # Skip validation images — they always use canonical (variant 0)
+            if info.is_val:
+                continue
+            subset = self.image_to_subset[info.image_key]
+            num_variants = self.get_effective_aug_variant_count(subset)
+            if num_variants <= 1:
+                info.latents_aug_variants = None
+                continue
+
+            augmentor = self.aug_helper.get_augmentor(
+                subset.color_aug, subset.gamma_aug, subset.gamma_aug_range, subset.gamma_aug_rate
+            )
+
+            imgs, alphas, orig_sizes, crop_ltrbs, flippeds = load_image_variants_for_caching(
+                [info], num_variants, subset.alpha_mask, subset.flip_aug,
+                augmentor, subset.random_crop, subset.random_crop_padding_percent,
+            )
+
+            aug_variants = []
+            for k in range(1, num_variants):
+                img_tensor = imgs[k].to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    latents_k = vae_encode_fn(img_tensor)
+                latents_k = latents_k[0].cpu()  # [C', H', W']
+                del img_tensor  # free GPU tensor before next variant
+                aug_variants.append({
+                    "latents": latents_k,
+                    "crop_ltrb": crop_ltrbs[k][0],
+                    "flipped": flippeds[k][0],
+                    "alpha_mask": alphas[k][0] if alphas[k][0] is not None else None,
+                })
+
+            info.latents_aug_variants = aug_variants
+
+            # Also refresh canonical if it was stored in RAM (not disk-only)
+            if info.latents is not None:
+                img_tensor = imgs[0].to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    canonical = vae_encode_fn(img_tensor)
+                info.latents = canonical[0].cpu()
+                info.latents_original_size = orig_sizes[0]
+                info.latents_crop_ltrb = crop_ltrbs[0][0]
+                info.alpha_mask = alphas[0][0] if alphas[0][0] is not None else None
+                del img_tensor
+
+    def refresh_caption_te_variants(self, text_encoders, tokenize_strategy, text_encoding_strategy, accelerator):
+        """Regenerate K caption variants and re-encode through text encoders.
+
+        Called at epoch boundaries when --cache_aug_refresh_epochs > 0 and
+        --cache_caption_variants > 1. Re-generates caption strings via
+        build_caption_variants() and re-encodes each variant through the
+        architecture-specific text encoding strategy. Results are stored
+        in-memory on info.text_encoder_outputs and info.text_encoder_outputs_variants.
+
+        Args:
+            text_encoders: list of text encoder models (will be on accelerator.device)
+            tokenize_strategy: active TokenizeStrategy
+            text_encoding_strategy: active TextEncodingStrategy
+            accelerator: Accelerator instance
+        """
+        K = self.caption_aug_variant_count
+        if K <= 1:
+            return
+
+        caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
+        if caching_strategy is None:
+            return
+
+        logger.info(f"Refreshing {K} caption TE variants in-memory...")
+        self.build_caption_variants()
+
+        # Build variant info groups per image (don't encode yet — chunked processing below)
+        variant_groups = []  # list of (real_info, [variant_info_0, ..., variant_info_K-1])
+        for info in self.image_data.values():
+            if info.is_val:
+                continue
+            subset = self.image_to_subset[info.image_key]
+            num_variants = self.get_effective_caption_variant_count(subset)
+            info.caption_aug_hash = self.get_caption_aug_config_hash(subset)
+            if num_variants <= 1:
+                info.text_encoder_outputs_variants = None
+                continue
+
+            vis = []
+            for k in range(num_variants):
+                vi = type(info)(info.image_key, info.num_repeats,
+                    info.caption_variants[k] if info.caption_variants else info.caption,
+                    info.is_reg, info.is_val, info.absolute_path, info.caption_dropout_rate)
+                vi.text_encoder_outputs_npz = None  # prevent disk writes
+                vi.caption_aug_hash = info.caption_aug_hash
+                vis.append(vi)
+            variant_groups.append((info, vis))
+
+        if not variant_groups:
+            logger.info("No caption variants to refresh.")
+            return
+
+        # Process in mini-batches: each mini-batch produces at most batch_size variant infos
+        # to keep memory bounded (avoids encoding K*N captions in one forward pass)
+        batch_size = caching_strategy.batch_size or 8
+        images_per_batch = max(1, batch_size // K)
+        old_cache_to_disk = caching_strategy._cache_to_disk
+        caching_strategy._cache_to_disk = False  # force RAM path only
+
+        try:
+            for chunk_start in tqdm(range(0, len(variant_groups), images_per_batch),
+                                    desc="Refreshing caption TE variants"):
+                chunk = variant_groups[chunk_start : chunk_start + images_per_batch]
+                # Flatten all variant infos for this chunk into one batch
+                chunk_variant_infos = [vi for _, vis in chunk for vi in vis]
+
+                # Encode this chunk's variants
+                caching_strategy.cache_batch_outputs(
+                    tokenize_strategy, text_encoders, text_encoding_strategy, chunk_variant_infos
+                )
+
+                # Extract and store results immediately, then free the temp infos
+                for real_info, vis in chunk:
+                    canonical_outputs = vis[0].text_encoder_outputs
+                    variant_outputs = ([vi.text_encoder_outputs for vi in vis[1:]]
+                                       if len(vis) > 1 else None)
+
+                    if canonical_outputs is not None:
+                        real_info.text_encoder_outputs = canonical_outputs
+                    real_info.text_encoder_outputs_variants = variant_outputs
+
+                    # For Anima: zero the stored dropout_rate when variants are active
+                    if (canonical_outputs is not None and len(canonical_outputs) >= 5
+                            and len(vis) > 1):
+                        real_info.text_encoder_outputs = tuple(
+                            [canonical_outputs[0], canonical_outputs[1], canonical_outputs[2],
+                             canonical_outputs[3], torch.tensor(0.0, dtype=torch.float32)]
+                        )
+
+                # Free temp infos from this chunk
+                del chunk_variant_infos
+        finally:
+            caching_strategy._cache_to_disk = old_cache_to_disk
+
     def get_input_ids(self, caption, tokenizer=None):
         if tokenizer is None:
             tokenizer = self.tokenizers[0]
@@ -1122,6 +1509,74 @@ class BaseDataset(torch.utils.data.Dataset):
         self.image_data[info.image_key] = info
         self.image_to_subset[info.image_key] = subset
 
+    def get_subset_resolution(self, subset: BaseSubset) -> Tuple[int, int]:
+        """Return the effective resolution for a subset."""
+        resolution = getattr(subset, "resolution", None)
+        if resolution is None:
+            resolution = (self.width, self.height)
+        assert resolution is not None, "resolution is required / resolution（解像度）指定は必須です"
+        return resolution
+
+    def get_subset_bucket_bounds(self, subset: BaseSubset) -> Tuple[Optional[int], Optional[int]]:
+        """Return effective min/max bucket sizes for a subset."""
+        min_bucket_reso = getattr(subset, "min_bucket_reso", None)
+        max_bucket_reso = getattr(subset, "max_bucket_reso", None)
+        if min_bucket_reso is None:
+            min_bucket_reso = self.min_bucket_reso
+        if max_bucket_reso is None:
+            max_bucket_reso = self.max_bucket_reso
+        return min_bucket_reso, max_bucket_reso
+
+    def get_subset_batch_size(self, subset: BaseSubset) -> int:
+        """Return the effective batch size for a subset.
+
+        Falls back to the dataset-level batch size when the subset does not
+        override it. Batch formation itself is deterministic (index
+        arithmetic), so this never consumes RNG state.
+        """
+        batch_size = getattr(subset, "batch_size", None)
+        if batch_size is None:
+            batch_size = self.batch_size
+        return max(1, int(batch_size))
+
+    def get_subset_resolution_jitter(self, subset: BaseSubset) -> Optional[Tuple[List[int], List[int], List[float]]]:
+        """Return (resolutions, batch_sizes, weights) for a subset, or None when jitter is inactive.
+
+        Subset-level settings defer to the dataset-level settings when unset; jitter is
+        inactive when unset at both levels. Validation datasets never jitter.
+        Batch formation itself is deterministic (index arithmetic), so this never
+        consumes RNG state.
+        """
+        if not getattr(self, "is_training_dataset", True):
+            return None
+
+        resolutions = getattr(subset, "resolution_jitter_resolutions", None)
+        if resolutions is None:
+            resolutions = self.resolution_jitter_resolutions
+        if resolutions is None:
+            return None
+
+        batch_sizes = getattr(subset, "resolution_jitter_batch_sizes", None)
+        if batch_sizes is None:
+            batch_sizes = self.resolution_jitter_batch_sizes
+        weights = getattr(subset, "resolution_jitter_weights", None)
+        if weights is None:
+            weights = self.resolution_jitter_weights
+
+        if batch_sizes is None or weights is None or not (len(resolutions) == len(batch_sizes) == len(weights)):
+            raise ValueError(
+                "resolution jitter requires resolutions, batch_sizes and weights with the same length; "
+                f"subset-level and dataset-level settings were mixed inconsistently "
+                f"(resolutions={resolutions}, batch_sizes={batch_sizes}, weights={weights}) / "
+                "解像度ジッターの設定が不整合です。resolutions、batch_sizes、weightsは同じ長さで指定してください"
+            )
+
+        return (
+            [int(r) for r in resolutions],
+            [max(1, int(b)) for b in batch_sizes],
+            [float(w) for w in weights],
+        )
+
     def make_buckets(self):
         """
         bucketingを行わない場合も呼び出し必須（ひとつだけbucketを作る）
@@ -1149,6 +1604,53 @@ class BaseDataset(torch.utils.data.Dataset):
         #     for future in futures:
         #         future.result()
 
+        # precompute per-subset resolution jitter configs (None = inactive for that subset)
+        jitter_cfgs: Dict[int, Tuple[List[int], List[int], List[float]]] = {}
+        for subset in self.subsets:
+            cfg = self.get_subset_resolution_jitter(subset)
+            if cfg is not None:
+                assert (
+                    not self.bucket_no_upscale
+                ), "resolution_jitter cannot be used with bucket_no_upscale / 解像度ジッターはbucket_no_upscaleと併用できません"
+                jitter_cfgs[id(subset)] = cfg
+        self.has_resolution_jitter = bool(jitter_cfgs)
+        if self.has_resolution_jitter:
+            logger.info(
+                "resolution jitter enabled for one or more subsets: "
+                + "; ".join(
+                    f"subset {i}: resolutions={cfg[0]}, batch_sizes={cfg[1]}, weights={cfg[2]}"
+                    for i, cfg in jitter_cfgs.items()
+                )
+            )
+
+        # per-(subset, jitter resolution) bucket managers for jitter pools
+        subset_jitter_managers: Dict[Tuple[int, int], BucketManager] = {}
+        for subset in self.subsets:
+            cfg = jitter_cfgs.get(id(subset))
+            if cfg is None:
+                continue
+            for reso_side in cfg[0]:
+                if self.enable_bucket:
+                    min_bucket_reso, max_bucket_reso = self.get_subset_bucket_bounds(subset)
+                    # clamp bounds around the jitter resolution so buckets at that size can be generated
+                    if min_bucket_reso is not None:
+                        min_bucket_reso = min(min_bucket_reso, reso_side)
+                    if max_bucket_reso is not None:
+                        max_bucket_reso = max(max_bucket_reso, reso_side)
+                    jitter_manager = BucketManager(
+                        self.bucket_no_upscale,
+                        (reso_side, reso_side),
+                        min_bucket_reso,
+                        max_bucket_reso,
+                        self.bucket_reso_steps,
+                        False,
+                    )
+                    jitter_manager.make_buckets()
+                else:
+                    jitter_manager = BucketManager(False, (reso_side, reso_side), None, None, None)
+                    jitter_manager.set_predefined_resos([(reso_side, reso_side)])
+                subset_jitter_managers[(id(subset), reso_side)] = jitter_manager
+
         if self.enable_bucket:
             logger.info("make buckets")
         else:
@@ -1172,12 +1674,44 @@ class BaseDataset(torch.utils.data.Dataset):
                         "min_bucket_reso and max_bucket_reso are ignored if bucket_no_upscale is set, because bucket reso is defined by image size automatically / bucket_no_upscaleが指定された場合は、bucketの解像度は画像サイズから自動計算されるため、min_bucket_resoとmax_bucket_resoは無視されます"
                     )
 
+            self.subset_bucket_managers = {}
+            for subset in self.subsets:
+                resolution = self.get_subset_resolution(subset)
+                min_bucket_reso, max_bucket_reso = self.get_subset_bucket_bounds(subset)
+                min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
+                    resolution, min_bucket_reso, max_bucket_reso, self.bucket_reso_steps
+                )
+                subset_bucket_manager = BucketManager(
+                    self.bucket_no_upscale,
+                    resolution,
+                    min_bucket_reso,
+                    max_bucket_reso,
+                    self.bucket_reso_steps,
+                    getattr(self, "multires_training", False),
+                )
+                if not self.bucket_no_upscale:
+                    subset_bucket_manager.make_buckets()
+                self.subset_bucket_managers[id(subset)] = subset_bucket_manager
+
             img_ar_errors = []
             for image_info in self.image_data.values():
+                subset = self.image_to_subset[image_info.image_key]
+                subset_bucket_manager = self.subset_bucket_managers[id(subset)]
                 image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
+                image_info.bucket_reso, image_info.resized_size, ar_error = subset_bucket_manager.select_bucket(
                     image_width, image_height
                 )
+                self.bucket_manager.add_if_new_reso(image_info.bucket_reso)
+
+                # assign the image to a bucket for each jitter resolution of its subset
+                cfg = jitter_cfgs.get(id(subset))
+                if cfg is not None:
+                    image_info.jitter_bucket_info = {}
+                    for reso_side in cfg[0]:
+                        jitter_manager = subset_jitter_managers[(id(subset), reso_side)]
+                        jitter_reso, jitter_resized, _ = jitter_manager.select_bucket(image_width, image_height)
+                        image_info.jitter_bucket_info[reso_side] = (jitter_reso, jitter_resized)
+                        self.bucket_manager.add_if_new_reso(jitter_reso)
 
                 # logger.info(image_info.image_key, image_info.bucket_reso)
                 img_ar_errors.append(abs(ar_error))
@@ -1186,13 +1720,60 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             self.bucket_manager = BucketManager(False, (self.width, self.height), None, None, None)
             self.bucket_manager.set_predefined_resos([(self.width, self.height)])  # ひとつの固定サイズbucketのみ
+            self.subset_bucket_managers = {}
+            for subset in self.subsets:
+                resolution = self.get_subset_resolution(subset)
+                subset_bucket_manager = BucketManager(False, resolution, None, None, None)
+                subset_bucket_manager.set_predefined_resos([resolution])
+                self.subset_bucket_managers[id(subset)] = subset_bucket_manager
             for image_info in self.image_data.values():
+                subset = self.image_to_subset[image_info.image_key]
+                subset_bucket_manager = self.subset_bucket_managers[id(subset)]
                 image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, _ = self.bucket_manager.select_bucket(image_width, image_height)
+                image_info.bucket_reso, image_info.resized_size, _ = subset_bucket_manager.select_bucket(image_width, image_height)
+                self.bucket_manager.add_if_new_reso(image_info.bucket_reso)
 
+                # assign the image to a bucket for each jitter resolution of its subset
+                cfg = jitter_cfgs.get(id(subset))
+                if cfg is not None:
+                    image_info.jitter_bucket_info = {}
+                    for reso_side in cfg[0]:
+                        jitter_manager = subset_jitter_managers[(id(subset), reso_side)]
+                        jitter_reso, jitter_resized, _ = jitter_manager.select_bucket(image_width, image_height)
+                        image_info.jitter_bucket_info[reso_side] = (jitter_reso, jitter_resized)
+                        self.bucket_manager.add_if_new_reso(jitter_reso)
+
+        # build subset-scoped batching buckets: every batch is drawn from a single subset,
+        # which allows a per-subset batch size (the dataset-level bucket_manager above is
+        # kept for resolution bookkeeping and logging only).
+        # For jitter-enabled subsets, one pool of batches is built per jitter resolution
+        # (the canonical-resolution pool is not used for those subsets).
+        self.batch_buckets = []
+        self.batch_bucket_subsets = []
+        self.batch_bucket_jitter_resos = []
+        self.batch_bucket_weights = []
+        batch_bucket_ids = {}  # (id(subset), jitter_reso, bucket_reso) -> index into batch_buckets
         for image_info in self.image_data.values():
+            subset = self.image_to_subset[image_info.image_key]
             for _ in range(image_info.num_repeats):
                 self.bucket_manager.add_image(image_info.bucket_reso, image_info.image_key)
+
+            cfg = jitter_cfgs.get(id(subset))
+            if cfg is None:
+                pool_resos = [(None, image_info.bucket_reso)]
+            else:
+                pool_resos = [(reso_side, image_info.jitter_bucket_info[reso_side][0]) for reso_side in cfg[0]]
+            for jitter_reso, bucket_reso in pool_resos:
+                bucket_key = (id(subset), jitter_reso, bucket_reso)
+                batch_bucket_index = batch_bucket_ids.get(bucket_key)
+                if batch_bucket_index is None:
+                    batch_bucket_index = len(self.batch_buckets)
+                    batch_bucket_ids[bucket_key] = batch_bucket_index
+                    self.batch_buckets.append([])
+                    self.batch_bucket_subsets.append(subset)
+                    self.batch_bucket_jitter_resos.append(jitter_reso)
+                    self.batch_bucket_weights.append(None if jitter_reso is None else cfg[2][cfg[0].index(jitter_reso)])
+                self.batch_buckets[batch_bucket_index].extend([image_info.image_key] * image_info.num_repeats)
 
         # bucket情報を表示、格納する
         if self.enable_bucket:
@@ -1213,11 +1794,23 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.info(f"mean ar error (without repeats): {mean_img_ar_error}")
 
         # データ参照用indexを作る。このindexはdatasetのshuffleに用いられる
+        # バッチはサブセット単位で作られるため、バッチサイズはサブセットごとに決まる
+        # (jitter pools use the batch size configured for their resolution)
         self.buckets_indices: List[BucketBatchIndex] = []
-        for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
-            batch_count = int(math.ceil(len(bucket) / self.batch_size))
+        for bucket_index, bucket in enumerate(self.batch_buckets):
+            jitter_reso = self.batch_bucket_jitter_resos[bucket_index]
+            if jitter_reso is not None:
+                resolutions, batch_sizes, _ = jitter_cfgs[id(self.batch_bucket_subsets[bucket_index])]
+                bucket_batch_size = batch_sizes[resolutions.index(jitter_reso)]
+            else:
+                bucket_batch_size = self.get_subset_batch_size(self.batch_bucket_subsets[bucket_index])
+            batch_count = int(math.ceil(len(bucket) / bucket_batch_size))
             for batch_index in range(batch_count):
-                self.buckets_indices.append(BucketBatchIndex(bucket_index, self.batch_size, batch_index))
+                self.buckets_indices.append(BucketBatchIndex(bucket_index, bucket_batch_size, batch_index))
+
+        # keep the deterministic full index list; shuffle_buckets() resamples from it
+        # (weighted by resolution) each epoch when jitter is active
+        self.all_buckets_indices = list(self.buckets_indices)
 
         self.shuffle_buckets()
         self._length = len(self.buckets_indices)
@@ -1226,8 +1819,22 @@ class BaseDataset(torch.utils.data.Dataset):
         # set random seed for this epoch
         random.seed(self.seed + self.current_epoch)
 
-        random.shuffle(self.buckets_indices)
-        self.bucket_manager.shuffle()
+        if self.has_resolution_jitter:
+            # weighted sampling with replacement: each batch index is weighted by its
+            # resolution's jitter weight (non-jitter batches weight 1.0). Weights are
+            # normalized so they sum to 1 across the epoch, keeping the epoch length
+            # stable while making the share of steps per resolution follow the weights.
+            all_indices = self.all_buckets_indices
+            weights = []
+            for batch_index in all_indices:
+                weight = self.batch_bucket_weights[batch_index.bucket_index]
+                weights.append(1.0 if weight is None else float(weight))
+            total = sum(weights)
+            self.buckets_indices = random.choices(all_indices, weights=[w / total for w in weights], k=len(all_indices))
+        else:
+            random.shuffle(self.buckets_indices)
+        for bucket in self.batch_buckets:
+            random.shuffle(bucket)
 
     def verify_bucket_reso_steps(self, min_steps: int):
         assert self.bucket_reso_steps is None or self.bucket_reso_steps % min_steps == 0, (
@@ -1235,43 +1842,169 @@ class BaseDataset(torch.utils.data.Dataset):
             + f"bucket_reso_stepsが{self.bucket_reso_steps}です。{min_steps}で割り切れる必要があります"
         )
 
+    def get_resolutions(self) -> List[Tuple[int, int]]:
+        """Return distinct effective resolutions used by this dataset (including jitter resolutions)."""
+        resolutions = []
+        for subset in self.subsets:
+            resolution = self.get_subset_resolution(subset)
+            if resolution not in resolutions:
+                resolutions.append(resolution)
+            jitter = self.get_subset_resolution_jitter(subset)
+            if jitter is not None:
+                for reso_side in jitter[0]:
+                    jitter_reso = (reso_side, reso_side)
+                    if jitter_reso not in resolutions:
+                        resolutions.append(jitter_reso)
+        if not resolutions and self.width is not None and self.height is not None:
+            resolutions.append((self.width, self.height))
+        return resolutions
+
     def is_latent_cacheable(self):
+        if self.latents_aug_variant_count > 1:
+            return True  # augmentations are pre-computed as cached variants
         return all([not subset.color_aug and not subset.gamma_aug and not subset.random_crop for subset in self.subsets])
 
+    def get_effective_aug_variant_count(self, subset: BaseSubset) -> int:
+        """Number of latent augmentation variants to cache for the subset (0 = legacy caching).
+
+        Variants are only worthwhile when pixel-level augmentations (color/gamma/random crop)
+        are enabled. Flip-only subsets keep the legacy flipped-latents path (2x storage),
+        because flip is already cached exactly by encoding the flipped pixels.
+        """
+        if self.latents_aug_variant_count <= 1:
+            return 0
+        if subset.color_aug or subset.gamma_aug or subset.random_crop:
+            return self.latents_aug_variant_count
+        return 0
+
+    def get_latent_aug_config_hash(self, subset: BaseSubset) -> str:
+        """Hash of the subset's image augmentation config (excludes the variant count itself)."""
+        return compute_aug_config_hash(
+            {
+                "color_aug": subset.color_aug,
+                "gamma_aug": subset.gamma_aug,
+                "gamma_aug_range": subset.gamma_aug_range,
+                "gamma_aug_rate": subset.gamma_aug_rate,
+                "flip_aug": subset.flip_aug,
+                "random_crop": subset.random_crop,
+                "random_crop_padding_percent": subset.random_crop_padding_percent,
+                "alpha_mask": subset.alpha_mask,
+            }
+        )
+
     def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
+        variants_enabled = self.caption_aug_variant_count > 1
         return all(
             [
                 not (
                     subset.caption_dropout_rate > 0
-                    and not cache_supports_dropout
-                    or subset.shuffle_caption
-                    or subset.token_warmup_step > 0
-                    or subset.caption_tag_dropout_rate > 0
+                    and not (cache_supports_dropout or variants_enabled)
+                    or (subset.shuffle_caption and not variants_enabled)
+                    or subset.token_warmup_step > 0  # step-dependent: can never be cached
+                    or (subset.caption_tag_dropout_rate > 0 and not variants_enabled)
                 )
                 for subset in self.subsets
             ]
         )
 
+    def _get_resolution_jitter_cache_passes(self) -> List[int]:
+        """Distinct jitter resolutions that need a dedicated caching pass (empty when no jitter)."""
+        passes: List[int] = []
+        if not self.has_resolution_jitter:
+            return passes
+        for subset in self.subsets:
+            jitter = self.get_subset_resolution_jitter(subset)
+            if jitter is None:
+                continue
+            for reso_side in jitter[0]:
+                if reso_side not in passes:
+                    passes.append(reso_side)
+        return passes
+
+    def _get_cache_pass_image_infos(self, pass_reso: Optional[int]) -> List[ImageInfo]:
+        """Image infos to cache in a pass: non-jitter subsets only in the canonical pass,
+        jitter subsets only in their jitter-resolution passes."""
+        infos = []
+        for info in self.image_data.values():
+            subset = self.image_to_subset[info.image_key]
+            jitter = self.get_subset_resolution_jitter(subset)
+            if jitter is None:
+                if pass_reso is None:
+                    infos.append(info)
+            elif pass_reso is not None and pass_reso in jitter[0]:
+                infos.append(info)
+        return infos
+
+    def _apply_jitter_cache_pass(self, pass_reso: int) -> None:
+        """Swap each jitter image's bucket assignment to the pass resolution before caching."""
+        for info in self.image_data.values():
+            if info.jitter_bucket_info and pass_reso in info.jitter_bucket_info:
+                info.bucket_reso, info.resized_size = info.jitter_bucket_info[pass_reso]
+
+    def _finish_jitter_cache_pass(self, pass_reso: int, canonical_bucket_info: dict) -> None:
+        """Collect in-memory latents cached at the pass resolution and restore canonical assignments."""
+        for key, info in self.image_data.items():
+            if info.jitter_bucket_info and pass_reso in info.jitter_bucket_info:
+                if info.latents is not None:
+                    info.latents_by_reso[pass_reso] = (
+                        info.latents,
+                        info.latents_flipped,
+                        info.alpha_mask,
+                        info.latents_original_size,
+                        info.latents_crop_ltrb,
+                    )
+                    info.latents = None
+                    info.latents_flipped = None
+                    info.alpha_mask = None
+                canonical_reso, canonical_resized = canonical_bucket_info[key]
+                info.bucket_reso, info.resized_size = canonical_reso, canonical_resized
+
     def new_cache_latents(self, model: Any, accelerator: Accelerator):
+        r"""
+        a brand new method to cache latents. This method caches latents with caching strategy.
+        normal cache_latents method is used by default, but this method is used when caching strategy is specified.
+
+        With resolution jitter, one caching pass runs per jitter resolution; each image of a
+        jitter-enabled subset is cached once per resolution (multi-resolution npz keys keep
+        them in the same file on disk).
+        """
+        cache_passes = self._get_resolution_jitter_cache_passes()
+        if not cache_passes:
+            self._new_cache_latents_pass(model, accelerator, None)
+            return
+
+        canonical_bucket_info = {key: (info.bucket_reso, info.resized_size) for key, info in self.image_data.items()}
+        for pass_reso in cache_passes:
+            logger.info(f"caching latents at resolution {pass_reso}x{pass_reso} (resolution jitter pass)")
+            self._apply_jitter_cache_pass(pass_reso)
+            try:
+                self._new_cache_latents_pass(model, accelerator, pass_reso)
+            finally:
+                self._finish_jitter_cache_pass(pass_reso, canonical_bucket_info)
+
+    def _new_cache_latents_pass(self, model: Any, accelerator: Accelerator, pass_reso: Optional[int]):
         r"""
         a brand new method to cache latents. This method caches latents with caching strategy.
         normal cache_latents method is used by default, but this method is used when caching strategy is specified.
         """
         logger.info("caching latents with caching strategy.")
         caching_strategy = LatentsCachingStrategy.get_strategy()
-        image_infos = list(self.image_data.values())
+        image_infos = self._get_cache_pass_image_infos(pass_reso)
 
         # sort by resolution
         image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
 
         # split by resolution and some conditions
         class Condition:
-            def __init__(self, reso, flip_aug, alpha_mask, random_crop, random_crop_padding_percent):
+            def __init__(self, reso, flip_aug, alpha_mask, random_crop, random_crop_padding_percent, num_aug_variants=0, augmentor=None, aug_config_hash=None):
                 self.reso = reso
                 self.flip_aug = flip_aug
                 self.alpha_mask = alpha_mask
                 self.random_crop = random_crop
                 self.random_crop_padding_percent = random_crop_padding_percent
+                self.num_aug_variants = num_aug_variants
+                self.augmentor = augmentor
+                self.aug_config_hash = aug_config_hash
 
             def __eq__(self, other):
                 return (
@@ -1281,6 +2014,8 @@ class BaseDataset(torch.utils.data.Dataset):
                     and self.alpha_mask == other.alpha_mask
                     and self.random_crop == other.random_crop
                     and self.random_crop_padding_percent == other.random_crop_padding_percent
+                    and self.num_aug_variants == other.num_aug_variants
+                    and self.aug_config_hash == other.aug_config_hash
                 )
 
         batch: List[ImageInfo] = []
@@ -1295,7 +2030,10 @@ class BaseDataset(torch.utils.data.Dataset):
             for info in batch:
                 if info.image is not None and isinstance(info.image, Future):
                     info.image = info.image.result()  # future to image
-            caching_strategy.cache_batch_latents(model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop, cond.random_crop_padding_percent)
+            caching_strategy.cache_batch_latents(
+                model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop, cond.random_crop_padding_percent,
+                num_aug_variants=cond.num_aug_variants, augmentor=cond.augmentor, aug_config_hash=cond.aug_config_hash,
+            )
 
             # remove image from memory
             for info in batch:
@@ -1328,14 +2066,32 @@ class BaseDataset(torch.utils.data.Dataset):
 
                     # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
 
+                    # When refresh is enabled, only cache canonical to disk (variants are in-memory)
+                    refresh_mode = self.aug_refresh_epochs > 0
+                    disk_variants = 0 if refresh_mode else self.get_effective_aug_variant_count(subset)
+                    disk_hash = None if refresh_mode else self.get_latent_aug_config_hash(subset)
                     cache_available = caching_strategy.is_disk_cached_latents_expected(
-                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
+                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask,
+                        num_aug_variants=disk_variants,
+                        aug_config_hash=disk_hash,
                     )
                     if cache_available:  # do not add to batch
                         continue
 
                 # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
-                condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop, subset.random_crop_padding_percent)
+                num_aug_variants = self.get_effective_aug_variant_count(subset)
+                # When refresh is enabled, disk writes use canonical only (variants generated at epoch boundaries)
+                refresh_mode = self.aug_refresh_epochs > 0
+                disk_variants = 0 if refresh_mode else num_aug_variants
+                augmentor = (
+                    self.aug_helper.get_augmentor(subset.color_aug, subset.gamma_aug, subset.gamma_aug_range, subset.gamma_aug_rate)
+                    if num_aug_variants > 1 and not refresh_mode
+                    else None
+                )
+                condition = Condition(
+                    info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop, subset.random_crop_padding_percent,
+                    disk_variants, augmentor, None if refresh_mode else self.get_latent_aug_config_hash(subset),
+                )
                 if len(batch) > 0 and current_condition != condition:
                     submit_batch(batch, current_condition)
                     batch = []
@@ -1363,9 +2119,25 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz"):
         # マルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
+        # With resolution jitter, one caching pass runs per jitter resolution.
+        cache_passes = self._get_resolution_jitter_cache_passes()
+        if not cache_passes:
+            self._cache_latents_pass(vae, vae_batch_size, cache_to_disk, is_main_process, file_suffix, None)
+            return
+
+        canonical_bucket_info = {key: (info.bucket_reso, info.resized_size) for key, info in self.image_data.items()}
+        for pass_reso in cache_passes:
+            logger.info(f"caching latents at resolution {pass_reso}x{pass_reso} (resolution jitter pass)")
+            self._apply_jitter_cache_pass(pass_reso)
+            try:
+                self._cache_latents_pass(vae, vae_batch_size, cache_to_disk, is_main_process, file_suffix, pass_reso)
+            finally:
+                self._finish_jitter_cache_pass(pass_reso, canonical_bucket_info)
+
+    def _cache_latents_pass(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz", pass_reso=None):
         logger.info("caching latents.")
 
-        image_infos = list(self.image_data.values())
+        image_infos = self._get_cache_pass_image_infos(pass_reso)
 
         # sort by resolution
         image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
@@ -1448,6 +2220,13 @@ class BaseDataset(torch.utils.data.Dataset):
         batch_size = caching_strategy.batch_size or self.batch_size
 
         logger.info("caching Text Encoder outputs with caching strategy.")
+
+        # When refresh is enabled, skip variant generation at cache time — variants are
+        # generated fresh at epoch boundaries by refresh_caption_te_variants().
+        if self.caption_aug_variant_count > 1 and self.aug_refresh_epochs == 0:
+            logger.info(f"building up to {self.caption_aug_variant_count} caption variants per image for cached Text Encoder outputs.")
+            self.build_caption_variants()
+
         image_infos = list(self.image_data.values())
 
         # split by resolution
@@ -1470,7 +2249,15 @@ class BaseDataset(torch.utils.data.Dataset):
                 if i % num_processes != process_index:
                     continue
 
-                cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
+                subset = self.image_to_subset[info.image_key]
+                info.caption_aug_hash = self.get_caption_aug_config_hash(subset)
+                # When refresh is enabled, only check for canonical TE outputs on disk
+                refresh_mode = self.aug_refresh_epochs > 0
+                cache_available = caching_strategy.is_disk_cached_outputs_expected(
+                    te_out_npz,
+                    num_caption_variants=0 if refresh_mode else self.get_effective_caption_variant_count(subset),
+                    caption_aug_hash=None if refresh_mode else info.caption_aug_hash,
+                )
                 if cache_available:  # do not add to batch
                     continue
 
@@ -1651,13 +2438,14 @@ class BaseDataset(torch.utils.data.Dataset):
     # いい感じに切り出す
     def crop_target(self, subset: BaseSubset, image, face_cx, face_cy, face_w, face_h):
         height, width = image.shape[0:2]
-        if height == self.height and width == self.width:
+        target_width, target_height = self.get_subset_resolution(subset)
+        if height == target_height and width == target_width:
             return image
 
         # 画像サイズはsizeより大きいのでリサイズする
         face_size = max(face_w, face_h)
-        size = min(self.height, self.width)  # 短いほう
-        min_scale = max(self.height / height, self.width / width)  # 画像がモデル入力サイズぴったりになる倍率（最小の倍率）
+        size = min(target_height, target_width)  # 短いほう
+        min_scale = max(target_height / height, target_width / width)  # 画像がモデル入力サイズぴったりになる倍率（最小の倍率）
         min_scale = min(1.0, max(min_scale, size / (face_size * subset.face_crop_aug_range[1])))  # 指定した顔最小サイズ
         max_scale = min(1.0, max(min_scale, size / (face_size * subset.face_crop_aug_range[0])))  # 指定した顔最大サイズ
         if min_scale >= max_scale:  # range指定がmin==max
@@ -1667,14 +2455,14 @@ class BaseDataset(torch.utils.data.Dataset):
 
         nh = int(height * scale + 0.5)
         nw = int(width * scale + 0.5)
-        assert nh >= self.height and nw >= self.width, f"internal error. small scale {scale}, {width}*{height}"
+        assert nh >= target_height and nw >= target_width, f"internal error. small scale {scale}, {width}*{height}"
         image = resize_image(image, width, height, nw, nh, subset.resize_interpolation)
         face_cx = int(face_cx * scale + 0.5)
         face_cy = int(face_cy * scale + 0.5)
         height, width = nh, nw
 
         # 顔を中心として448*640とかへ切り出す
-        for axis, (target_size, length, face_p) in enumerate(zip((self.height, self.width), (height, width), (face_cy, face_cx))):
+        for axis, (target_size, length, face_p) in enumerate(zip((target_height, target_width), (height, width), (face_cy, face_cx))):
             p1 = face_p - target_size // 2  # 顔を中心に持ってくるための切り出し位置
 
             if subset.random_crop:
@@ -1700,12 +2488,15 @@ class BaseDataset(torch.utils.data.Dataset):
         return self._length
 
     def __getitem__(self, index):
-        bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
+        bucket_index = self.buckets_indices[index].bucket_index
+        bucket = self.batch_buckets[bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
         image_index = self.buckets_indices[index].batch_index * bucket_batch_size
+        # resolution jitter: batches from jitter pools train at their pool's resolution
+        jitter_reso = self.batch_bucket_jitter_resos[bucket_index] if bucket_index < len(self.batch_bucket_jitter_resos) else None
 
         if self.caching_mode is not None:  # return batch for latents/text encoder outputs caching
-            return self.get_item_for_caching(bucket, bucket_batch_size, image_index)
+            return self.get_item_for_caching(bucket, bucket_batch_size, image_index, jitter_reso)
 
         loss_weights = []
         captions = []
@@ -1727,36 +2518,106 @@ class BaseDataset(torch.utils.data.Dataset):
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
 
+            # effective bucket assignment for this batch (differs from canonical for jitter batches)
+            if jitter_reso is not None:
+                eff_bucket_reso, eff_resized_size = image_info.jitter_bucket_info[jitter_reso]
+            else:
+                eff_bucket_reso, eff_resized_size = image_info.bucket_reso, image_info.resized_size
+
             custom_attributes.append(subset.custom_attributes)
 
             # in case of fine tuning, is_reg is always False
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
 
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
+            is_canonical_only = image_info.is_val or not getattr(self, "is_training_dataset", True)  # validation always uses variant 0
 
             # image/latentsを処理する
-            if image_info.latents is not None:  # cache_latents=Trueの場合
-                original_size = image_info.latents_original_size
-                crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
-                if not flipped:
-                    latents = image_info.latents
-                    alpha_mask = image_info.alpha_mask
+            jitter_cached = image_info.latents_by_reso.get(jitter_reso) if jitter_reso is not None else None
+            if jitter_cached is not None:
+                # resolution jitter with in-memory cached latents: use the latents cached at
+                # this batch's resolution (augmentation variants are only available at the
+                # canonical resolution, so they are not applied to jitter batches)
+                latents, latents_flipped, j_alpha_mask, original_size, crop_ltrb = jitter_cached
+                if flipped:
+                    latents = latents_flipped if latents_flipped is not None else torch.flip(latents, [-1])
+                    alpha_mask = None if j_alpha_mask is None else torch.flip(j_alpha_mask, [1])
                 else:
-                    latents = image_info.latents_flipped
-                    alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
+                    alpha_mask = j_alpha_mask
+                image = None
+            elif image_info.latents is not None:  # cache_latents=Trueの場合
+                aug_variants = image_info.latents_aug_variants
+                if aug_variants:
+                    # variant caching: sample one variant (validation always uses the canonical variant 0)
+                    k = 0 if is_canonical_only else random.randrange(len(aug_variants) + 1)
+                    if k == 0:
+                        original_size = image_info.latents_original_size
+                        crop_ltrb = image_info.latents_crop_ltrb
+                        latents = image_info.latents
+                        alpha_mask = image_info.alpha_mask
+                        flipped = False
+                    else:
+                        var = aug_variants[k - 1]
+                        original_size = image_info.latents_original_size
+                        crop_ltrb = var["crop_ltrb"]
+                        latents = var["latents"]
+                        alpha_mask = var["alpha_mask"]
+                        flipped = var["flipped"]  # flip is baked into the variant latents
+                else:
+                    original_size = image_info.latents_original_size
+                    crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
+                    if not flipped:
+                        latents = image_info.latents
+                        alpha_mask = image_info.alpha_mask
+                    else:
+                        latents = image_info.latents_flipped
+                        alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
 
                 image = None
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = (
-                    self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
-                )
-                if flipped:
-                    latents = flipped_latents
-                    alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
-                    del flipped_latents
-                latents = torch.FloatTensor(latents)
-                if alpha_mask is not None:
-                    alpha_mask = torch.FloatTensor(alpha_mask)
+                # Check for in-memory variants first (populated by epoch refresh or RAM-first caching)
+                aug_variants = getattr(image_info, "latents_aug_variants", None)
+                if aug_variants:
+                    # In-memory variant path: sample from RAM variants + disk canonical
+                    k = 0 if is_canonical_only else random.randrange(len(aug_variants) + 1)
+                    if k == 0:
+                        # load canonical from disk
+                        latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped = (
+                            self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, eff_bucket_reso, variant=0)
+                        )
+                        if variant_flipped is not None:
+                            flipped = variant_flipped
+                        elif flipped:
+                            latents = flipped_latents
+                            alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()
+                            del flipped_latents
+                        latents = torch.FloatTensor(latents)
+                        if alpha_mask is not None:
+                            alpha_mask = torch.FloatTensor(alpha_mask)
+                    else:
+                        var = aug_variants[k - 1]
+                        original_size = image_info.latents_original_size
+                        crop_ltrb = var["crop_ltrb"]
+                        latents = var["latents"]
+                        alpha_mask = var["alpha_mask"]
+                        flipped = var["flipped"]
+                else:
+                    # sample an augmentation variant from disk npz if variant caching is enabled (validation uses variant 0)
+                    num_variants = self.get_effective_aug_variant_count(subset)
+                    k = 0 if is_canonical_only or num_variants <= 1 else random.randrange(num_variants)
+                    latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped = (
+                        self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, eff_bucket_reso, variant=k)
+                    )
+                    if variant_flipped is not None:
+                        # variant cache: flip is baked into the latents; only the flag is needed for conditioning
+                        flipped = variant_flipped
+                    elif flipped:
+                        latents = flipped_latents
+                        alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
+                        del flipped_latents
+                    latents = torch.FloatTensor(latents)
+                    if alpha_mask is not None:
+                        alpha_mask = torch.FloatTensor(alpha_mask)
 
                 image = None
             else:
@@ -1765,33 +2626,37 @@ class BaseDataset(torch.utils.data.Dataset):
                     subset, image_info.absolute_path, subset.alpha_mask
                 )
                 im_h, im_w = img.shape[0:2]
+                if jitter_reso is not None:
+                    target_width, target_height = eff_bucket_reso
+                else:
+                    target_width, target_height = self.get_subset_resolution(subset)
 
                 if self.enable_bucket:
                     img, original_size, crop_ltrb = trim_and_resize_if_required(
                         subset.random_crop,
                         img,
-                        image_info.bucket_reso,
-                        image_info.resized_size,
+                        eff_bucket_reso,
+                        eff_resized_size,
                         resize_interpolation=image_info.resize_interpolation,
                         random_crop_padding_percent=subset.random_crop_padding_percent,
                     )
                 else:
                     if face_cx > 0:  # 顔位置情報あり
                         img = self.crop_target(subset, img, face_cx, face_cy, face_w, face_h)
-                    elif im_h > self.height or im_w > self.width:
+                    elif im_h > target_height or im_w > target_width:
                         assert (
                             subset.random_crop
                         ), f"image too large, but cropping and bucketing are disabled / 画像サイズが大きいのでface_crop_aug_rangeかrandom_crop、またはbucketを有効にしてください: {image_info.absolute_path}"
-                        if im_h > self.height:
-                            p = random.randint(0, im_h - self.height)
-                            img = img[p : p + self.height]
-                        if im_w > self.width:
-                            p = random.randint(0, im_w - self.width)
-                            img = img[:, p : p + self.width]
+                        if im_h > target_height:
+                            p = random.randint(0, im_h - target_height)
+                            img = img[p : p + target_height]
+                        if im_w > target_width:
+                            p = random.randint(0, im_w - target_width)
+                            img = img[:, p : p + target_width]
 
                     im_h, im_w = img.shape[0:2]
                     assert (
-                        im_h == self.height and im_w == self.width
+                        im_h == target_height and im_w == target_width
                     ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
 
                     original_size = [im_w, im_h]
@@ -1836,7 +2701,7 @@ class BaseDataset(torch.utils.data.Dataset):
             latents_list.append(latents)
             alpha_mask_list.append(alpha_mask)
 
-            target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
+            target_size = (image.shape[2], image.shape[1]) if image is not None else target_size_from_latents(latents)
 
             if not flipped:
                 crop_left_top = (crop_ltrb[0], crop_ltrb[1])
@@ -1859,16 +2724,46 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids = None
             masks = None
 
+            # sample a caption variant if cached (validation always uses the canonical variant 0)
+            num_caption_variants = len(image_info.caption_variants) if image_info.caption_variants else 0
+            k_cap = 0 if is_canonical_only or num_caption_variants <= 1 else random.randrange(num_caption_variants)
+            if k_cap > 0:
+                caption = image_info.caption_variants[k_cap]  # for logging/debug; overwritten below if tokenization is required
+
             if image_info.text_encoder_outputs is not None:
                 # cached
-                text_encoder_outputs = image_info.text_encoder_outputs
+                if k_cap > 0 and image_info.text_encoder_outputs_variants and len(image_info.text_encoder_outputs_variants) >= k_cap:
+                    text_encoder_outputs = image_info.text_encoder_outputs_variants[k_cap - 1]
+                else:
+                    text_encoder_outputs = image_info.text_encoder_outputs
             elif image_info.text_encoder_outputs_npz is not None:
                 # on disk
                 text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
-                    image_info.text_encoder_outputs_npz
+                    image_info.text_encoder_outputs_npz, variant=k_cap
                 )
             else:
                 tokenization_required = True
+
+            # Epoch-based caption dropout on cached TE outputs: when current_epoch is a
+            # multiple of caption_dropout_every_n_epochs, replace cached outputs with
+            # zeros (≈ unconditional/empty-caption embedding). This mirrors the per-step
+            # process_caption() logic that sets caption="" when the epoch condition is met,
+            # enabling caption_dropout_every_n_epochs to work with cached TE outputs.
+            if (
+                not is_canonical_only
+                and text_encoder_outputs is not None
+                and getattr(subset, "caption_dropout_every_n_epochs", 0) > 0
+                and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
+            ):
+                caption = ""  # reflect dropout in caption for logging/debug
+                if isinstance(text_encoder_outputs, (list, tuple)):
+                    text_encoder_outputs = [
+                        torch.zeros_like(t) if isinstance(t, torch.Tensor) else np.zeros_like(t) if isinstance(t, np.ndarray) else t
+                        for t in text_encoder_outputs
+                    ]
+                elif isinstance(text_encoder_outputs, torch.Tensor):
+                    text_encoder_outputs = torch.zeros_like(text_encoder_outputs)
+
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             if tokenization_required:
@@ -1949,7 +2844,7 @@ class BaseDataset(torch.utils.data.Dataset):
         example = {}
         example["custom_attributes"] = custom_attributes  # may be list of empty dict
         example["loss_weights"] = torch.FloatTensor(loss_weights)
-        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
+        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, convert_te_output_for_batch)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
         example["attn_mask_list"] = none_or_stack_elements(attn_mask_list, lambda x: x)
 
@@ -1964,7 +2859,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         alpha_mask_list[i] = torch.ones((images[i].shape[1], images[i].shape[2]), dtype=torch.float32)
                     else:
                         alpha_mask_list[i] = torch.ones(
-                            (latents_list[i].shape[1] * 8, latents_list[i].shape[2] * 8), dtype=torch.float32
+                            (latents_list[i].shape[-2] * 8, latents_list[i].shape[-1] * 8), dtype=torch.float32
                         )
             example["alpha_masks"] = torch.stack(alpha_mask_list)
         else:
@@ -1991,10 +2886,10 @@ class BaseDataset(torch.utils.data.Dataset):
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
 
         if self.debug_dataset:
-            example["image_keys"] = bucket[image_index : image_index + self.batch_size]
+            example["image_keys"] = bucket[image_index : image_index + bucket_batch_size]
         return example
 
-    def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
+    def get_item_for_caching(self, bucket, bucket_batch_size, image_index, jitter_reso=None):
         captions = []
         images = []
         input_ids1_list = []
@@ -2011,19 +2906,25 @@ class BaseDataset(torch.utils.data.Dataset):
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
 
+            # effective bucket assignment for this batch (differs from canonical for jitter batches)
+            if jitter_reso is not None:
+                eff_bucket_reso, eff_resized_size = image_info.jitter_bucket_info[jitter_reso]
+            else:
+                eff_bucket_reso, eff_resized_size = image_info.bucket_reso, image_info.resized_size
+
             if flip_aug is None:
                 flip_aug = subset.flip_aug
                 alpha_mask = subset.alpha_mask
                 random_crop = subset.random_crop
                 random_crop_padding_percent = subset.random_crop_padding_percent
-                bucket_reso = image_info.bucket_reso
+                bucket_reso = eff_bucket_reso
             else:
                 # TODO そもそも混在してても動くようにしたほうがいい
                 assert flip_aug == subset.flip_aug, "flip_aug must be same in a batch"
                 assert alpha_mask == subset.alpha_mask, "alpha_mask must be same in a batch"
                 assert random_crop == subset.random_crop, "random_crop must be same in a batch"
                 assert random_crop_padding_percent == subset.random_crop_padding_percent, "random_crop_padding_percent must be same in a batch"
-                assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
+                assert bucket_reso == eff_bucket_reso, "bucket_reso must be same in a batch"
 
             caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
 
@@ -2044,7 +2945,7 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids1_list.append(input_ids1)
             input_ids2_list.append(input_ids2)
             absolute_paths.append(image_info.absolute_path)
-            resized_sizes.append(image_info.resized_size)
+            resized_sizes.append(eff_resized_size)
 
         example = {}
 
@@ -2116,6 +3017,9 @@ class DreamBoothDataset(BaseDataset):
         validation_seed: Optional[int],
         resize_interpolation: Optional[str],
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__(
             resolution,
@@ -2124,6 +3028,9 @@ class DreamBoothDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
 
         assert resolution is not None, f"resolution is required / resolution（解像度）指定は必須です"
@@ -2455,6 +3362,9 @@ class FineTuningDataset(BaseDataset):
         validation_split: float,
         resize_interpolation: Optional[str],
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__(
             resolution,
@@ -2463,6 +3373,9 @@ class FineTuningDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
 
         self.batch_size = batch_size
@@ -2677,6 +3590,9 @@ class ControlNetDataset(BaseDataset):
         validation_seed: Optional[int],
         resize_interpolation: Optional[str] = None,
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__(
             resolution,
@@ -2685,6 +3601,9 @@ class ControlNetDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
 
         db_subsets = []
@@ -2724,6 +3643,9 @@ class ControlNetDataset(BaseDataset):
                 token_warmup_step=subset.token_warmup_step,
                 protected_tags_file=subset.protected_tags_file,
                 resize_interpolation=subset.resize_interpolation,
+                resolution=subset.resolution,
+                min_bucket_reso=subset.min_bucket_reso,
+                max_bucket_reso=subset.max_bucket_reso,
             )
             db_subsets.append(db_subset)
 
@@ -2746,6 +3668,9 @@ class ControlNetDataset(BaseDataset):
             validation_seed,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
         self.controlnet_subsets = subsets
 
@@ -2916,6 +3841,11 @@ class ControlNetDataset(BaseDataset):
         self.dreambooth_dataset_delegate.make_buckets()
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
         self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
+        self.batch_buckets = self.dreambooth_dataset_delegate.batch_buckets
+        self.batch_bucket_subsets = self.dreambooth_dataset_delegate.batch_bucket_subsets
+
+    def get_resolutions(self) -> List[Tuple[int, int]]:
+        return self.dreambooth_dataset_delegate.get_resolutions()
 
     def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True):
         return self.dreambooth_dataset_delegate.cache_latents(vae, vae_batch_size, cache_to_disk, is_main_process)
@@ -2932,7 +3862,7 @@ class ControlNetDataset(BaseDataset):
     def __getitem__(self, index):
         example = self.dreambooth_dataset_delegate[index]
 
-        bucket = self.dreambooth_dataset_delegate.bucket_manager.buckets[
+        bucket = self.dreambooth_dataset_delegate.batch_buckets[
             self.dreambooth_dataset_delegate.buckets_indices[index].bucket_index
         ]
         bucket_batch_size = self.dreambooth_dataset_delegate.buckets_indices[index].bucket_batch_size
@@ -2956,7 +3886,7 @@ class ControlNetDataset(BaseDataset):
             alpha_mask_mode = getattr(image_info, "addift_alpha_mask", None)
 
             if hasattr(image_info, "addift_conditioning_latents_npz"):
-                data = np.load(image_info.addift_conditioning_latents_npz)
+                data = load_npz(image_info.addift_conditioning_latents_npz)
                 key = "latents_flipped" if flipped else "latents"
                 addift_conditioning_latents.append(torch.FloatTensor(data[key]))
             else:
@@ -3075,13 +4005,52 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.verify_bucket_reso_steps(min_steps)
 
     def get_resolutions(self) -> List[Tuple[int, int]]:
-        return [(dataset.width, dataset.height) for dataset in self.datasets]
+        resolutions = []
+        for dataset in self.datasets:
+            for resolution in dataset.get_resolutions():
+                if resolution not in resolutions:
+                    resolutions.append(resolution)
+        return resolutions
 
     def is_latent_cacheable(self) -> bool:
         return all([dataset.is_latent_cacheable() for dataset in self.datasets])
 
     def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False) -> bool:
         return all([dataset.is_text_encoder_output_cacheable(cache_supports_dropout) for dataset in self.datasets])
+
+    def set_aug_variant_config(self, latents_aug_variants: int = 0, caption_aug_variants: int = 0):
+        """Configure K-variant sampled augmentation caching on all datasets (incl. delegates)."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "set_aug_variant_config"):
+                dataset.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+
+    def set_aug_refresh_epochs(self, refresh_epochs: int):
+        """Set the epoch refresh interval on all datasets."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "aug_refresh_epochs"):
+                dataset.aug_refresh_epochs = refresh_epochs
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.aug_refresh_epochs = refresh_epochs
+
+    def refresh_latent_variants(self, vae_encode_fn, device, dtype):
+        """Regenerate K latent augmentation variants in-memory on all datasets."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "refresh_latent_variants"):
+                dataset.refresh_latent_variants(vae_encode_fn, device, dtype)
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.refresh_latent_variants(vae_encode_fn, device, dtype)
+
+    def refresh_caption_te_variants(self, text_encoders, tokenize_strategy, text_encoding_strategy, accelerator):
+        """Regenerate K caption TE variants in-memory on all datasets."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "refresh_caption_te_variants"):
+                dataset.refresh_caption_te_variants(text_encoders, tokenize_strategy, text_encoding_strategy, accelerator)
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.refresh_caption_te_variants(
+                    text_encoders, tokenize_strategy, text_encoding_strategy, accelerator
+                )
 
     def set_current_strategies(self):
         for dataset in self.datasets:
@@ -3111,7 +4080,7 @@ def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alph
         return False
 
     try:
-        npz = np.load(npz_path)
+        npz = load_npz(npz_path)
         if "latents" not in npz or "original_size" not in npz or "crop_ltrb" not in npz:  # old ver?
             return False
         if npz["latents"].shape[1:3] != expected_latents_size:
@@ -3460,6 +4429,117 @@ def load_images_and_masks_for_caching(
     return img_tensor, alpha_masks, original_sizes, crop_ltrbs
 
 
+# for new_cache_latents with augmentation variants
+def load_image_variants_for_caching(
+    image_infos: List[ImageInfo],
+    num_variants: int,
+    use_alpha_mask: bool,
+    flip_aug: bool,
+    augmentor: Optional[Callable],
+    random_crop: bool,
+    random_crop_padding_percent: float = 0.05,
+) -> Tuple[List[torch.Tensor], List[List[Optional[torch.Tensor]]], List[Tuple[int, int]], List[List[Tuple[int, int, int, int]]], List[List[bool]]]:
+    r"""
+    Load each image once, resize once, then build num_variants augmented variants per image.
+
+    Variant 0 is canonical: center crop, unflipped, no color/gamma augmentation (matching the
+    legacy cache for subsets without augmentation). Variants >= 1 sample a random crop offset
+    (if random_crop), a random flip (if flip_aug) and color/gamma augmentation (if augmentor
+    is not None). All augmentations are applied in pixel space BEFORE VAE encoding, so every
+    cached latent is exact (crop-then-encode, flip-then-encode).
+
+    requires image_infos to have: [absolute_path or image], bucket_reso, resized_size
+
+    returns:
+        images_per_variant: List of torch.Tensor [B, 3, H, W] per variant, normalized to [-1, 1]
+        alpha_masks_per_variant: List per variant of per-image alpha masks (torch.Tensor [H,W] or None)
+        original_sizes: per-image original sizes (shared across variants)
+        crop_ltrbs_per_variant: List per variant of per-image crop_ltrb
+        flippeds_per_variant: List per variant of per-image flip flags
+    """
+    images_per_variant: List[List[torch.Tensor]] = [[] for _ in range(num_variants)]
+    alpha_masks_per_variant: List[List[Optional[torch.Tensor]]] = [[] for _ in range(num_variants)]
+    original_sizes: List[Tuple[int, int]] = []
+    crop_ltrbs_per_variant: List[List[Tuple[int, int, int, int]]] = [[] for _ in range(num_variants)]
+    flippeds_per_variant: List[List[bool]] = [[] for _ in range(num_variants)]
+
+    for info in image_infos:
+        image = load_image(info.absolute_path, use_alpha_mask) if info.image is None else np.array(info.image, np.uint8)
+
+        image_height, image_width = image.shape[0:2]
+        original_size = (image_width, image_height)  # size before resize
+        original_sizes.append(original_size)
+
+        # resize once (with random crop padding); all variants crop from this resized image
+        resized_size = info.resized_size
+        if random_crop:
+            resized_size = (
+                int(resized_size[0] * (1.0 + random_crop_padding_percent)),
+                int(resized_size[1] * (1.0 + random_crop_padding_percent)),
+            )
+        if image_width != resized_size[0] or image_height != resized_size[1]:
+            image = resize_image(image, image_width, image_height, resized_size[0], resized_size[1], info.resize_interpolation)
+        image_height, image_width = image.shape[0:2]
+
+        reso = info.bucket_reso
+        trim_w = max(0, image_width - reso[0])
+        trim_h = max(0, image_height - reso[1])
+
+        for k in range(num_variants):
+            # crop offset: canonical is center; variants sample randomly when random_crop is enabled
+            if k == 0 or not random_crop:
+                crop_left, crop_top = trim_w // 2, trim_h // 2
+            else:
+                crop_left = random.randint(0, trim_w) if trim_w > 0 else 0
+                crop_top = random.randint(0, trim_h) if trim_h > 0 else 0
+
+            img_k = image[crop_top : crop_top + reso[1], crop_left : crop_left + reso[0]]
+
+            # color/gamma augmentation on RGB channels only (mirrors __getitem__ ordering: crop -> aug -> flip)
+            if k > 0 and augmentor is not None:
+                img_rgb = img_k[:, :, :3]
+                img_rgb = augmentor(image=img_rgb)["image"]
+                img_k = np.concatenate([img_rgb, img_k[:, :, 3:]], axis=2) if img_k.shape[2] == 4 else img_rgb
+
+            # flip: pixels are flipped BEFORE encoding, so the cached latents are exact
+            flipped = k > 0 and flip_aug and random.random() < 0.5
+            if flipped:
+                img_k = img_k[:, ::-1, :].copy()  # copy to avoid negative stride problem
+
+            # crop_ltrb in original pixel coordinates. Variant 0 uses get_crop_ltrb for
+            # backward compatibility with legacy caches; variants use the true sampled offsets.
+            if k == 0:
+                crop_ltrb = BucketManager.get_crop_ltrb(reso, original_size)
+            else:
+                scale_w = original_size[0] / image_width
+                scale_h = original_size[1] / image_height
+                crop_ltrb = (
+                    int(round(crop_left * scale_w)),
+                    int(round(crop_top * scale_h)),
+                    int(round((crop_left + reso[0]) * scale_w)),
+                    int(round((crop_top + reso[1]) * scale_h)),
+                )
+
+            if use_alpha_mask:
+                if img_k.shape[2] == 4:
+                    alpha_mask = img_k[:, :, 3]  # [H,W]
+                    alpha_mask = alpha_mask.astype(np.float32) / 255.0  # 0.0~1.0
+                    alpha_mask = torch.FloatTensor(alpha_mask)
+                else:
+                    alpha_mask = torch.ones((img_k.shape[0], img_k.shape[1]), dtype=torch.float32)
+            else:
+                alpha_mask = None
+
+            img_k = img_k[:, :, :3]  # remove alpha channel
+            images_per_variant[k].append(IMAGE_TRANSFORMS(img_k))
+            alpha_masks_per_variant[k].append(alpha_mask)
+            crop_ltrbs_per_variant[k].append(crop_ltrb)
+            flippeds_per_variant[k].append(flipped)
+
+    img_tensors = [torch.stack(images, dim=0) for images in images_per_variant]
+    return img_tensors, alpha_masks_per_variant, original_sizes, crop_ltrbs_per_variant, flippeds_per_variant
+
+
 def cache_batch_latents(
     vae: AutoencoderKL, cache_to_disk: bool, image_infos: List[ImageInfo], flip_aug: bool, use_alpha_mask: bool, random_crop: bool, random_crop_padding_percent: float = 0.05
 ) -> None:
@@ -3538,7 +4618,8 @@ def cache_batch_latents(
 
 
 def cache_batch_text_encoder_outputs(
-    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, use_zero_cond_dropout, input_ids1, input_ids2, dtype
+    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, use_zero_cond_dropout, input_ids1, input_ids2, dtype,
+    cache_dtype="auto",
 ):
     input_ids1 = input_ids1.to(text_encoders[0].device)
     input_ids2 = input_ids2.to(text_encoders[1].device)
@@ -3563,7 +4644,7 @@ def cache_batch_text_encoder_outputs(
 
     for info, hidden_state1, hidden_state2, pool2 in zip(image_infos, b_hidden_state1, b_hidden_state2, b_pool2):
         if cache_to_disk:
-            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, hidden_state1, hidden_state2, pool2)
+            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, hidden_state1, hidden_state2, pool2, cache_dtype)
         else:
             info.text_encoder_outputs1 = hidden_state1
             info.text_encoder_outputs2 = hidden_state2
@@ -3571,7 +4652,7 @@ def cache_batch_text_encoder_outputs(
 
 
 def cache_batch_text_encoder_outputs_sd3(
-    image_infos, tokenizer, text_encoders, max_token_length, cache_to_disk, input_ids, output_dtype
+    image_infos, tokenizer, text_encoders, max_token_length, cache_to_disk, input_ids, output_dtype, cache_dtype="auto"
 ):
     # make input_ids for each text encoder
     l_tokens, g_tokens, t5_tokens = input_ids
@@ -3591,27 +4672,26 @@ def cache_batch_text_encoder_outputs_sd3(
             raise RuntimeError(f"NaN detected in text encoder outputs: {info.absolute_path}")
 
         if cache_to_disk:
-            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, lg_out, t5_out, pool)
+            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, lg_out, t5_out, pool, cache_dtype)
         else:
             info.text_encoder_outputs1 = lg_out
             info.text_encoder_outputs2 = t5_out
             info.text_encoder_pool2 = pool
 
 
-def save_text_encoder_outputs_to_disk(npz_path, hidden_state1, hidden_state2, pool2):
-    np.savez(
+def save_text_encoder_outputs_to_disk(npz_path, hidden_state1, hidden_state2, pool2, cache_dtype="auto"):
+    save_npz(
         npz_path,
-        hidden_state1=hidden_state1.cpu().float().numpy(),
-        hidden_state2=hidden_state2.cpu().float().numpy(),
-        pool2=pool2.cpu().float().numpy(),
+        {"hidden_state1": hidden_state1, "hidden_state2": hidden_state2, "pool2": pool2},
+        cache_dtype=cache_dtype,
     )
 
 
 def load_text_encoder_outputs_from_disk(npz_path):
-    with np.load(npz_path) as f:
-        hidden_state1 = torch.from_numpy(f["hidden_state1"])
-        hidden_state2 = torch.from_numpy(f["hidden_state2"]) if "hidden_state2" in f else None
-        pool2 = torch.from_numpy(f["pool2"]) if "pool2" in f else None
+    f = load_npz(npz_path)
+    hidden_state1 = torch.from_numpy(f["hidden_state1"])
+    hidden_state2 = torch.from_numpy(f["hidden_state2"]) if "hidden_state2" in f else None
+    pool2 = torch.from_numpy(f["pool2"]) if "pool2" in f else None
     return hidden_state1, hidden_state2, pool2
 
 
@@ -4624,6 +5704,37 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=2,
         help="Hidden depth of the timestep sampler network",
     )
+    parser.add_argument(
+        "--adaptive_sampler_eval_chunk_size",
+        type=int,
+        default=16,
+        help="Batch size used for per-timestep loss sweeps in Algorithm 2. "
+        "Lower values reduce peak VRAM during the sweep at the cost of more sequential forwards. "
+        "Memory-only: results are identical regardless of this value. Default 16.",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_eval_stride",
+        type=int,
+        default=1,
+        help="Stride for the timestep evaluation grid in Algorithm 2. "
+        "stride=1 (default) evaluates all timesteps (paper-faithful). "
+        "stride>1 evaluates a coarser grid, reducing the number of model forwards "
+        "proportionally. The queue and F-statistic operate on the coarser grid; "
+        "selected indices are mapped back to real timesteps. Opt-in approximation.",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_fp32_eval",
+        action="store_true",
+        help="Escape hatch: keep model_output and targets in fp32 during Algorithm 2 sweeps "
+        "instead of the default bf16/fp16 accumulation with fp32 scalar reduction.",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_disable_empty_cache",
+        action="store_true",
+        help="Disable the automatic torch.cuda.empty_cache() call after each adaptive "
+        "sampler update. By default, empty_cache releases the caching allocator's "
+        "reserved pool after Algorithm 2 sweeps to prevent permanently elevated VRAM.",
+    )
 
 
     parser.add_argument(
@@ -4792,6 +5903,13 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         "--cache_text_encoder_outputs_to_disk",
         action="store_true",
         help="cache text encoder outputs to disk / text encoderの出力をディスクにキャッシュする",
+    )
+    parser.add_argument(
+        "--cache_text_encoder_outputs_dtype",
+        type=str,
+        choices=CACHE_DTYPE_CHOICES,
+        default="auto",
+        help="floating-point dtype policy for text encoder output caches: auto, fp16, bf16, or fp32",
     )
     parser.add_argument(
         "--text_encoder_batch_size",
@@ -5135,10 +6253,38 @@ def add_dataset_arguments(
         help="cache latents to disk to reduce VRAM usage (augmentations must be disabled) / VRAM削減のためにlatentをディスクにcacheする（augmentationは使用不可）",
     )
     parser.add_argument(
+        "--cache_latents_dtype",
+        type=str,
+        choices=CACHE_DTYPE_CHOICES,
+        default="auto",
+        help="floating-point dtype policy for latent caches: auto, fp16, bf16, or fp32",
+    )
+    parser.add_argument(
         "--skip_cache_check",
         action="store_true",
         help="skip the content validation of cache (latent and text encoder output). Cache file existence check is always performed, and cache processing is performed if the file does not exist"
         " / cacheの内容の検証をスキップする（latentとテキストエンコーダの出力）。キャッシュファイルの存在確認は常に行われ、ファイルがなければキャッシュ処理が行われる",
+    )
+    parser.add_argument(
+        "--cache_aug_variants",
+        type=int,
+        default=0,
+        help="precompute K augmentation variants per image (random crop, flip, color/gamma) when caching latents, sampled per training step. 0=disabled (legacy). Requires --cache_latents; --cache_latents_to_disk recommended"
+        " / latentキャッシュ時にaugmentation（random crop, flip, color/gamma）をKパターン事前計算してキャッシュし、学習ステップごとに1つを選択する。0=無効（従来通り）。--cache_latentsが必要。--cache_latents_to_disk推奨",
+    )
+    parser.add_argument(
+        "--cache_caption_variants",
+        type=int,
+        default=0,
+        help="precompute K caption variants per image (shuffle, tag dropout, caption dropout, wildcards) when caching text encoder outputs, sampled per training step. 0=disabled (legacy). Requires --cache_text_encoder_outputs; incompatible with --weighted_captions and token_warmup_step"
+        " / text encoder出力キャッシュ時にcaption augmentation（shuffle, tag dropout, caption dropout, wildcard）をKパターン事前計算してキャッシュし、学習ステップごとに1つを選択する。0=無効（従来通り）。--cache_text_encoder_outputsが必要。--weighted_captionsとtoken_warmup_stepとは併用不可",
+    )
+    parser.add_argument(
+        "--cache_aug_refresh_epochs",
+        type=int,
+        default=0,
+        help="re-generate augmentation variants in-memory every N epochs (0=disabled). When enabled, variants are NOT written to disk — only canonical (variant 0) is disk-cached. Requires --cache_aug_variants or --cache_caption_variants. VAE/TE models are moved to GPU at each refresh boundary"
+        " / augmentation variantをNエポックごとにメモリ上で再生成する（0=無効）。有効時、variantはディスクに書き込まれず、canonical（variant 0）のみキャッシュされる。--cache_aug_variantsまたは--cache_caption_variantsが必要。各リフレッシュ時にVAE/TEモデルがGPUに移動される",
     )
     parser.add_argument(
         "--enable_bucket",
@@ -6912,18 +8058,31 @@ def get_noise_noisy_latents_and_timesteps(
     elif flow_model_enabled:
         timestep_max = noise_scheduler.config.num_train_timesteps
         distribution = getattr(args, "flow_timestep_distribution", "logit_normal")
-        if distribution == "logit_normal":
-            logits = torch.normal(
-                mean=float(getattr(args, "flow_logit_mean", 0.0)),
-                std=float(getattr(args, "flow_logit_std", 1.0)),
-                size=(b_size,),
-                device=latents.device,
-            )
-            sigmas = torch.sigmoid(logits)
-        elif distribution == "uniform":
-            sigmas = torch.rand((b_size,), device=latents.device)
-        else:
+        antithetic = getattr(args, "antithetic_timestep_sampling", False) and is_train
+        stratified = getattr(args, "stratified_timestep_sampling", False) and is_train
+        qmc = getattr(args, "qmc_timestep_sampling", None) if is_train else None
+        qmc_rank = PartialState().process_index if qmc is not None else 0
+        # Route through the canonical density function so that antithetic pairing,
+        # stratified sampling, QMC, and the "mode" distribution are all supported
+        # here (previously only logit_normal/uniform + antithetic were handled).
+        # The function generates on the target device and applies the deterministic
+        # distribution transform; the downstream shift below stays applicable and
+        # the marginal distribution is preserved.
+        if distribution not in ("logit_normal", "uniform", "mode"):
             raise ValueError(f"Unknown flow_timestep_distribution: {distribution}")
+        sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+            weighting_scheme=distribution,
+            batch_size=b_size,
+            logit_mean=float(getattr(args, "flow_logit_mean", 0.0)),
+            logit_std=float(getattr(args, "flow_logit_std", 1.0)),
+            mode_scale=float(getattr(args, "flow_mode_scale", 1.29)),
+            antithetic=antithetic,
+            stratified=stratified,
+            qmc=qmc,
+            qmc_seed=getattr(args, "qmc_seed", 0),
+            device=latents.device,
+            rank=qmc_rank,
+        )
 
         shift_requested = (
             getattr(args, "flow_uniform_shift", False) or getattr(args, "flow_uniform_static_ratio", None) is not None
@@ -6970,6 +8129,10 @@ def get_noise_noisy_latents_and_timesteps(
                 noise_flat = noise.view(b_size, -1)
                 _, (_, col_indices) = cosine_optimal_transport(lat_flat, noise_flat)
                 noise = noise[col_indices.squeeze(0)]
+
+        # Antithetic noise pairing (after OT so pair structure matches sigmas).
+        # The paired noise is returned and used for the loss target by callers.
+        noise = custom_train_functions.maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
         sigmas_view = sigmas.view(-1, 1, 1, 1)
         noisy_latents = sigmas_view * noise + (1.0 - sigmas_view) * latents
@@ -8416,6 +9579,7 @@ def get_wavelet_mask(
     l: float,
     T: int,
     timesteps: torch.Tensor,
+    flow_matching: bool = False,
 ) -> torch.Tensor:
     """
     Compute the time-dependent binary mask for LWD wavelet masking.
@@ -8429,11 +9593,25 @@ def get_wavelet_mask(
     - High-frequency regions (A close to 1) receive up to (1+l)*T steps
     - Smooth regions (A close to 0) receive l*T steps (the minimum)
 
+    Timestep scale handling:
+    Eq. 6 is scale-invariant (M_t = 1 iff (A+l) >= t/T). Flow-matching
+    trainers (Flux/SD3/Anima/Lumina/Hunyuan) divide timesteps by 1000 before
+    returning them (t in [0, 1]), whereas DDPM trainers keep them in [0, T].
+    The caller must pass ``flow_matching=True`` when timesteps are in [0, 1]
+    so they are rescaled to [0, T] before the comparison. Without this,
+    flow-matching trainers would always produce an all-ones mask
+    (wavelet_mask_ratio stuck at 1.0).
+
     Args:
         A: Wavelet attention map of shape (B, H, W), values in [0, 1]
         l: Lower bound on supervision fraction (paper optimal: 0.3)
         T: Total number of diffusion timesteps (e.g., 1000)
-        timesteps: Current timestep per sample, shape (B,)
+        timesteps: Current timestep per sample, shape (B,). In [0, T] for
+            DDPM trainers, or [0, 1] for flow-matching trainers (when
+            ``flow_matching=True``).
+        flow_matching: If True, timesteps are in [0, 1] and are rescaled
+            to [0, T] before applying Eq. 6. Defaults to False (DDPM
+            convention, timesteps already in [0, T]).
 
     Returns:
         mask: Binary mask of shape (B, 1, H, W), values {0.0, 1.0}
@@ -8445,8 +9623,21 @@ def get_wavelet_mask(
     original_dtype = A.dtype
     A_f32 = A.to(dtype=torch.float32, device=device)
 
+    # Normalize timesteps to the [0, T] scale.
+    # Flow-matching trainers (Flux/SD3/Anima/Lumina/Hunyuan) divide timesteps by
+    # 1000 before returning them (t in [0, 1]), whereas DDPM trainers keep them in
+    # [0, T]. Eq. 6 is scale-invariant: M_t = 1 iff T*(A+l) >= t, i.e. iff
+    # (A+l) >= t/T. When flow_matching=True, rescale t from [0, 1] to [0, T] so
+    # the comparison is correct. Without this, flow-matching trainers would
+    # always produce an all-ones mask (wavelet_mask_ratio stuck at 1.0).
+    t_f32 = timesteps.to(dtype=torch.float32, device=device)
+    if flow_matching:
+        t_scaled = t_f32 * float(T)
+    else:
+        t_scaled = t_f32
+
     # Broadcast timesteps to spatial dims: (B, 1, 1) -> (B, H, W)
-    t_matrix = timesteps.to(dtype=torch.float32, device=device).view(B, 1, 1).expand(B, H, W)
+    t_matrix = t_scaled.view(B, 1, 1).expand(B, H, W)
 
     # Compute threshold: T * (A + l)  (Eq. 6)
     thresholds = T * (A_f32 + l)  # (B, H, W)

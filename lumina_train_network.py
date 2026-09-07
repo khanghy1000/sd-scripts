@@ -23,7 +23,7 @@ from library import (
     strategy_lumina,
     train_util,
 )
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.utils import setup_logging
 
 setup_logging()
@@ -37,6 +37,8 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
+        # Lumina is a flow-matching model: model_pred is velocity, x0_hat = noisy - sigmas * v
+        self.hf_prediction_mode = "flow"
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -104,7 +106,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.tokenizer]
 
     def get_latents_caching_strategy(self, args):
-        return strategy_lumina.LuminaLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
+        return strategy_lumina.LuminaLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, False,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
+        )
 
     def get_text_encoding_strategy(self, args):
         return strategy_lumina.LuminaTextEncodingStrategy()
@@ -120,6 +125,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 args.text_encoder_batch_size,
                 args.skip_cache_check,
                 is_partial=self.train_gemma2,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None
@@ -265,6 +271,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
     ):
         assert isinstance(noise_scheduler, sd3_train_utils.FlowMatchEulerDiscreteScheduler)
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = lumina_train_util.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, fixed_timesteps=fixed_timesteps, is_train=is_train
@@ -273,6 +280,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for High-Frequency Token loss (4D pre-pack; Lumina never packs)
+        if is_train and self.hf_scale > 0.0:
+            self._hf_noisy_latents = noisy_model_input.detach()
 
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
@@ -343,7 +354,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:

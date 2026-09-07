@@ -14,7 +14,7 @@ from tqdm import tqdm
 from PIL import Image
 from safetensors.torch import save_file
 
-from library import flux_models, flux_utils, strategy_base, train_util
+from library import flux_models, flux_utils, strategy_base, train_util, custom_train_functions
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.image_utils import to_srgb
 from library.safetensors_utils import mem_eff_save_file
@@ -43,6 +43,7 @@ def sample_images(
     sample_prompts_te_outputs,
     prompt_replacement=None,
     controlnet=None,
+    is_chroma_radiance=False,
 ):
     if steps == 0:
         if not args.sample_at_first:
@@ -89,9 +90,10 @@ def sample_images(
 
     if distributed_state.num_processes <= 1:
         # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
+        sample_fn = sample_image_inference_chroma_radiance if is_chroma_radiance else sample_image_inference
         with torch.no_grad(), accelerator.autocast():
             for prompt_dict in prompts:
-                sample_image_inference(
+                sample_fn(
                     accelerator,
                     args,
                     flux,
@@ -113,9 +115,10 @@ def sample_images(
             per_process_prompts.append(prompts[i :: distributed_state.num_processes])
 
         with torch.no_grad():
+            sample_fn = sample_image_inference_chroma_radiance if is_chroma_radiance else sample_image_inference
             with distributed_state.split_between_processes(per_process_prompts) as prompt_dict_lists:
                 for prompt_dict in prompt_dict_lists[0]:
-                    sample_image_inference(
+                    sample_fn(
                         accelerator,
                         args,
                         flux,
@@ -308,6 +311,125 @@ def time_shift(mu: float, sigma: float, t: torch.Tensor):
     return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
 
 
+def sample_image_inference_chroma_radiance(
+    accelerator: Accelerator,
+    args: argparse.Namespace,
+    flux,
+    text_encoders,
+    ae,  # unused, kept for signature compatibility
+    save_dir,
+    prompt_dict,
+    epoch,
+    steps,
+    sample_prompts_te_outputs,
+    prompt_replacement,
+    controlnet,  # unused
+):
+    """Sample image inference for pixel-space ChromaRadiance."""
+    assert isinstance(prompt_dict, dict)
+    negative_prompt = prompt_dict.get("negative_prompt")
+    sample_steps = prompt_dict.get("sample_steps", 20)
+    width = prompt_dict.get("width", 512)
+    height = prompt_dict.get("height", 512)
+    cfg_scale = prompt_dict.get("scale", 1.0)
+    seed = prompt_dict.get("seed")
+    prompt: str = prompt_dict.get("prompt", "")
+
+    if prompt_replacement is not None:
+        prompt = prompt.replace(prompt_replacement[0], prompt_replacement[1])
+        if negative_prompt is not None:
+            negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
+
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+    else:
+        torch.seed()
+        torch.cuda.seed()
+
+    if negative_prompt is None:
+        negative_prompt = ""
+    height = max(64, height - height % 16)
+    width = max(64, width - width % 16)
+    logger.info(f"prompt: {prompt}")
+    if cfg_scale != 1.0:
+        logger.info(f"negative_prompt: {negative_prompt}")
+    elif negative_prompt != "":
+        logger.info(f"negative prompt is ignored because scale is 1.0")
+    logger.info(f"height: {height}, width: {width}")
+    logger.info(f"sample_steps: {sample_steps}")
+    if cfg_scale != 1.0:
+        logger.info(f"CFG scale: {cfg_scale}")
+    if seed is not None:
+        logger.info(f"seed: {seed}")
+
+    # encode prompts
+    tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+    encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+
+    def encode_prompt(prpt):
+        text_encoder_conds = []
+        if sample_prompts_te_outputs and prpt in sample_prompts_te_outputs:
+            text_encoder_conds = sample_prompts_te_outputs[prpt]
+        if text_encoders is not None:
+            tokens_and_masks = tokenize_strategy.tokenize(prpt)
+            encoded = encoding_strategy.encode_tokens(tokenize_strategy, text_encoders, tokens_and_masks)
+            if len(text_encoder_conds) == 0:
+                text_encoder_conds = encoded
+            else:
+                for i in range(len(encoded)):
+                    if encoded[i] is not None:
+                        text_encoder_conds[i] = encoded[i]
+        return text_encoder_conds
+
+    l_pooled, t5_out, txt_ids, t5_attn_mask = encode_prompt(prompt)
+    t5_attn_mask = t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask and t5_attn_mask is not None else None
+
+    if cfg_scale != 1.0:
+        _, neg_t5_out, _, neg_t5_attn_mask = encode_prompt(negative_prompt)
+        neg_t5_attn_mask = neg_t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask and neg_t5_attn_mask is not None else None
+        neg_cond = (cfg_scale, neg_t5_out, neg_t5_attn_mask)
+    else:
+        neg_cond = None
+
+    # Create pixel-space noise
+    weight_dtype = t5_out.dtype
+    noise = torch.randn(
+        1, 3, height, width,
+        device=accelerator.device,
+        dtype=weight_dtype,
+        generator=torch.Generator(device=accelerator.device).manual_seed(seed) if seed is not None else None,
+    )
+    timesteps = get_schedule(sample_steps, noise.shape[2] // 16 * noise.shape[3] // 16, shift=True)
+
+    with accelerator.autocast(), torch.no_grad():
+        x = denoise_chroma_radiance(
+            flux,
+            noise,
+            t5_out,
+            timesteps=timesteps,
+            t5_attn_mask=t5_attn_mask,
+            neg_cond=neg_cond,
+        )
+
+    # Save image (pixel-space output, no VAE decode needed)
+    x = x.clamp(-1, 1)
+    x = x.permute(0, 2, 3, 1)
+    image = Image.fromarray((127.5 * (x + 1.0)).float().cpu().numpy().astype(np.uint8)[0])
+
+    ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+    num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+    seed_suffix = "" if seed is None else f"_{seed}"
+    i: int = prompt_dict["enum"]
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+    image.save(os.path.join(save_dir, img_filename))
+
+    if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+        wandb_tracker = accelerator.get_tracker("wandb")
+        import wandb
+        wandb_tracker.log({f"sample_{i}": wandb.Image(image, caption=prompt)}, commit=False)
+
+
 def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15) -> Callable[[float], float]:
     m = (y2 - y1) / (x2 - x1)
     b = y1 - m * x1
@@ -417,6 +539,46 @@ def denoise(
     return img
 
 
+def denoise_chroma_radiance(
+    model,
+    img: torch.Tensor,          # [1, 3, H, W] pixel-space noise
+    txt: torch.Tensor,          # t5_out
+    timesteps: list[float],
+    t5_attn_mask: Optional[torch.Tensor] = None,
+    neg_cond: Optional[Tuple[float, torch.Tensor, torch.Tensor]] = None,
+):
+    """Euler denoising loop for pixel-space ChromaRadiance."""
+    do_cfg = neg_cond is not None
+    for t_curr, t_prev in zip(tqdm(timesteps[:-1]), timesteps[1:]):
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+        model.prepare_block_swap_before_forward()
+
+        if not do_cfg:
+            pred = model(
+                x=img,
+                t=t_vec,
+                txt=txt,
+                txt_mask=t5_attn_mask,
+            )
+            img = img + (t_prev - t_curr) * pred
+        else:
+            cfg_scale, neg_txt, neg_t5_attn_mask = neg_cond
+            nc_c_t5_attn_mask = None if t5_attn_mask is None else torch.cat([neg_t5_attn_mask, t5_attn_mask], dim=0)
+
+            nc_c_pred = model(
+                x=torch.cat([img, img], dim=0),
+                t=t_vec.repeat(2),
+                txt=torch.cat([neg_txt, txt], dim=0),
+                txt_mask=nc_c_t5_attn_mask,
+            )
+            neg_pred, pred = torch.chunk(nc_c_pred, 2, dim=0)
+            pred = neg_pred + (pred - neg_pred) * cfg_scale
+            img = img + (t_prev - t_curr) * pred
+
+    model.prepare_block_swap_before_forward()
+    return img
+
+
 # endregion
 
 
@@ -432,24 +594,36 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    antithetic: bool = False,
+    stratified: bool = False,
+    device=None,
+    **kwargs,
 ):
-    """Compute the density for sampling the timesteps when doing SD3 training.
+    """Compute the density for sampling the timesteps when doing SD3/Flux training.
 
-    Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
-
-    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    .. note::
+        Thin re-export of the canonical implementation in
+        :mod:`library.custom_train_functions`, kept for backward compatibility
+        with code that imports it from this module. New code should import
+        ``compute_density_for_timestep_sampling`` from
+        ``library.custom_train_functions`` directly.
     """
-    if weighting_scheme == "logit_normal":
-        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
-        u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
-        u = torch.nn.functional.sigmoid(u)
-    elif weighting_scheme == "mode":
-        u = torch.rand(size=(batch_size,), device="cpu")
-        u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
-    else:
-        u = torch.rand(size=(batch_size,), device="cpu")
-    return u
+    return custom_train_functions.compute_density_for_timestep_sampling(
+        weighting_scheme=weighting_scheme,
+        batch_size=batch_size,
+        logit_mean=logit_mean,
+        logit_std=logit_std,
+        mode_scale=mode_scale,
+        antithetic=antithetic,
+        stratified=stratified,
+        device=device if device is not None else "cpu",
+        **kwargs,
+    )
 
 
 def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
@@ -483,12 +657,51 @@ def get_noisy_model_input_and_timesteps(
     assert bsz > 0, "Batch size not large enough"
     num_timesteps = noise_scheduler.config.num_train_timesteps
 
+    # Resolve variance-reduction flags once. Precedence: antithetic > qmc > stratified
+    # (the canonical density function warns if multiple are set).
+    antithetic = getattr(args, "antithetic_timestep_sampling", False) and is_train and fixed_timesteps is None
+    stratified = getattr(args, "stratified_timestep_sampling", False) and is_train and fixed_timesteps is None
+    qmc = getattr(args, "qmc_timestep_sampling", None) if (is_train and fixed_timesteps is None) else None
+    qmc_seed = getattr(args, "qmc_seed", 0)
+    # DDP rank: each rank fast-forwards its QMC sequence to a disjoint slice so
+    # the combined batch across ranks covers distinct low-discrepancy points.
+    qmc_rank = PartialState().process_index if qmc is not None else 0
+
     if fixed_timesteps is not None:
         timesteps = fixed_timesteps
         sigmas = timesteps / num_timesteps
     elif args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
         # Simple random sigma-based noise sampling
-        if args.timestep_sampling == "sigmoid":
+        if antithetic:
+            # Antithetic pairing on the base variates; same marginal distribution
+            sigmas = custom_train_functions.compute_antithetic_sigmas(
+                bsz, args.timestep_sampling, device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif qmc is not None:
+            # QMC: low-discrepancy sequence for the base uniform, then apply the
+            # distribution transform (sigmoid for "sigmoid", identity for "uniform").
+            sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+                weighting_scheme=args.timestep_sampling,
+                batch_size=bsz,
+                qmc=qmc,
+                qmc_seed=qmc_seed,
+                device=device,
+                sigmoid_scale=args.sigmoid_scale,
+                rank=qmc_rank,
+            )
+        elif stratified and args.timestep_sampling == "uniform":
+            # Stratified: one uniform per equal-width stratum of [0,1].
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            sigmas = (edges + torch.rand(bsz, device=device)) / bsz
+        elif stratified and args.timestep_sampling == "sigmoid":
+            # Stratify the base uniform then apply the sigmoid transform.
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(bsz, device=device)) / bsz
+            # Map through the inverse-sigmoid (logit) so the result is a stratified
+            # sample under the sigmoid distribution.
+            z = torch.logit(u.clamp(1e-6, 1 - 1e-6)) / args.sigmoid_scale
+            sigmas = torch.sigmoid(args.sigmoid_scale * z)
+        elif args.timestep_sampling == "sigmoid":
             # https://github.com/XLabs-AI/x-flux/tree/main
             sigmas = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
         else:
@@ -497,17 +710,74 @@ def get_noisy_model_input_and_timesteps(
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "shift":
         shift = args.discrete_flow_shift
-        sigmas = torch.randn(bsz, device=device)
-        sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigmas = sigmas.sigmoid()
+        if antithetic:
+            # Mirrored (z, -z) base pairs; the deterministic shift transform is
+            # applied identically to both, preserving the shifted distribution
+            sigmas = custom_train_functions.compute_antithetic_sigmas(
+                bsz, "sigmoid", device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif qmc is not None:
+            # QMC low-discrepancy base; the deterministic shift preserves the
+            # shifted marginal distribution.
+            sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale, rank=qmc_rank
+            )
+        elif stratified:
+            # Stratified base uniform mapped through the sigmoid transform; the
+            # deterministic shift is applied identically to all, preserving coverage.
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(bsz, device=device)) / bsz
+            z = torch.logit(u.clamp(1e-6, 1 - 1e-6)) / args.sigmoid_scale
+            sigmas = torch.sigmoid(args.sigmoid_scale * z)
+        else:
+            sigmas = torch.randn(bsz, device=device)
+            sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
+            sigmas = sigmas.sigmoid()
         sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "flux_shift":
-        sigmas = torch.randn(bsz, device=device)
-        sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigmas = sigmas.sigmoid()
+        if antithetic:
+            # Mirrored (z, -z) base pairs; the resolution-dependent time_shift is
+            # deterministic, so the shifted marginal distribution is preserved
+            sigmas = custom_train_functions.compute_antithetic_sigmas(
+                bsz, "sigmoid", device, sigmoid_scale=args.sigmoid_scale
+            )
+        elif qmc is not None:
+            # QMC low-discrepancy base; the resolution-dependent time_shift is
+            # deterministic, so the shifted marginal distribution is preserved.
+            sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale, rank=qmc_rank
+            )
+        elif stratified:
+            # Stratified base uniform mapped through the sigmoid transform; the
+            # resolution-dependent time_shift is deterministic, preserving coverage.
+            edges = torch.arange(bsz, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(bsz, device=device)) / bsz
+            z = torch.logit(u.clamp(1e-6, 1 - 1e-6)) / args.sigmoid_scale
+            sigmas = torch.sigmoid(args.sigmoid_scale * z)
+        else:
+            sigmas = torch.randn(bsz, device=device)
+            sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
+            sigmas = sigmas.sigmoid()
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
         sigmas = time_shift(mu, 1.0, sigmas)
+        timesteps = sigmas * num_timesteps
+    elif args.timestep_sampling == "hump":
+        # Inverted parabola distribution centered at hump_center
+        if (antithetic or stratified or qmc is not None) and is_train:
+            logger.warning(
+                "--antithetic_timestep_sampling / --stratified_timestep_sampling / "
+                "--qmc_timestep_sampling is set but timestep_sampling='hump' uses a multinomial "
+                "draw that cannot honor pairing, stratification, or low-discrepancy sequences; "
+                "the flag(s) are ignored for this branch."
+            )
+        num_points = num_timesteps
+        x = torch.linspace(0, 1, num_points, device=device)
+        probabilities = -7.7 * ((x - args.hump_center) ** 2) + 2
+        probabilities = probabilities.clamp(min=0)
+        probabilities /= probabilities.sum()
+        indices = torch.multinomial(probabilities.unsqueeze(0).expand(bsz, -1), 1).squeeze(-1)
+        sigmas = x[indices]
         timesteps = sigmas * num_timesteps
     else:
         # Sample a random timestep for each image
@@ -518,9 +788,14 @@ def get_noisy_model_input_and_timesteps(
             logit_mean=args.logit_mean,
             logit_std=args.logit_std,
             mode_scale=args.mode_scale,
+            antithetic=antithetic,
+            stratified=stratified,
+            qmc=qmc,
+            qmc_seed=qmc_seed,
+            device=device,
         )
-        indices = (u * num_timesteps).long()
-        timesteps = noise_scheduler.timesteps[indices].to(device=device)
+        indices = (u * num_timesteps).long().clamp(0, len(noise_scheduler.timesteps) - 1)
+        timesteps = noise_scheduler.timesteps.to(device=device)[indices]
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
 
     # Broadcast sigmas to latent shape
@@ -666,7 +941,7 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "hump"],
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and FLUX.1 shifting."
         " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、FLUX.1のシフト。",
@@ -676,6 +951,12 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=1.0,
         help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid"). / sigmoidタイムステップサンプリングの倍率（timestep-samplingが"sigmoid"の場合のみ有効）。',
+    )
+    parser.add_argument(
+        "--hump_center",
+        type=float,
+        default=0.5,
+        help='Center position for "hump" timestep sampling distribution (0.0-1.0). / "hump"タイムステップサンプリング分布の中心位置（0.0-1.0）。',
     )
     parser.add_argument(
         "--model_prediction_type",
@@ -696,7 +977,7 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["flux", "chroma"],
+        choices=["flux", "chroma", "chroma_radiance"],
         default="flux",
-        help="Model type to use for training / トレーニングに使用するモデルタイプ：flux or chroma (default: flux)",
+        help="Model type to use for training / トレーニングに使用するモデルタイプ：flux, chroma or chroma_radiance (default: flux)",
     )

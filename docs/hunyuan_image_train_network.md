@@ -404,6 +404,12 @@ You can calculate validation loss during training using a validation dataset to 
 
 ## 7. Other Training Options / その他の学習オプション
 
+- **High-Frequency Token Latent Loss**: `--hf_scale`, `--hf_exponent`, `--hf_patch` enable
+  the High-Frequency Token latent loss (an opt-in auxiliary term weighting per-token x0-MSE
+  by clean-token detail). Use `--hf_patch 2` for HunyuanImage latent space. See the
+  [advanced guide](train_network_advanced.md#210-high-frequency-token-latent-loss) for the
+  full specification.
+
 - **`--ip_noise_gamma`**: Use `--ip_noise_gamma` and `--ip_noise_gamma_random_strength` to adjust Input Perturbation noise gamma values during training. See Stable Diffusion 3 training options for details.
 
 - **`--loss_type`**: Specifies the loss function for training. The default is `l2`.

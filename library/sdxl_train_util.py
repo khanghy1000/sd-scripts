@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 import torch
+from library.cache_utils import CACHE_DTYPE_CHOICES
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -357,6 +358,13 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser, support_text_en
             "--cache_text_encoder_outputs_to_disk",
             action="store_true",
             help="cache text encoder outputs to disk / text encoderの出力をディスクにキャッシュする",
+        )
+        parser.add_argument(
+            "--cache_text_encoder_outputs_dtype",
+            type=str,
+            choices=CACHE_DTYPE_CHOICES,
+            default="auto",
+            help="floating-point dtype policy for text encoder output caches: auto, fp16, bf16, or fp32",
         )
     parser.add_argument(
         "--disable_mmap_load_safetensors",

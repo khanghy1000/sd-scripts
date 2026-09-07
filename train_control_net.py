@@ -79,7 +79,8 @@ def train(args):
     tokenizer = tokenize_strategy.tokenizer
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
-        True, args.cache_latents_to_disk, args.vae_batch_size, False
+        True, args.cache_latents_to_disk, args.vae_batch_size, False,
+        cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
     )
     strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 

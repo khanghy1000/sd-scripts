@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import random
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -39,6 +40,41 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def build_self_reg_anchor_caption(caption, trigger_word, filler="", shuffle=False, separator=","):
+    """Build the self-regularization anchor caption from a training caption.
+
+    The anchor carries the same held tags as the training caption and differs
+    only in the trigger slot, so whatever the LoRA changes has to be carried by
+    the trigger word alone. The main caption itself is left untouched; only the
+    anchor is derived here.
+
+    - `caption`, `trigger_word` and `filler` are split on `separator`, stripped,
+      and empties are dropped.
+    - Every trigger tag is removed from the caption tags (exact tag match,
+      case-insensitive) to form `held_tags`.
+    - If `shuffle`, `held_tags` are shuffled once so the LoRA cannot key on tag
+      position. `filler` tags keep the vacated trigger slot occupied.
+    - If the caption contains no trigger tag, the anchor is filler + full tags
+      (still a valid hold target).
+    """
+    def split_tags(text):
+        return [t.strip() for t in str(text or "").split(separator) if t.strip()]
+
+    caption_tags = split_tags(caption)
+    trigger_tags = {t.lower() for t in split_tags(trigger_word)}
+    filler_tags = split_tags(filler)
+    held_tags = [t for t in caption_tags if t.lower() not in trigger_tags]
+    if shuffle:
+        held_tags = list(held_tags)
+        random.shuffle(held_tags)
+    return ", ".join(filler_tags + held_tags)
+
+
+def parse_self_reg_trigger_words(trigger_word):
+    """Split a comma-separated trigger word string into a list of non-empty tags."""
+    return [t.strip() for t in str(trigger_word or "").split(",") if t.strip()]
+
+
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -61,6 +97,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # mutated in place), so a single reusable buffer per key avoids a fresh CUDA
         # allocation on every forward pass.
         self._padding_mask_cache = {}
+        # Anima-only self-regularization state.
+        # `_self_reg_step` counts train steps to alternate main/hold steps;
+        # `_self_reg_ema` tracks the held-term EMA; `_self_reg_ctx` carries the
+        # per-step anchor context from process_batch to get_noise_pred_and_target.
+        self._self_reg_step = 0
+        self._self_reg_ema = None
+        self._self_reg_loss_value = None
+        self._self_reg_ctx = None
+        self._self_reg_anchor_stash = None
+        self._self_reg_batched_warned = False
+        self._self_reg_no_trigger_warned = False
 
     def get_padding_mask(self, batch_size: int, height: int, width: int, dtype: torch.dtype, device) -> torch.Tensor:
         """Return a cached zero padding mask for the given shape/dtype/device.
@@ -271,6 +318,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                     "Enable --cache_latents or --cache_latents_to_disk to reduce VRAM usage."
                 )
 
+        if getattr(args, "self_reg_weight", 0.0):
+            self.validate_self_reg_args(args)
+
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
         ), "network for Text Encoder cannot be trained with caching Text Encoder outputs / Text Encoderの出力をキャッシュしながらText Encoderのネットワークを学習することはできません"
@@ -303,6 +353,49 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group.verify_bucket_reso_steps(16)  # WanVAE spatial downscale = 8 and patch size = 2
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(16)
+
+    @staticmethod
+    def is_self_reg_enabled(args) -> bool:
+        return float(getattr(args, "self_reg_weight", 0.0) or 0.0) > 0.0
+
+    def validate_self_reg_args(self, args):
+        """Validate Anima-only self-regularization arguments.
+
+        Constraints: LoRA only, explicit trigger word, no cached text encoder
+        outputs (the anchor is live-encoded each step).
+        """
+        triggers = parse_self_reg_trigger_words(getattr(args, "self_reg_trigger_word", ""))
+        assert triggers, "--self_reg_trigger_word is required when --self_reg_weight > 0"
+        noise_p = float(getattr(args, "self_reg_noise", 0.0) or 0.0)
+        assert 0.0 <= noise_p <= 1.0, "--self_reg_noise must be in [0, 1]"
+        assert not getattr(args, "ileco", False), "--self_reg_weight cannot be combined with --ileco"
+        assert not getattr(args, "addift", False), "--self_reg_weight cannot be combined with --addift"
+        if args.cache_text_encoder_outputs:
+            raise ValueError(
+                "--self_reg_weight requires live text encoder encoding; "
+                "--cache_text_encoder_outputs is not supported with self-regularization"
+            )
+        if not args.network_train_unet_only:
+            logger.warning(
+                "--self_reg_weight trains through Anima DiT only. "
+                "Forcing --network_train_unet_only to avoid keeping the text encoder on GPU."
+            )
+            args.network_train_unet_only = True
+        if getattr(args, "self_reg_batched", False) and getattr(args, "train_batch_size", 1) < 2:
+            # Mirror source trainer/train.py: fall back to alternating steps.
+            logger.warning(
+                "Self-regularization needs a batch of two or more to hold both halves in one step, alternating instead"
+            )
+        logger.info(
+            "[Anima self-reg] ENABLED -- weight=%s, trigger=%s, filler=%s, noise=%s, batched=%s, shuffle_tags=%s. "
+            "A starting weight of 1.0 is a good default; alternating mode needs ~2x iterations.",
+            getattr(args, "self_reg_weight", 0.0),
+            getattr(args, "self_reg_trigger_word", ""),
+            getattr(args, "self_reg_filler", ""),
+            getattr(args, "self_reg_noise", 0.0),
+            getattr(args, "self_reg_batched", False),
+            getattr(args, "self_reg_shuffle_tags", False),
+        )
 
     def load_target_model(self, args, weight_dtype, accelerator):
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
@@ -1040,6 +1133,224 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Latents already normalized by vae.encode with scale
         return latents
 
+    def anima_predict(self, anima, noisy_5d, timesteps_scaled, conds, padding_mask):
+        """Single Anima DiT forward returning a 4D prediction.
+
+        Callers are responsible for the surrounding autocast / grad context.
+        `conds` is the 4-tensor Anima conditioning
+        (prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask).
+        """
+        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = conds[:4]
+        return anima(
+            noisy_5d,
+            timesteps_scaled,
+            prompt_embeds,
+            padding_mask=padding_mask,
+            target_input_ids=t5_input_ids,
+            target_attention_mask=t5_attn_mask,
+            source_attention_mask=attn_mask,
+        ).squeeze(2)
+
+    def encode_self_reg_conds(
+        self, args, accelerator, text_encoders, anchor_captions, tokenize_strategy, text_encoding_strategy, weight_dtype
+    ):
+        """Live-encode self-reg anchor captions through the frozen text encoder.
+
+        Mirrors the non-cached main path (tokenize -> move ids to device ->
+        encode_tokens under no_grad/autocast). The Anima TE is always frozen, so
+        no grad context is needed here.
+        """
+        tokens_and_masks = tokenize_strategy.tokenize(anchor_captions)
+        tokens_and_masks = [t.to(accelerator.device) for t in tokens_and_masks]
+        models = self.get_models_for_text_encoding(args, accelerator, text_encoders)
+        if models is None:
+            raise ValueError("Text encoder models are not available for self-regularization anchor encoding")
+        with torch.no_grad(), accelerator.autocast():
+            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, models, tokens_and_masks)
+        if getattr(args, "full_fp16", False):
+            encoded = [c.to(weight_dtype) for c in encoded]
+        return encoded
+
+    def move_self_reg_conds(self, conds, accelerator, weight_dtype):
+        """Move anchor conds to device/dtype exactly like the main conds."""
+        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = conds[:4]
+        prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
+        attn_mask = attn_mask.to(accelerator.device)
+        t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
+        t5_attn_mask = t5_attn_mask.to(accelerator.device)
+        return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask] + list(conds[4:])
+
+    def get_self_reg_noise_pred_and_target(
+        self,
+        args,
+        accelerator,
+        noise_scheduler,
+        latents,
+        batch,
+        text_encoder_conds,
+        unet,
+        network,
+        weight_dtype,
+        is_train=True,
+    ):
+        """Self-regularization forward.
+
+        At the same noisy point in the latent, with the trigger word taken out
+        of the caption, the LoRA's anchor prediction has to match what the
+        frozen model predicted there: `loss = main + weight * MSE(LoRA(anchor),
+        frozen(anchor))`. The loss is exactly zero while the LoRA is zero, so
+        there is no floor to drift on.
+
+        Mode comes from `self._self_reg_ctx` (built in `process_batch`):
+        - "hold": odd alternating steps train on the hold term only. Returns
+          (anchor_pred, teacher_pred, timesteps, weighting * weight, noise) so
+          the base loss pipeline computes the hold loss directly.
+        - "together": same-step half-batch. Returns the main triple on the
+          first half and stashes the held-term scalar in
+          `self._self_reg_anchor_stash` for `process_batch` to add.
+        """
+        anima: anima_models.Anima = unet
+        ctx = self._self_reg_ctx or {}
+        mode = ctx.get("mode", "hold")
+        half = ctx.get("half", None)
+        anchor_conds = ctx.get("anchor_conds", None)
+        if anchor_conds is None:
+            raise ValueError("Self-regularization anchor conds are not prepared")
+        if network is None or not hasattr(network, "set_multiplier"):
+            raise ValueError("Self-regularization training requires a network with set_multiplier() support")
+
+        # Teacher-distillation hold term: no analytic clean x0 exists for the
+        # auxiliary x0-based losses on this branch — skip them like iLECO.
+        self._hf_noisy_latents = None
+        self._anchor_noisy_latents = None
+        self._noisy_latents = None
+
+        if latents.ndim == 5:
+            latents = latents.squeeze(2)
+
+        if mode == "hold" and float(getattr(args, "self_reg_noise", 0.0) or 0.0) > 0:
+            if random.random() < float(args.self_reg_noise):
+                # Somewhere the training images never reach (pure-noise anchor).
+                latents = torch.randn_like(latents)
+
+        # Shared noise path (keeps flow_use_ot, antithetic pairing, adaptive
+        # sampler and grad checkpointing consistent for both sides).
+        noise = torch.randn_like(latents)
+
+        if getattr(args, "flow_use_ot", False) and latents.size(0) > 1:
+            with torch.no_grad():
+                b_size = latents.size(0)
+                lat_flat = latents.view(b_size, -1)
+                noise_flat = noise.view(b_size, -1)
+                _, (_, col_indices) = train_util.cosine_optimal_transport(lat_flat, noise_flat)
+                noise = noise[col_indices.squeeze(0)]
+
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
+
+        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+            args,
+            noise_scheduler,
+            latents,
+            noise,
+            accelerator.device,
+            weight_dtype,
+            fixed_timesteps=None,
+            is_train=is_train,
+        )
+
+        # Set T-LoRA timestep mask after any together-mode truncation below (the
+        # mask expects [0, max_timestep]-range timesteps matching the forwards).
+        timesteps_scaled = timesteps / 1000.0  # scale to [0, 1] range
+
+        if args.gradient_checkpointing:
+            noisy_model_input.requires_grad_(True)
+
+        main_conds = self.move_self_reg_conds(text_encoder_conds, accelerator, weight_dtype)
+        anchor_conds = self.move_self_reg_conds(anchor_conds, accelerator, weight_dtype)
+        if args.gradient_checkpointing:
+            for t in list(main_conds) + list(anchor_conds):
+                if t is not None and torch.is_tensor(t) and t.dtype.is_floating_point:
+                    t.requires_grad_(True)
+
+        if mode == "together":
+            if half is None or half < 1:
+                raise ValueError("Self-regularization together mode requires half >= 1")
+            latents = latents[:half]
+            noise = noise[:half]
+            noisy_model_input = noisy_model_input[:half]
+            timesteps_scaled = timesteps_scaled[:half]
+            timesteps = timesteps[:half]
+            sigmas = sigmas[:half]
+            main_conds = [
+                t[:half] if torch.is_tensor(t) and t.shape[0] >= half else t for t in main_conds
+            ]
+            anchor_conds = [
+                t[:half] if torch.is_tensor(t) and t.shape[0] >= half else t for t in anchor_conds
+            ]
+
+        self.apply_tlora_mask(timesteps)
+
+        h_latent = latents.shape[-2]
+        w_latent = latents.shape[-1]
+        bs = latents.shape[0]
+        padding_mask = self.get_padding_mask(bs, h_latent, w_latent, weight_dtype, accelerator.device)
+        noisy_5d = noisy_model_input.unsqueeze(2)  # 4D to 5D
+
+        if mode == "together":
+            # The main-half stores keep the base auxiliaries (HF / wavelet /
+            # multiscale anchor / CFM) working on the main term exactly as
+            # without self-reg.
+            if is_train and getattr(self, "wavelet_masking_enabled", False):
+                self._noisy_latents = noisy_model_input.detach()
+            if is_train and self.hf_scale > 0.0:
+                self._hf_noisy_latents = noisy_model_input.detach()
+            if is_train and self.anchor_scale > 0.0:
+                self._anchor_noisy_latents = noisy_model_input.detach()
+
+        old_multiplier = getattr(network, "multiplier", 1.0)
+        try:
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                base_pred = self.anima_predict(anima, noisy_5d, timesteps_scaled, anchor_conds, padding_mask)
+                base_pred = base_pred.detach()
+
+            network.set_multiplier(old_multiplier)
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
+                if mode != "hold":
+                    model_pred = self.anima_predict(anima, noisy_5d, timesteps_scaled, main_conds, padding_mask)
+                anchor_pred = self.anima_predict(anima, noisy_5d, timesteps_scaled, anchor_conds, padding_mask)
+        finally:
+            network.set_multiplier(old_multiplier)
+
+        self.clear_tlora_mask_if_needed()
+
+        base_weighting = anima_train_utils.compute_loss_weighting_for_anima(
+            weighting_scheme=args.weighting_scheme, sigmas=sigmas
+        )
+        reg_weight = float(getattr(args, "self_reg_weight", 0.0) or 0.0)
+
+        if mode == "hold":
+            weighting = base_weighting * reg_weight
+            return anchor_pred, base_pred, timesteps_scaled, weighting, noise
+
+        # together: main triple flows through the base loss pipeline; the held
+        # term is stashed for process_batch to add.
+        latents_f64 = latents.to(torch.float64)
+        noise_f64 = noise.to(torch.float64)
+        target = noise_f64 - latents_f64  # rectified flow target
+
+        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+        anchor_loss_elem = train_util.conditional_loss(
+            anchor_pred, base_pred, args.loss_type, "none", huber_c, scale=float(args.loss_scale)
+        )
+        anchor_loss_elem = anchor_loss_elem * (base_weighting * reg_weight)
+        anchor_per_sample = anchor_loss_elem.mean(dim=list(range(1, anchor_loss_elem.ndim)))
+        anchor_per_sample = anchor_per_sample * batch["loss_weights"]
+        anchor_per_sample = self.post_process_loss(anchor_per_sample, args, timesteps, noise_scheduler)
+        self._self_reg_anchor_stash = anchor_per_sample.mean()
+
+        return model_pred, target, timesteps_scaled, base_weighting, noise
+
     def get_noise_pred_and_target(
         self,
         args,
@@ -1072,6 +1383,20 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         if args.addift:
             return self.get_addift_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                network,
+                weight_dtype,
+                is_train=is_train,
+            )
+
+        if is_train and self._self_reg_ctx is not None:
+            return self.get_self_reg_noise_pred_and_target(
                 args,
                 accelerator,
                 noise_scheduler,
@@ -1287,24 +1612,173 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             )
             self._cfm_logged = True
 
-        return super().process_batch(
-            batch,
-            text_encoders,
-            unet,
-            network,
-            vae,
-            noise_scheduler,
-            vae_dtype,
-            weight_dtype,
-            accelerator,
-            args,
-            text_encoding_strategy,
-            tokenize_strategy,
-            is_train,
-            train_text_encoder,
-            train_unet,
-            edm2_model,
+        self_reg_ctx = self.prepare_self_reg_step(
+            args, accelerator, text_encoders, batch, text_encoding_strategy, tokenize_strategy, weight_dtype,
+            is_train=is_train,
         )
+        if self_reg_ctx is None:
+            return super().process_batch(
+                batch,
+                text_encoders,
+                unet,
+                network,
+                vae,
+                noise_scheduler,
+                vae_dtype,
+                weight_dtype,
+                accelerator,
+                args,
+                text_encoding_strategy,
+                tokenize_strategy,
+                is_train,
+                train_text_encoder,
+                train_unet,
+                edm2_model,
+            )
+
+        saved = self.apply_self_reg_batch_mutations(args, batch, self_reg_ctx)
+        try:
+            final_loss, pre_scaling_loss, loss_scaled = super().process_batch(
+                batch,
+                text_encoders,
+                unet,
+                network,
+                vae,
+                noise_scheduler,
+                vae_dtype,
+                weight_dtype,
+                accelerator,
+                args,
+                text_encoding_strategy,
+                tokenize_strategy,
+                is_train,
+                train_text_encoder,
+                train_unet,
+                edm2_model,
+            )
+            held = None
+            if self_reg_ctx["mode"] == "together":
+                if self._self_reg_anchor_stash is None:
+                    raise ValueError("Self-regularization together step did not produce a held-term loss")
+                final_loss = final_loss + self._self_reg_anchor_stash
+                pre_scaling_loss = pre_scaling_loss + self._self_reg_anchor_stash
+                held = self._self_reg_anchor_stash.detach()
+            else:  # hold step: the base pre-scaling loss IS the held term
+                held = pre_scaling_loss.detach()
+            if held is not None:
+                held_value = float(held.float().mean().item())
+                if self._self_reg_ema is None:
+                    self._self_reg_ema = held_value
+                else:
+                    self._self_reg_ema = self._self_reg_ema * 0.9 + held_value * 0.1
+                self._self_reg_loss_value = held_value
+            return final_loss, pre_scaling_loss, loss_scaled
+        finally:
+            self.restore_self_reg_batch_mutations(args, batch, saved)
+            self._self_reg_ctx = None
+            self._self_reg_anchor_stash = None
+
+    def prepare_self_reg_step(
+        self, args, accelerator, text_encoders, batch, text_encoding_strategy, tokenize_strategy, weight_dtype,
+        is_train=True,
+    ):
+        """Decide the self-reg mode for this step and live-encode anchors.
+
+        Returns a context dict consumed by `get_self_reg_noise_pred_and_target`,
+        or None when this step runs the plain base path (self-reg disabled,
+        validation, or an even alternating "main" step).
+        """
+        if not is_train or not self.is_self_reg_enabled(args):
+            return None
+        if getattr(args, "cache_text_encoder_outputs", False):
+            raise ValueError(
+                "--self_reg_weight requires live text encoder encoding; "
+                "--cache_text_encoder_outputs is not supported with self-regularization"
+            )
+        captions = batch.get("captions", None)
+        if not captions:
+            return None
+
+        self._self_reg_step += 1
+        batch_size = len(captions)
+        batched = bool(getattr(args, "self_reg_batched", False))
+        if batched and batch_size < 2:
+            if not self._self_reg_batched_warned:
+                logger.warning(
+                    "Self-regularization needs a batch of two or more to hold both halves in one step, alternating instead"
+                )
+                self._self_reg_batched_warned = True
+            batched = False
+
+        if batched:
+            mode = "together"
+            half = batch_size // 2
+        elif self._self_reg_step % 2 == 1:
+            mode = "hold"
+            half = None
+        else:
+            return None  # even alternating step: plain main path, no anchor overhead
+
+        trigger_word = str(getattr(args, "self_reg_trigger_word", "") or "")
+        filler = str(getattr(args, "self_reg_filler", "") or "")
+        shuffle_tags = bool(getattr(args, "self_reg_shuffle_tags", False))
+        anchor_captions = [
+            build_self_reg_anchor_caption(caption, trigger_word, filler, shuffle_tags) for caption in captions
+        ]
+        if not self._self_reg_no_trigger_warned and parse_self_reg_trigger_words(trigger_word):
+            lowered = [t.lower() for t in parse_self_reg_trigger_words(trigger_word)]
+            for caption in captions:
+                tags = [t.strip().lower() for t in str(caption or "").split(",")]
+                if not any(t in lowered for t in tags):
+                    logger.debug(
+                        "Self-regularization: caption contains no trigger tag; "
+                        "the anchor still holds filler + full tags."
+                    )
+                    break
+            self._self_reg_no_trigger_warned = True
+
+        anchor_conds = self.encode_self_reg_conds(
+            args, accelerator, text_encoders, anchor_captions, tokenize_strategy, text_encoding_strategy, weight_dtype
+        )
+        self._self_reg_ctx = {"mode": mode, "half": half, "anchor_conds": anchor_conds}
+        return self._self_reg_ctx
+
+    def apply_self_reg_batch_mutations(self, args, batch, ctx):
+        """Align per-sample batch entries with the truncated together halves.
+
+        Both halves derive from samples [:half], so loss_weights / alpha_masks
+        are sliced to match. The adaptive timestep sampler is gated off for the
+        step to keep its (latents, conds) bookkeeping consistent. On hold steps
+        the contrastive flow-matching term is disabled since the whole step is
+        the teacher branch.
+        """
+        saved = {}
+        if ctx["mode"] == "together":
+            half = ctx["half"]
+            if "loss_weights" in batch and batch["loss_weights"] is not None:
+                saved["loss_weights"] = batch["loss_weights"]
+                batch["loss_weights"] = batch["loss_weights"][:half]
+            if batch.get("alpha_masks") is not None:
+                saved["alpha_masks"] = batch["alpha_masks"]
+                batch["alpha_masks"] = batch["alpha_masks"][:half]
+            if getattr(self, "_adaptive_update_pending", False):
+                saved["_adaptive_update_pending"] = True
+                self._adaptive_update_pending = False
+        else:  # hold
+            if getattr(args, "contrastive_flow_matching", False):
+                saved["contrastive_flow_matching"] = True
+                args.contrastive_flow_matching = False
+        return saved
+
+    def restore_self_reg_batch_mutations(self, args, batch, saved):
+        if "loss_weights" in saved:
+            batch["loss_weights"] = saved["loss_weights"]
+        if "alpha_masks" in saved:
+            batch["alpha_masks"] = saved["alpha_masks"]
+        if saved.get("_adaptive_update_pending", False):
+            self._adaptive_update_pending = True
+        if saved.get("contrastive_flow_matching", False):
+            args.contrastive_flow_matching = True
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:
@@ -1349,6 +1823,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             metadata["ss_addift_min_sigma"] = args.addift_min_sigma
             metadata["ss_addift_max_sigma"] = args.addift_max_sigma
 
+        # Anima-only self-regularization config
+        metadata["ss_self_reg_weight"] = getattr(args, "self_reg_weight", 0.0)
+        metadata["ss_self_reg_trigger_word"] = getattr(args, "self_reg_trigger_word", "")
+        metadata["ss_self_reg_filler"] = getattr(args, "self_reg_filler", "")
+        metadata["ss_self_reg_noise"] = getattr(args, "self_reg_noise", 0.0)
+        metadata["ss_self_reg_batched"] = getattr(args, "self_reg_batched", False)
+        metadata["ss_self_reg_shuffle_tags"] = getattr(args, "self_reg_shuffle_tags", False)
+
         # Patch Topology Loss config (runs through inherited NetworkTrainer.process_batch)
         metadata["ss_patch_topology_loss"] = bool(getattr(args, "patch_topology_loss", False))
         metadata["ss_patch_topology_weight"] = getattr(args, "patch_topology_weight", 1.0)
@@ -1365,6 +1847,67 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         metadata["ss_patch_topology_dwa_temperature"] = getattr(args, "patch_topology_dwa_temperature", 2.0)
         metadata["ss_patch_topology_gradnorm_alpha"] = getattr(args, "patch_topology_gradnorm_alpha", 1.5)
         metadata["ss_patch_topology_dynamic_max_weight"] = getattr(args, "patch_topology_dynamic_max_weight", 10.0)
+
+    def generate_step_logs(
+        self,
+        args: argparse.Namespace,
+        current_loss,
+        avr_loss,
+        lr_scheduler,
+        lr_descriptions,
+        optimizer=None,
+        keys_scaled=None,
+        mean_norm=None,
+        maximum_norm=None,
+        mean_grad_norm=None,
+        mean_combined_norm=None,
+        edm2_lr_scheduler=None,
+        current_loss_scaled=None,
+        average_loss_scaled=None,
+        current_loss_edm2=None,
+        average_loss_edm2=None,
+        current_val_loss=None,
+        average_val_loss=None,
+        current_ffl_loss=None,
+        current_patch_topology_loss=None,
+        current_patch_topology_weight=None,
+        current_wav_mask_ratio=None,
+        current_weight_noise_norm=None,
+        current_hf_loss=None,
+        current_anchor_loss=None,
+        it_s: float = 0.0,
+    ):
+        logs = super().generate_step_logs(
+            args,
+            current_loss,
+            avr_loss,
+            lr_scheduler,
+            lr_descriptions,
+            optimizer,
+            keys_scaled,
+            mean_norm,
+            maximum_norm,
+            mean_grad_norm,
+            mean_combined_norm,
+            edm2_lr_scheduler,
+            current_loss_scaled,
+            average_loss_scaled,
+            current_loss_edm2,
+            average_loss_edm2,
+            current_val_loss=current_val_loss,
+            average_val_loss=average_val_loss,
+            current_ffl_loss=current_ffl_loss,
+            current_patch_topology_loss=current_patch_topology_loss,
+            current_patch_topology_weight=current_patch_topology_weight,
+            current_wav_mask_ratio=current_wav_mask_ratio,
+            current_weight_noise_norm=current_weight_noise_norm,
+            current_hf_loss=current_hf_loss,
+            current_anchor_loss=current_anchor_loss,
+            it_s=it_s,
+        )
+        if self._self_reg_loss_value is not None:
+            logs["loss/current_self_reg"] = self._self_reg_loss_value
+        return logs
 
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)
@@ -1446,6 +1989,43 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--addift_multiplier", type=float, default=1.0, help="LoRA multiplier for ADDifT student prediction")
     parser.add_argument("--addift_min_sigma", type=float, default=None, help="minimum sigma for ADDifT timestep sampling")
     parser.add_argument("--addift_max_sigma", type=float, default=None, help="maximum sigma for ADDifT timestep sampling")
+    parser.add_argument(
+        "--self_reg_weight",
+        type=float,
+        default=0.0,
+        help="Self-regularization weight: hold the LoRA to the frozen model's own behaviour on "
+        "everything but the trigger word. 0 = off. 1.0 is a good starting value.",
+    )
+    parser.add_argument(
+        "--self_reg_trigger_word",
+        type=str,
+        default="",
+        help="Trigger word(s) for self-regularization, comma-separated, matched case-insensitively "
+        "against comma-separated caption tags. Required when --self_reg_weight > 0.",
+    )
+    parser.add_argument(
+        "--self_reg_filler",
+        type=str,
+        default="",
+        help="Word(s) placed in the vacated trigger slot of the anchor caption so tag positions stay stable.",
+    )
+    parser.add_argument(
+        "--self_reg_noise",
+        type=float,
+        default=0.0,
+        help="Probability (0..1) of using a pure-noise anchor on hold steps, covering latents the images never reach.",
+    )
+    parser.add_argument(
+        "--self_reg_batched",
+        action="store_true",
+        help="Hold both halves in one step (same-step half-batch) instead of alternating steps. "
+        "Needs batch size >= 2; otherwise falls back to alternating steps.",
+    )
+    parser.add_argument(
+        "--self_reg_shuffle_tags",
+        action="store_true",
+        help="Shuffle the held tags once when building the anchor caption so tag positions are unreliable.",
+    )
     return parser
 
 

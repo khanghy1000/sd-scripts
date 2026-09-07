@@ -319,7 +319,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 )
 
         if getattr(args, "self_reg_weight", 0.0):
-            self.validate_self_reg_args(args)
+            self.validate_self_reg_args(args, train_dataset_group)
 
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
@@ -358,7 +358,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def is_self_reg_enabled(args) -> bool:
         return float(getattr(args, "self_reg_weight", 0.0) or 0.0) > 0.0
 
-    def validate_self_reg_args(self, args):
+    def validate_self_reg_args(self, args, train_dataset_group=None):
         """Validate Anima-only self-regularization arguments.
 
         Constraints: LoRA only, explicit trigger word, no cached text encoder
@@ -381,11 +381,34 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 "Forcing --network_train_unet_only to avoid keeping the text encoder on GPU."
             )
             args.network_train_unet_only = True
-        if getattr(args, "self_reg_batched", False) and getattr(args, "train_batch_size", 1) < 2:
-            # Mirror source trainer/train.py: fall back to alternating steps.
-            logger.warning(
-                "Self-regularization needs a batch of two or more to hold both halves in one step, alternating instead"
-            )
+
+        effective_batch_sizes = []
+        if train_dataset_group is not None:
+            datasets = getattr(train_dataset_group, "datasets", [train_dataset_group])
+            for dataset in datasets:
+                subsets = getattr(dataset, "subsets", None)
+                if subsets:
+                    for subset in subsets:
+                        bs = getattr(subset, "batch_size", None)
+                        if bs is not None:
+                            effective_batch_sizes.append(int(bs))
+                bs = getattr(dataset, "batch_size", None)
+                if bs is not None:
+                    effective_batch_sizes.append(int(bs))
+        if not effective_batch_sizes:
+            effective_batch_sizes.append(int(getattr(args, "train_batch_size", 1)))
+
+        if getattr(args, "self_reg_batched", False):
+            if max(effective_batch_sizes) < 2:
+                # Mirror source trainer/train.py: fall back to alternating steps.
+                logger.warning(
+                    "Self-regularization needs a batch of two or more to hold both halves in one step, alternating instead."
+                )
+            elif min(effective_batch_sizes) < 2:
+                logger.info(
+                    "Self-regularization batched mode enabled, but some dataset subsets have batch size < 2; "
+                    "those subsets will alternate instead."
+                )
         logger.info(
             "[Anima self-reg] ENABLED -- weight=%s, trigger=%s, filler=%s, noise=%s, batched=%s, shuffle_tags=%s. "
             "A starting weight of 1.0 is a good default; alternating mode needs ~2x iterations.",

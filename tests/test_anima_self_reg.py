@@ -274,6 +274,41 @@ def test_validate_args_forces_unet_only():
     assert args.network_train_unet_only is True
 
 
+def test_validate_args_dataset_group_batch_size(caplog):
+    t = AnimaNetworkTrainer()
+    # CLI train_batch_size is 1 (default), but dataset has batch_size = 4
+    args = _make_args(self_reg_batched=True, train_batch_size=1)
+    dataset = SimpleNamespace(batch_size=4, subsets=[])
+    dataset_group = SimpleNamespace(datasets=[dataset])
+
+    with caplog.at_level("WARNING"):
+        t.validate_self_reg_args(args, dataset_group)
+    assert "Self-regularization needs a batch of two or more" not in caplog.text
+
+
+def test_validate_args_dataset_group_batch_size_warns_when_all_single(caplog):
+    t = AnimaNetworkTrainer()
+    args = _make_args(self_reg_batched=True, train_batch_size=1)
+    dataset = SimpleNamespace(batch_size=1, subsets=[])
+    dataset_group = SimpleNamespace(datasets=[dataset])
+
+    with caplog.at_level("WARNING"):
+        t.validate_self_reg_args(args, dataset_group)
+    assert "Self-regularization needs a batch of two or more" in caplog.text
+
+
+def test_validate_args_subset_batch_size_override(caplog):
+    t = AnimaNetworkTrainer()
+    args = _make_args(self_reg_batched=True, train_batch_size=1)
+    subset = SimpleNamespace(batch_size=4)
+    dataset = SimpleNamespace(batch_size=1, subsets=[subset])
+    dataset_group = SimpleNamespace(datasets=[dataset])
+
+    with caplog.at_level("WARNING"):
+        t.validate_self_reg_args(args, dataset_group)
+    assert "Self-regularization needs a batch of two or more" not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Forward-path integration on CPU with a fake DiT (no weights needed)
 # ---------------------------------------------------------------------------

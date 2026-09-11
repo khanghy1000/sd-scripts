@@ -433,9 +433,11 @@ def train(args):
         if unexpected:
             logger.warning(f"unexpected keys ({len(unexpected)}): {unexpected[:5]}")
     else:
-        # Copy base weights then zero-init the projections
-        vace.copy_weights_to_control_branch(dit, strategy=args.vace_copy_strategy, n=args.vace_copy_n)
+        # Init first (random + zeroed before/after projs), then copy base
+        # weights into the inner control blocks. Copy-then-init would
+        # re-randomize the just-copied blocks via Block.init_weights().
         vace.init_weights()
+        vace.copy_weights_to_control_branch(dit, strategy=args.vace_copy_strategy, n=args.vace_copy_n)
 
     wrapper = AnimaControlNetVACEWrapper(
         dit, vace, control_context_scale=args.vace_control_context_scale

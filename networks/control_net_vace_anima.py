@@ -9,8 +9,10 @@
 # additively injects per-block "hints" into the base transformer's hidden
 # states via zero-conv projections.
 #
-# Injection is non-invasive: forward hooks on target base blocks return
-# `output + hints[i] * scale`. The base DiT class is unmodified.
+# Injection is non-invasive: the wrapper patches dit.forward_mini_train_dit
+# to add `output + hints[i] * scale` explicitly after each target base
+# block (hook-free, so gradient checkpointing stays correct). The base
+# DiT class is unmodified.
 
 import os
 from typing import List, Literal, Optional, Tuple
@@ -284,6 +286,16 @@ class ControlNetVACEAnima(nn.Module):
                 break
             self.control_blocks[cb_idx].copy_weights_from_base_block(dit.blocks[base_idx])
 
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable checkpointing on each inner control Block (trainable branch)."""
+        for cb in self.control_blocks:
+            cb.block.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable checkpointing on each inner control Block."""
+        for cb in self.control_blocks:
+            cb.block.disable_gradient_checkpointing()
+
     def forward(
         self,
         control_latent_B_C_T_H_W: torch.Tensor,
@@ -355,22 +367,19 @@ class ControlNetVACEAnima(nn.Module):
 # ---------------------------------------------------------------------------
 class AnimaControlNetVACEWrapper(nn.Module):
     """Holds dit (frozen) + vace (trainable). Runs control branch, then base
-    with per-block forward hooks injecting hints.
+    with explicit per-block hint injection.
 
-    Hook mechanism:
-      * On __init__, a ``register_forward_hook`` is attached to each target
-        base Block. The hook returns ``output + hints[i] * scale``.
-      * Before each base forward, ``_set_hints`` stores the list of hint
-        tensors on ``self._hints``; the hooks read from there.
-      * After each base forward, ``_clear_hints`` resets to ``[None] * N``.
-
-    Interaction with gradient checkpointing:
-      PyTorch forward hooks do NOT fire during the activation-checkpointing
-      recomputation pass, so gradients will not flow through the hint injection
-      when the base Block uses ``torch.utils.checkpoint``. The wrapper raises
-      a clear error if any target block has ``gradient_checkpointing=True``
-      at construction time, and offers ``disable_target_block_checkpointing``
-      to turn it off selectively.
+    Injection mechanism (hook-free, gradient-checkpointing safe):
+      * The patched ``dit.forward_mini_train_dit`` runs the control branch
+        first to produce ``hints`` (one per target base block).
+      * The base block loop then applies ``x = x + hints[i] * scale``
+        explicitly after each target block.
+      * Because the addition lives *outside* ``Block._forward``'s
+        ``torch.utils.checkpoint`` region, it stays in the outer autograd
+        graph and gradients flow to VACE on both the forward and the
+        checkpoint recomputation pass. (The previous forward-hook design
+        silently dropped hint grads under checkpointing because hooks do
+        not re-fire during recomputation.)
     """
 
     def __init__(
@@ -384,52 +393,14 @@ class AnimaControlNetVACEWrapper(nn.Module):
         self.vace = vace
         self.control_context_scale = float(control_context_scale)
 
-        # hints[i] holds the hint for control_layers_mapping target i (None = no injection)
-        self._hints: List[Optional[torch.Tensor]] = [None] * len(vace.control_layers)
-        self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
-
-        # Hold the latest control latent so a patched forward_mini_train_dit can find it
+        # Hold the latest control latent so a patched forward_mini_train_dit can find it.
+        # NOTE: padding_mask needs no staging — it travels with each dit()
+        # call straight into the patched forward and on to both branches.
         self._pending_control_latent: Optional[torch.Tensor] = None
-        self._pending_padding_mask: Optional[torch.Tensor] = None
 
-        self._register_block_hooks()
         self._patch_dit_forward()
 
-    # -- hook management ----------------------------------------------------
-    def _register_block_hooks(self) -> None:
-        """Register forward hooks on each target base block."""
-        for base_idx, control_idx in self.vace.control_layers_mapping.items():
-            block = self.dit.blocks[base_idx]
-
-            def make_hook(cidx: int):
-                def hook(module, inputs, output):
-                    hint = self._hints[cidx]
-                    if hint is None:
-                        return output
-                    return output + hint.to(dtype=output.dtype) * self.control_context_scale
-
-                return hook
-
-            handle = block.register_forward_hook(make_hook(control_idx))
-            self._hook_handles.append(handle)
-
-    def _set_hints(self, hints: List[torch.Tensor]) -> None:
-        assert len(hints) == len(self._hints), (
-            f"got {len(hints)} hints, expected {len(self._hints)} (= len(control_layers))"
-        )
-        for i, h in enumerate(hints):
-            self._hints[i] = h
-
-    def _clear_hints(self) -> None:
-        for i in range(len(self._hints)):
-            self._hints[i] = None
-
-    def remove_hooks(self) -> None:
-        for h in self._hook_handles:
-            h.remove()
-        self._hook_handles.clear()
-
-    def stage_control(self, control_latent: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> None:
+    def stage_control(self, control_latent: torch.Tensor) -> None:
         """Stage a control latent to be used on subsequent forward calls.
 
         The staged latent persists across multiple forwards (so CFG / multi-step
@@ -437,17 +408,10 @@ class AnimaControlNetVACEWrapper(nn.Module):
         ``clear_staged_control`` when the generation is done.
         """
         self._pending_control_latent = control_latent
-        self._pending_padding_mask = padding_mask
 
     def clear_staged_control(self) -> None:
         """Clear any staged control latent so subsequent forwards run unconditioned."""
         self._pending_control_latent = None
-        self._pending_padding_mask = None
-
-    def disable_target_block_checkpointing(self) -> None:
-        """Call if you need gradient checkpointing elsewhere but want hooks to work."""
-        for base_idx in self.vace.control_layers_mapping:
-            self.dit.blocks[base_idx].disable_gradient_checkpointing()
 
     # -- forward patching ---------------------------------------------------
     def _patch_dit_forward(self) -> None:
@@ -458,10 +422,9 @@ class AnimaControlNetVACEWrapper(nn.Module):
              exactly as the original method does.
           2. Runs the control branch using these shared tensors and the
              pending control latent → produces hints list.
-          3. Sets hints on self._hints so per-block hooks fire during step 4.
-          4. Runs the original block loop (hooks inject).
-          5. Runs final_layer + unpatchify (unchanged).
-          6. Clears hints.
+          3. Runs the block loop, applying ``x = x + hints[i] * scale``
+             explicitly after each target block (checkpoint-safe).
+          4. Runs final_layer + unpatchify (unchanged).
         """
         dit = self.dit
         original_forward_mini_train_dit = dit.forward_mini_train_dit
@@ -514,6 +477,7 @@ class AnimaControlNetVACEWrapper(nn.Module):
             # runs the DiT twice per step in inference). The caller owns the
             # lifecycle via ``clear_staged_control`` / re-setting the attr.
             control_latent = self._pending_control_latent
+            hints: Optional[List[torch.Tensor]] = None
             if control_latent is not None:
                 hints = self.vace(
                     control_latent_B_C_T_H_W=control_latent,
@@ -527,24 +491,29 @@ class AnimaControlNetVACEWrapper(nn.Module):
                     extra_per_block_pos_emb=extra_pos_emb,
                     padding_mask=padding_mask,
                 )
-                self._set_hints(hints)
 
-            # 4. Block loop (original) — hooks fire at target blocks
-            try:
+            # 4. Block loop with explicit hint injection (checkpoint-safe:
+            # the addition stays in the outer graph, outside Block._forward's
+            # torch.utils.checkpoint region).
+            control_layers_mapping = self.vace.control_layers_mapping
+            if dit.blocks_to_swap:
+                dit.prepare_block_swap_before_forward()
+
+            for block_idx, block in enumerate(dit.blocks):
                 if dit.blocks_to_swap:
-                    dit.prepare_block_swap_before_forward()
-
-                for block_idx, block in enumerate(dit.blocks):
-                    if dit.blocks_to_swap:
-                        dit.offloader.wait_for_block(block_idx)
-                    x_B_T_H_W_D = block(
-                        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs
-                    )
-                    if dit.blocks_to_swap:
-                        dit.offloader.submit_move_blocks(dit.blocks, block_idx)
-            finally:
-                # 6. Clear hints regardless of success/failure
-                self._clear_hints()
+                    dit.offloader.wait_for_block(block_idx)
+                x_B_T_H_W_D = block(
+                    x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs
+                )
+                if hints is not None:
+                    control_idx = control_layers_mapping.get(block_idx)
+                    if control_idx is not None:
+                        x_B_T_H_W_D = (
+                            x_B_T_H_W_D
+                            + hints[control_idx].to(dtype=x_B_T_H_W_D.dtype) * self.control_context_scale
+                        )
+                if dit.blocks_to_swap:
+                    dit.offloader.submit_move_blocks(dit.blocks, block_idx)
 
             # 5. Final layer + unpatchify
             x_B_T_H_W_O = dit.final_layer(
@@ -592,7 +561,6 @@ class AnimaControlNetVACEWrapper(nn.Module):
         if control_latent is not None:
             # Stage the control latent for the patched forward_mini_train_dit
             self._pending_control_latent = control_latent
-            self._pending_padding_mask = padding_mask
             clear_after = True
 
         try:
@@ -600,7 +568,6 @@ class AnimaControlNetVACEWrapper(nn.Module):
         finally:
             if clear_after:
                 self._pending_control_latent = None
-                self._pending_padding_mask = None
 
 
 # ---------------------------------------------------------------------------
@@ -739,8 +706,8 @@ def attach_vace_to_dit(
 ) -> AnimaControlNetVACEWrapper:
     """End-to-end: build VACE from metadata, load weights, wrap the DiT.
 
-    Returns a wrapper ready for inference. Hooks are registered; the original
-    dit.forward_mini_train_dit is patched.
+    Returns a wrapper ready for inference. The wrapper patches
+    dit.forward_mini_train_dit for explicit hint injection.
     """
     vace = build_vace_from_metadata(dit, file, extra_kwargs=extra_vace_kwargs)
     missing, unexpected = load_vace_weights(vace, file, strict=strict_load)

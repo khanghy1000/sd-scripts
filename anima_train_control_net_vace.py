@@ -226,7 +226,7 @@ def train(args):
         "blocks_to_swap is not supported in Anima ControlNet-VACE training (MVP)"
     )
     assert not args.cpu_offload_checkpointing, (
-        "cpu_offload_checkpointing is not supported in Anima ControlNet-VACE training (hooks + checkpointing incompatible)"
+        "cpu_offload_checkpointing is not supported in Anima ControlNet-VACE training (MVP)"
     )
     assert not args.unsloth_offload_checkpointing, (
         "unsloth_offload_checkpointing is not supported in Anima ControlNet-VACE training"
@@ -397,15 +397,11 @@ def train(args):
         "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
     )
 
-    # NOTE: VACE injects via forward hooks, which are incompatible with
-    # torch.utils.checkpoint on the target base blocks (hooks do not fire
-    # during recomputation in backward). For correctness we forbid
-    # gradient_checkpointing for now; revisit if a per-block override is added.
-    assert not args.gradient_checkpointing, (
-        "gradient_checkpointing is not supported with VACE hook injection. "
-        "Disable --gradient_checkpointing or use a larger GPU. "
-        "(Hooks do not fire during the checkpoint recomputation pass.)"
-    )
+    # VACE hint injection is hook-free (explicit residual addition outside
+    # Block._forward's checkpoint region), so vanilla gradient checkpointing
+    # is safe on both the frozen base DiT and the trainable control branch.
+    if args.gradient_checkpointing:
+        dit.enable_gradient_checkpointing()
 
     dit.requires_grad_(False)
 
@@ -438,6 +434,9 @@ def train(args):
         # re-randomize the just-copied blocks via Block.init_weights().
         vace.init_weights()
         vace.copy_weights_to_control_branch(dit, strategy=args.vace_copy_strategy, n=args.vace_copy_n)
+
+    if args.gradient_checkpointing:
+        vace.enable_gradient_checkpointing()
 
     wrapper = AnimaControlNetVACEWrapper(
         dit, vace, control_context_scale=args.vace_control_context_scale
@@ -654,8 +653,8 @@ def train(args):
         current_epoch.value = epoch + 1
 
         wrapper.train()
-        # DiT is frozen; keep eval mode except where train mode is required
-        accelerator.unwrap_model(wrapper).dit.eval()
+        # DiT is frozen, but gradient checkpointing only triggers in train mode
+        accelerator.unwrap_model(wrapper).dit.train() if args.gradient_checkpointing else accelerator.unwrap_model(wrapper).dit.eval()
 
         for step, batch in enumerate(train_dataloader):
             current_step.value = global_step
@@ -782,9 +781,8 @@ def train(args):
                 optimizer.zero_grad(set_to_none=True)
 
             # clear staged control latent to prevent leakage
-            unwrapped = accelerator.unwrap_model(wrapper)
-            unwrapped._pending_control_latent = None
-            unwrapped._pending_padding_mask = None
+            # (forward() already clears it, this is just a safety net)
+            accelerator.unwrap_model(wrapper).clear_staged_control()
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -842,7 +840,6 @@ def train(args):
     # Restore original dit.forward_mini_train_dit so the dit object can be reused cleanly
     unwrapped = accelerator.unwrap_model(wrapper)
     unwrapped.unpatch_dit_forward()
-    unwrapped.remove_hooks()
 
     del accelerator
 

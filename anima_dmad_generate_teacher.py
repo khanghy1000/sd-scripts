@@ -145,6 +145,7 @@ def run_generate(args):
             print(f"skip {os.path.basename(cpath)} (complete)", flush=True)
             continue
         lats, texts = [], []
+        print(f"shard {args.shard}: caching chunk {ci + 1}/{n_chunks} ({len(idxs)} samples ...)", flush=True)
         for b0 in range(0, len(idxs), args.batch_size):
             bidx = idxs[b0:b0 + args.batch_size]
             batch_prompts = [prompts[i % len(prompts)] for i in bidx]

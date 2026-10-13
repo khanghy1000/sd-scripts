@@ -251,6 +251,19 @@ class AnimaDMADCritic(nn.Module):
     ):
         from library import attention as attention_lib
 
+        # Run the backbone in its own parameter dtype (timesteps included: a
+        # float32 t/embedding against bf16 weights raises a dtype error in the
+        # AdaLN modulation, where autocast is explicitly disabled).
+        try:
+            model_dtype = next(self.parameters()).dtype
+        except StopIteration:
+            model_dtype = x_5d.dtype
+        x_5d = x_5d.to(model_dtype)
+        if torch.is_tensor(padding_mask):
+            padding_mask = padding_mask.to(model_dtype)
+        if torch.is_tensor(prompt_embeds):
+            prompt_embeds = prompt_embeds.to(model_dtype)
+
         crossattn_emb = prompt_embeds
         if self.use_llm_adapter and t5_input_ids is not None and self.llm_adapter is not None:
             crossattn_emb = self.llm_adapter(
@@ -261,12 +274,16 @@ class AnimaDMADCritic(nn.Module):
             )
             if t5_attn_mask is not None:
                 crossattn_emb = crossattn_emb.masked_fill(~t5_attn_mask.bool().unsqueeze(-1), 0)
+        if torch.is_tensor(crossattn_emb):
+            crossattn_emb = crossattn_emb.to(model_dtype)
 
         x_B_T_H_W_D, rope_emb, extra_pos_emb = self._prepare_embedded_sequence(x_5d, padding_mask)
 
-        t = sigmas.reshape(-1, 1).to(x_5d.dtype)
+        t = sigmas.reshape(-1, 1).to(model_dtype)
         t_emb, adaln_lora = self.t_embedder(t)
-        t_emb = self.t_embedding_norm(t_emb)
+        t_emb = self.t_embedding_norm(t_emb).to(model_dtype)
+        if adaln_lora is not None:
+            adaln_lora = adaln_lora.to(model_dtype)
 
         attn_params = attention_lib.AttentionParams.create_attention_params(self.attn_mode, self.split_attn)
         use_fp32 = x_B_T_H_W_D.dtype == torch.float16
@@ -295,7 +312,7 @@ class AnimaDMADCritic(nn.Module):
         b, _, _, h, w = noised.shape
         padding_mask = torch.zeros(b, 1, h, w, dtype=noised.dtype, device=noised.device)
         tokens = self._backbone_features(noised, sigmas, prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, padding_mask)
-        tokens = tokens.float()
+        tokens = tokens.to(next(self.head_real.parameters()).dtype)
         d_real = self.head_real(tokens).reshape(b, -1).mean(dim=1)
         d_teacher = self.head_teacher(tokens).reshape(b, -1).mean(dim=1)
         return d_real, d_teacher

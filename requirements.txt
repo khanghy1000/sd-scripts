@@ -54,5 +54,7 @@ numpy
 rich==14.1.0
 # for T5XXL tokenizer (SD3/FLUX)
 sentencepiece==0.2.1
+# for DMAD teacher-latent LMDB (anima_dmad_generate_teacher.py / anima_train_dmad.py --teacher_latent_path)
+lmdb
 # for kohya_ss library
 -e .

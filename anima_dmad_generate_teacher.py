@@ -111,7 +111,11 @@ def run_generate(args):
     text_encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
 
     logger.info("Loading teacher DiT...")
-    dit = anima_utils.load_anima_model("cuda", args.dit, args.attn_mode, args.split_attn, "cuda", dtype)
+    # Load to CPU first, then move the whole module: several buffers (RoPE
+    # freqs, adapter inv_freq) are absent from the checkpoint, so the loader's
+    # weight-only move to CUDA would leave them on CPU -> device mismatch.
+    dit = anima_utils.load_anima_model("cpu", args.dit, args.attn_mode, args.split_attn, "cpu", dtype)
+    dit.to(device)
     dit.requires_grad_(False)
     dit.eval()
     qwen3_te.to(device)

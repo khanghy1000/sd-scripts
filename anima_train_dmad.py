@@ -53,6 +53,7 @@ import library.accelerator_setup as accelerator_setup
 import library.args as args_util
 import library.checkpoint_io as checkpoint_io
 import library.dataset as dataset_util
+import library.deepspeed_utils as deepspeed_utils
 import library.logging_util as logging_util
 import library.loss as loss_util  # noqa: F401 (kept for parity with anima_train.py)
 import library.optimizer as optimizer_util
@@ -866,6 +867,7 @@ def setup_parser() -> argparse.ArgumentParser:
     args_util.add_dataset_arguments(parser, True, True, True)
     args_util.add_training_arguments(parser, False)
     args_util.add_masked_loss_arguments(parser)
+    deepspeed_utils.add_deepspeed_arguments(parser)
     args_util.add_sd_saving_arguments(parser)
     args_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)

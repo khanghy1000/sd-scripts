@@ -207,7 +207,7 @@ def sample_backward_simulation(dit, noise4d, prompt_embeds, attn_mask, t5_input_
         v = dit(x.to(dtype), t, prompt_embeds.to(dtype) if torch.is_tensor(prompt_embeds) else prompt_embeds,
                 padding_mask=padding_mask.to(dtype), source_attention_mask=attn_mask,
                 target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask).float()
-        clean = (x.squeeze(2) - s * v)
+        clean = (x.squeeze(2) - s * v.squeeze(2))
         s_next = float(sigmas[j + 1])
         clean_full = clean.unsqueeze(2)
         clean_full = (1.0 - s_next) * clean_full + s_next * torch.randn_like(clean_full)

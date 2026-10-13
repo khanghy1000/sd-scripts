@@ -598,6 +598,7 @@ def train(args):
         args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
     accelerator.print("running DMAD training / 学習開始")
+    os.makedirs(args.output_dir, exist_ok=True)
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0,
                         disable=not accelerator.is_local_main_process, desc="steps")
     global_step = 0
@@ -660,6 +661,7 @@ def train(args):
         accelerator.wait_for_everyone()
         if not accelerator.is_main_process:
             return
+        os.makedirs(args.output_dir, exist_ok=True)
         base = args.output_name or "anima-dmad"
         if network is None:
             anima_train_utils.save_anima_model_on_epoch_end_or_stepwise(

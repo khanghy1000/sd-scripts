@@ -31,6 +31,8 @@ from library.device_utils import init_ipex
 
 init_ipex()
 
+from tqdm import tqdm
+
 from library import anima_utils, strategy_anima
 from library.anima_dmad import euler_sample_x0
 from library.utils import setup_logging
@@ -145,8 +147,9 @@ def run_generate(args):
             print(f"skip {os.path.basename(cpath)} (complete)", flush=True)
             continue
         lats, texts = [], []
-        print(f"shard {args.shard}: caching chunk {ci + 1}/{n_chunks} ({len(idxs)} samples ...)", flush=True)
-        for b0 in range(0, len(idxs), args.batch_size):
+        for b0 in tqdm(range(0, len(idxs), args.batch_size),
+                       desc=f"shard {args.shard} chunk {ci + 1}/{n_chunks}",
+                       unit="batch"):
             bidx = idxs[b0:b0 + args.batch_size]
             batch_prompts = [prompts[i % len(prompts)] for i in bidx]
             with torch.no_grad():

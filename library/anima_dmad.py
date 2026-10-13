@@ -397,49 +397,50 @@ def euler_sample_x0(dit, noise4d, prompt_embeds, attn_mask, t5_input_ids, t5_att
                     steps=20, flow_shift=1.0, guidance_scale=1.0, neg_cond=None):
     """Multi-step Euler sampling for rectified flow (no grad). Returns x0 latents (4D).
 
+    The DiT runs in its own parameter dtype (timesteps included — a float32
+    ``t`` against bf16 weights raises a dtype error); accumulation stays fp32.
+
     Args:
         guidance_scale: CFG scale (1.0 = no guidance). With > 1.0, ``neg_cond``
             must be a ``(neg_embeds, neg_attn, neg_t5_ids, neg_t5_mask)`` tuple;
             the guided velocity ``v_neg + cfg * (v_pos - v_neg)`` is integrated,
             baking the guidance into the samples.
     """
-    device, dtype = noise4d.device, noise4d.dtype
+    device = noise4d.device
+    try:
+        model_dtype = next(dit.parameters()).dtype
+    except StopIteration:
+        model_dtype = noise4d.dtype
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
     if float(flow_shift) != 1.0:
         fs = float(flow_shift)
         sigmas = (sigmas * fs) / (1 + (fs - 1) * sigmas)
     use_cfg = float(guidance_scale) > 1.0 and neg_cond is not None
-    x = noise4d.unsqueeze(2).to(torch.float32)  # 5D
+    x = noise4d.unsqueeze(2).float()  # 5D float32 accumulator
     b, _, _, h, w = x.shape
-    padding_mask = torch.zeros(b, 1, h, w, dtype=torch.float32, device=device)
+    padding_mask = torch.zeros(b, 1, h, w, dtype=model_dtype, device=device)
+
+    def run_dit(x_in, t_in, cond):
+        c_emb, c_attn, c_t5, c_t5m = cond
+        if torch.is_tensor(c_emb):
+            c_emb = c_emb.to(model_dtype)
+        return dit(x_in.to(model_dtype), t_in,
+                   c_emb, padding_mask=padding_mask,
+                   source_attention_mask=c_attn,
+                   target_input_ids=c_t5,
+                   target_attention_mask=c_t5m).float()
+
     for i in range(steps):
-        s = sigmas[i]
-        t = torch.full((b,), float(s), device=device, dtype=torch.float32)
+        s = float(sigmas[i])
+        t = torch.full((b,), s, device=device, dtype=model_dtype)
         if use_cfg:
-            n_emb, n_attn, n_t5, n_t5m = neg_cond
-            v_pos = dit(x.to(dtype), t,
-                        prompt_embeds.to(dtype) if torch.is_tensor(prompt_embeds) else prompt_embeds,
-                        padding_mask=padding_mask.to(dtype),
-                        source_attention_mask=attn_mask,
-                        target_input_ids=t5_input_ids,
-                        target_attention_mask=t5_attn_mask).float()
-            v_neg = dit(x.to(dtype), t,
-                        n_emb.to(dtype) if torch.is_tensor(n_emb) else n_emb,
-                        padding_mask=padding_mask.to(dtype),
-                        source_attention_mask=n_attn,
-                        target_input_ids=n_t5,
-                        target_attention_mask=n_t5m).float()
+            v_pos = run_dit(x, t, (prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask))
+            v_neg = run_dit(x, t, neg_cond)
             v = v_neg + float(guidance_scale) * (v_pos - v_neg)
         else:
-            v = dit(x.to(dtype), t,
-                    prompt_embeds.to(dtype) if torch.is_tensor(prompt_embeds) else prompt_embeds,
-                    padding_mask=padding_mask.to(dtype),
-                    source_attention_mask=attn_mask,
-                    target_input_ids=t5_input_ids,
-                    target_attention_mask=t5_attn_mask)
-            v = v.float()
-        x = x + v * (float(sigmas[i + 1]) - float(s))
-    return x.squeeze(2).to(dtype)
+            v = run_dit(x, t, (prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask))
+        x = x + v * (float(sigmas[i + 1]) - s)
+    return x.squeeze(2).to(noise4d.dtype)
 
 
 # ---------------------------------------------------------------------------

@@ -202,7 +202,7 @@ def sample_backward_simulation(dit, noise4d, prompt_embeds, attn_mask, t5_input_
     clean = noise4d.float()
     for j in range(k):
         s = float(sigmas[j])
-        t = torch.full((b,), s, device=device, dtype=torch.float32)
+        t = torch.full((b,), s, device=device, dtype=noise4d.dtype)
         v = dit(x.to(dtype), t, prompt_embeds.to(dtype) if torch.is_tensor(prompt_embeds) else prompt_embeds,
                 padding_mask=padding_mask.to(dtype), source_attention_mask=attn_mask,
                 target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask).float()
@@ -223,7 +223,8 @@ def student_forward(dit, noise4d, cond, args, real_latents=None, dtype=None):
     steps = max(1, int(args.num_denoising_steps))
     if steps <= 1:
         s = float(args.conditioning_sigma)
-        t = torch.full((b,), s, device=device, dtype=torch.float32)
+        # timesteps must match the DiT dtype (float32 t vs bf16 weights errors)
+        t = torch.full((b,), s, device=device, dtype=noise4d.dtype)
         x = noise4d.unsqueeze(2)
         _, _, _, h, w = x.shape
         padding_mask = torch.zeros(b, 1, h, w, dtype=dtype, device=device)
@@ -240,7 +241,7 @@ def student_forward(dit, noise4d, cond, args, real_latents=None, dtype=None):
         x = noised.unsqueeze(2)
         _, _, _, h, w = x.shape
         padding_mask = torch.zeros(b, 1, h, w, dtype=dtype, device=device)
-        t = s.float()
+        t = s.to(noise4d.dtype)
         v = dit(x, t, prompt_embeds, padding_mask=padding_mask, source_attention_mask=attn_mask,
                 target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask)
         g = velocity_to_x0(noised, v.squeeze(2), s.to(v.dtype))
@@ -257,7 +258,7 @@ def student_forward(dit, noise4d, cond, args, real_latents=None, dtype=None):
     x = noised.unsqueeze(2)
     _, _, _, h, w = x.shape
     padding_mask = torch.zeros(b, 1, h, w, dtype=dtype, device=device)
-    t = s.float()
+    t = s.to(noise4d.dtype)
     v = dit(x, t, prompt_embeds, padding_mask=padding_mask, source_attention_mask=attn_mask,
             target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask)
     g = velocity_to_x0(noised, v.squeeze(2), s.to(v.dtype))

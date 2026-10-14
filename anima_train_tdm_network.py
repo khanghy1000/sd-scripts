@@ -52,6 +52,10 @@ Outputs: ``tdm_student_step_<n>.safetensors`` (student LoRA only, same key
 layout as ``anima_train_network.py`` -- directly usable for inference /
 ComfyUI conversion) and ``tdm_state_step_<n>.safetensors`` (both adapters,
 ``student.``/``fake.`` prefixes -- resume with ``--tdm_resume_state``).
+With EMA enabled (default, ``--tdm_ema_decay``), an extra
+``<output_name>_ema_step_<n>.safetensors`` holds the EMA student LoRA (the
+recommended inference weight), the state file also carries ``ema.`` entries,
+and previews render with the EMA weights.
 """
 
 import argparse
@@ -144,6 +148,14 @@ def add_tdm_arguments(parser: argparse.ArgumentParser):
     g.add_argument("--tdm_eval_every", type=int, default=0, help="Render K-step student previews every N steps (0 = disabled, default).")
     g.add_argument("--tdm_preview_n", type=int, default=4, help="Preview images per eval.")
     g.add_argument("--tdm_seed", type=int, default=None, help="Preview noise seed (default: fixed 42 for comparability).")
+    g.add_argument("--tdm_no_ema", action="store_true",
+                   help="Disable the student EMA shadow (by default an EMA of the student LoRA is kept for previews/saving).")
+    g.add_argument("--tdm_ema_decay", type=float, default=0.999,
+                   help="EMA decay for the student LoRA shadow (default: 0.999). Updated once per optimizer step.")
+    g.add_argument("--tdm_ema_warmup", type=int, default=0,
+                   help="Optimizer steps before EMA starts tracking. At this step the EMA is re-synced from the student, then decayed (default: 0).")
+    g.add_argument("--tdm_ema_update_every", type=int, default=1,
+                   help="Update the EMA every N optimizer steps (default: 1).")
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -261,6 +273,44 @@ def zero_all(*nets):
         for p in net.parameters():
             if p.grad is not None:
                 p.grad = None
+
+
+# ---------------------------------------------------------------------------
+# Student EMA (fp32 shadow of the student LoRA state_dict)
+# ---------------------------------------------------------------------------
+
+def init_ema_state(student_net, device) -> dict:
+    """Snapshot the student LoRA state_dict in fp32 on ``device``."""
+    ema = {}
+    for k, v in student_net.state_dict().items():
+        if torch.is_tensor(v) and v.is_floating_point():
+            ema[k] = v.detach().to(device, dtype=torch.float32).clone()
+        else:
+            ema[k] = v.detach().clone() if torch.is_tensor(v) else v
+    return ema
+
+
+@torch.no_grad()
+def update_ema_state(ema: dict, student_net, decay: float):
+    """ema <- decay * ema + (1 - decay) * student (fp32, in place)."""
+    src_sd = student_net.state_dict()
+    for k, e in ema.items():
+        s = src_sd[k]
+        if torch.is_tensor(s) and s.is_floating_point():
+            e.mul_(decay).add_(s.detach().to(e.device, dtype=torch.float32), alpha=1.0 - decay)
+
+
+def ema_casted_state_dict(ema: dict, student_net) -> dict:
+    """EMA entries cast back to the student's dtype/device (for load/swap)."""
+    dst_sd = student_net.state_dict()
+    out = {}
+    for k, v in dst_sd.items():
+        e = ema.get(k, v)
+        if torch.is_tensor(e) and torch.is_tensor(v) and e.is_floating_point():
+            out[k] = e.to(device=v.device, dtype=v.dtype)
+        else:
+            out[k] = e
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +470,38 @@ def main(args):
         student_net.load_state_dict(s_sd, strict=True)
         fake_net.load_state_dict(f_sd, strict=True)
 
+    # ---- student EMA shadow (fp32, student LoRA only) ----
+    use_ema = not bool(getattr(args, "tdm_no_ema", False))
+    ema_decay = float(getattr(args, "tdm_ema_decay", 0.999) or 0.0)
+    ema_warmup = max(0, int(getattr(args, "tdm_ema_warmup", 0) or 0))
+    ema_update_every = max(1, int(getattr(args, "tdm_ema_update_every", 1) or 1))
+    if use_ema and not (0.0 < ema_decay < 1.0):
+        logger.warning(f"--tdm_ema_decay={ema_decay} out of (0, 1); disabling EMA.")
+        use_ema = False
+    ema_state = None
+    if use_ema:
+        ema_state = init_ema_state(student_net, device)
+        if args.tdm_resume_state:
+            e_sd = {k[len("ema."):]: v for k, v in sd.items() if k.startswith("ema.")}
+            if e_sd:
+                missing = [k for k in student_net.state_dict().keys() if k not in e_sd]
+                if missing:
+                    logger.warning(f"EMA state in resume file misses {len(missing)} keys; init those from student.")
+                    for k in missing:
+                        e_sd[k] = student_net.state_dict()[k].detach().cpu()
+                with torch.no_grad():
+                    for k, e in ema_state.items():
+                        v = e_sd[k]
+                        e.copy_(v.to(e.device, dtype=torch.float32) if torch.is_tensor(v) and v.is_floating_point()
+                                else (v if torch.is_tensor(v) else e))
+                logger.info(f"Resumed student EMA from {args.tdm_resume_state} ({len(e_sd)} tensors).")
+            else:
+                logger.info("Resume file has no ema.* entries; EMA re-initialized from student.")
+        logger.info(f"Student EMA ENABLED (decay={ema_decay:g}, warmup={ema_warmup}, update_every={ema_update_every}). "
+                    f"Previews and *_ema_*.safetensors use the EMA weights.")
+    else:
+        logger.info("Student EMA disabled (--tdm_no_ema).")
+
     betas = tuple(args.tdm_betas)
     opt_s = torch.optim.AdamW(student_net.parameters(), lr=args.tdm_lr, betas=betas, weight_decay=args.tdm_weight_decay)
     opt_f = torch.optim.AdamW(fake_net.parameters(), lr=args.tdm_fake_lr, betas=betas, weight_decay=args.tdm_weight_decay)
@@ -476,19 +558,51 @@ def main(args):
     def save_all(step: int):
         s_sd = {f"student.{k}": v.detach().cpu().contiguous() for k, v in student_net.state_dict().items()}
         f_sd = {f"fake.{k}": v.detach().cpu().contiguous() for k, v in fake_net.state_dict().items()}
+        state_dict = {**s_sd, **f_sd}
+        if use_ema and ema_state is not None:
+            for k, e in ema_state.items():
+                state_dict[f"ema.{k}"] = e.detach().cpu().contiguous()
         state_path = os.path.join(args.output_dir, f"tdm_state_step_{step}.safetensors")
-        save_file({**s_sd, **f_sd}, state_path)
-        logger.info(f"[ckpt] both adapters -> {state_path}")
+        save_file(state_dict, state_path)
+        logger.info(f"[ckpt] both adapters{' + EMA' if use_ema else ''} -> {state_path}")
         student_path = os.path.join(args.output_dir, f"{out_name}_step_{step}.safetensors")
         meta = model_io.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
         meta["ss_tdm_step"] = str(step)
         student_net.save_weights(student_path, save_dtype, meta)
         logger.info(f"[ckpt] student LoRA -> {student_path}")
+        if use_ema and ema_state is not None:
+            # Save the EMA student via a temporary swap so hashing/metadata
+            # reuse the LoRA save path. Raw student is restored afterwards.
+            backup_sd = {k: v.detach().clone() for k, v in student_net.state_dict().items()}
+            try:
+                student_net.load_state_dict(ema_casted_state_dict(ema_state, student_net), strict=True)
+                ema_meta = dict(meta)
+                ema_meta["ss_tdm_ema"] = f"decay={ema_decay:g}"
+                ema_path = os.path.join(args.output_dir, f"{out_name}_ema_step_{step}.safetensors")
+                student_net.save_weights(ema_path, save_dtype, ema_meta)
+                logger.info(f"[ckpt] student EMA LoRA -> {ema_path}")
+            finally:
+                student_net.load_state_dict(backup_sd, strict=True)
         torch.save({"student": opt_s.state_dict(), "fake": opt_f.state_dict(), "step": step + 1},
                    os.path.join(args.output_dir, f"tdm_optim_step_{step}.pt"))
 
     @torch.no_grad()
     def preview(step: int):
+        dit.eval()
+        # Previews render with EMA weights when available (restored afterwards);
+        # the training rollout always uses the raw student.
+        backup_sd = None
+        if use_ema and ema_state is not None:
+            backup_sd = {k: v.detach().clone() for k, v in student_net.state_dict().items()}
+            student_net.load_state_dict(ema_casted_state_dict(ema_state, student_net), strict=True)
+        try:
+            _preview_rollout(step)
+        finally:
+            if backup_sd is not None:
+                student_net.load_state_dict(backup_sd, strict=True)
+
+    @torch.no_grad()
+    def _preview_rollout(step: int):
         dit.eval()
         set_role(student_net, fake_net, "student")
         vae_device = vae.device if hasattr(vae, "device") else device
@@ -690,6 +804,19 @@ def main(args):
         opt_f.step()
         torch.nn.utils.clip_grad_norm_(student_net.parameters(), args.tdm_max_grad_norm)
         opt_s.step()
+        if use_ema and ema_state is not None:
+            if opt_step < ema_warmup:
+                pass  # keep init until warmup elapses
+            elif opt_step == ema_warmup and ema_warmup > 0:
+                # Fresh start from the warmed-up student, then decay afterwards.
+                # In-place re-sync (closures hold a reference to this dict).
+                with torch.no_grad():
+                    for k, e in ema_state.items():
+                        s = student_net.state_dict()[k]
+                        if torch.is_tensor(s) and s.is_floating_point():
+                            e.copy_(s.detach().to(e.device, dtype=torch.float32))
+            elif (opt_step - ema_warmup) % ema_update_every == 0:
+                update_ema_state(ema_state, student_net, ema_decay)
         loss_d_v = loss_d_sum / accum_steps
         loss_g_v = loss_g_sum / accum_steps
 

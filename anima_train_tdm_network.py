@@ -106,6 +106,10 @@ def add_tdm_arguments(parser: argparse.ArgumentParser):
                    help="Prompts per iteration (default: 8).")
     g.add_argument("--tdm_cfg", type=float, default=3.5,
                    help="Teacher CFG scale for the revised target (paper default: 3.5).")
+    g.add_argument("--tdm_neg_prompt", type=str, default="",
+                   help="Teacher CFG negative prompt (uncond anchor). Default: empty string (standard). Baked into the student permanently since the student is CFG-free.")
+    g.add_argument("--tdm_neg_file", type=str, default=None,
+                   help="Optional text file with one negative prompt per line, sampled per batch. Overrides --tdm_neg_prompt when given.")
     g.add_argument("--tdm_shift", type=float, default=3.0,
                    help="Flow shift for the K-step student schedule (Anima sampling default: 3.0).")
     g.add_argument("--tdm_lr", type=float, default=2e-6, help="Student AdamW LR (paper default: 2e-6).")
@@ -252,6 +256,19 @@ def main(args):
     if not prompts:
         raise ValueError(f"No captions found in {args.tdm_prompts_file}.")
     logger.info(f"Loaded {len(prompts)} captions from {args.tdm_prompts_file} (images are not used).")
+    if getattr(args, "tdm_neg_file", None):
+        if not os.path.isfile(args.tdm_neg_file):
+            raise ValueError(f"--tdm_neg_file not found: {args.tdm_neg_file}.")
+        with open(args.tdm_neg_file, encoding="utf-8") as f:
+            neg_prompts = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        if not neg_prompts:
+            raise ValueError(f"No negative prompts found in {args.tdm_neg_file}.")
+        logger.info(f"Loaded {len(neg_prompts)} negative prompts from {args.tdm_neg_file}.")
+    else:
+        neg_prompts = None
+    neg_single = getattr(args, "tdm_neg_prompt", "") or ""
+    if neg_prompts is None and neg_single:
+        logger.info(f"Using fixed teacher negative prompt ({len(neg_single)} chars). Baked into the student; student stays CFG-free.")
 
     flux_train_utils.log_timestep_sampling_info(args)
     if args.fp8_base or args.fp8_base_unet:
@@ -472,12 +489,20 @@ def main(args):
     pbar = tqdm(range(global_step, max_steps), initial=global_step, total=max_steps, desc="TDM")
     for step in pbar:
         batch_caps = random.choices(prompts, k=B)
+        if neg_prompts is not None:
+            neg_caps = random.choices(neg_prompts, k=B)
+        else:
+            neg_caps = [neg_single] * B
         lr_now = apply_warmup(step)
 
         with torch.no_grad():
             with torch.autocast(**autocast_kw):
                 cond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, batch_caps, weight_dtype)
-                uncond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, [""] * B, weight_dtype, uncond=True)
+                # The </s>+mask patch inside encode_cond(uncond=True) is the cached-dropout
+                # empty-anchor convention: keep it only for blank negatives so a real
+                # negative prompt's first T5 token is not clobbered.
+                use_blank_anchor = all(not s.strip() for s in neg_caps)
+                uncond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, neg_caps, weight_dtype, uncond=use_blank_anchor)
 
         x = torch.randn(B, latent_ch, lat_h, lat_w, device=device, dtype=weight_dtype)
 

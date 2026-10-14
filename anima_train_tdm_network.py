@@ -34,7 +34,7 @@ Per iteration (K = ``--tdm_steps``):
      fake scores at ``(x_tau, tau)`` (no grad); revised target
      ``coop = x0hat + (x0_real_cfg - x0_fake)``; re-run the ONE student step
      WITH grad and pull its ``x0`` prediction toward ``sg(coop)`` with the
-     Pseudo-Huber surrogate (paper Sec. 3.3, ``c = 0.00054*sqrt(d)``) and the
+     element-wise Pseudo-Huber surrogate (``c = 1e-3``) and the
      DMD normalizer ``1 / mean|x0hat - x0_real_cfg|``.
 
 ``tau`` is sampled inside the segment (non-overlapping intervals, paper
@@ -123,8 +123,8 @@ def add_tdm_arguments(parser: argparse.ArgumentParser):
     g.add_argument("--tdm_max_steps", type=int, default=2000, help="Total distillation iterations.")
     g.add_argument("--tdm_no_huber", action="store_true",
                    help="Use plain MSE for the student loss instead of the Pseudo-Huber surrogate.")
-    g.add_argument("--tdm_huber_c", type=float, default=None,
-                   help="Explicit Pseudo-Huber c (overrides both --tdm_no_huber and the auto 0.00054*sqrt(d)).")
+    g.add_argument("--tdm_huber_c", type=float, default=1e-3,
+                   help="Element-wise Pseudo-Huber c for the student loss (default: 1e-3). Ignored with --tdm_no_huber.")
     g.add_argument("--tdm_no_separate_intervals", action="store_true",
                    help="Sample tau up to the schedule top (demo default) instead of inside the segment (paper default).")
     g.add_argument("--tdm_randmid", action="store_true",
@@ -363,7 +363,7 @@ def main(args):
             "two WITH-grad forwards and eval() everywhere else."
         )
     else:
-        logger.info("gradient checkpointing disabled (pass --gradient_checkpointing to reduce activation VRAM).")
+        logger.info("gradient checkpointing disabled.")
 
     # ---- two LoRA adapters nested on the same frozen base ----
     from networks import lora_anima
@@ -450,15 +450,12 @@ def main(args):
     logger.info(f"Distilling at {img_w}x{img_h} (latent {lat_w}x{lat_h}x{latent_ch}), K={args.tdm_steps}.")
     K = args.tdm_steps
     ts = make_schedule(K, args.tdm_shift, device)  # [K+1], 1 -> 0
-    if args.tdm_huber_c is not None:
-        huber_c = args.tdm_huber_c
-        logger.info(f"Student loss: Pseudo-Huber(c={huber_c:.3g} explicit) + DMD normalizer.")
-    elif args.tdm_no_huber:
+    if args.tdm_no_huber:
         huber_c = None
         logger.info("Student loss: MSE + DMD normalizer.")
     else:
-        huber_c = 0.00054 * (latent_ch * lat_h * lat_w) ** 0.5
-        logger.info(f"Student loss: Pseudo-Huber(c={huber_c:.3g} auto = 0.00054*sqrt(d)) + DMD normalizer.")
+        huber_c = args.tdm_huber_c
+        logger.info(f"Student loss: Pseudo-Huber(c={huber_c:.3g}) + DMD normalizer.")
     logger.info(f"tau sampled in {'segment (non-overlapping)' if not args.tdm_no_separate_intervals else 'full range'}.")
 
     os.makedirs(args.output_dir, exist_ok=True)

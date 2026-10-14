@@ -543,149 +543,167 @@ def main(args):
     # ---- data-free loop: random caption batches; images never used ----
     B = args.tdm_batch_size
     max_steps = args.tdm_max_steps
+    accum_steps = max(1, int(getattr(args, "gradient_accumulation_steps", 1) or 1))
+    if accum_steps > 1:
+        logger.info(
+            f"gradient accumulation ENABLED: {accum_steps} micro-steps x batch {B} "
+            f"= effective batch {B * accum_steps} per optimizer step. "
+            f"--tdm_max_steps={max_steps} counts optimizer steps."
+        )
+    else:
+        logger.info("gradient accumulation disabled (gradient_accumulation_steps=1).")
     pbar = tqdm(range(global_step, max_steps), initial=global_step, total=max_steps, desc="TDM")
-    for step in pbar:
-        batch_caps = random.choices(prompts, k=B)
-        if neg_prompts is not None:
-            neg_caps = random.choices(neg_prompts, k=B)
-        else:
-            neg_caps = [neg_single] * B
-        lr_now = apply_warmup(step)
-
-        with torch.no_grad():
-            with torch.autocast(**autocast_kw):
-                cond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, batch_caps, weight_dtype)
-                # The </s>+mask patch inside encode_cond(uncond=True) is the cached-dropout
-                # empty-anchor convention: keep it only for blank negatives so a real
-                # negative prompt's first T5 token is not clobbered.
-                use_blank_anchor = all(not s.strip() for s in neg_caps)
-                uncond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, neg_caps, weight_dtype, uncond=use_blank_anchor)
-
-        x = torch.randn(B, latent_ch, lat_h, lat_w, device=device, dtype=weight_dtype)
-
-        # 1. student rollout (no grad): K Euler steps, save inputs + x0/eps preds
-        xs, x0s, epss = [], [], []
-        with torch.no_grad():
-            dit.eval()  # ensure eval (grad-ckpt train mode is only for WITH-grad forwards)
-            set_role(student_net, fake_net, "student")
-            for k in range(K):
-                t_vec = torch.full((B,), ts[k].item(), dtype=torch.float32, device=device)
-                with torch.autocast(**autocast_kw):
-                    v = dit_predict_v(dit, x, t_vec, cond, weight_dtype).float()
-                xf = x.float()
-                xs.append(x)
-                x0s.append(xf - ts[k].item() * v)
-                epss.append(xf + (1.0 - ts[k].item()) * v)
-                x = (xf + (ts[k + 1].item() - ts[k].item()) * v).to(weight_dtype)
-
-        def draw_segment():
-            """Random segment per sample + flow renoise of its ODE point to tau."""
-            m = torch.randint(0, K, (B,), device=device)
-            t_m = ts[m]
-            t_next = ts[m + 1]
-            idx = m.view(1, B, 1, 1, 1).expand(1, B, latent_ch, lat_h, lat_w)
-            x_tm = torch.stack(xs).gather(0, idx)[0]
-            x0_hat = torch.stack(x0s).gather(0, idx)[0].float()
-            eps_hat = torch.stack(epss).gather(0, idx)[0].float()
-            t_mid = t_next.clone()
-            if args.tdm_randmid:
-                u = torch.rand(B, device=device)
-                t_mid = t_next + u * (0.975 * t_m - t_next).clamp(min=0.0)
-            tm4 = t_mid.view(B, 1, 1, 1)
-            x_mid = (1.0 - tm4) * x0_hat + tm4 * eps_hat
-            lo = torch.maximum(t_mid, torch.full_like(t_mid, args.tdm_tau_min))
-            if args.tdm_no_separate_intervals:
-                hi = torch.full_like(t_m, args.tdm_tau_max)
-            else:
-                hi = t_m - args.tdm_tau_gap
-            hi = torch.maximum(hi, lo + 1e-4)
-            tau = lo + torch.rand(B, device=device) * (hi - lo)
-            ta4 = tau.view(B, 1, 1, 1)
-            c = (1.0 - ta4) / (1.0 - tm4).clamp(min=1e-6)
-            beta = (ta4.square() - (c * tm4).square()).clamp(min=0.0).sqrt()
-            xi = torch.randn_like(x_mid)
-            x_tau = c * x_mid + beta * xi
-            eps_mix = (c * tm4 * eps_hat + beta * xi) / ta4.clamp(min=1e-6)
-            return t_m, x_tm, x0_hat, tau, x_tau, eps_mix, xi
-
-        # 2. fake-score update: denoise x_tau -> sg(x0hat)
-        with torch.no_grad():
-            _, _, x0_hat_f, tau_f, x_tau_f, eps_mix, xi = draw_segment()
-            is_w = torch.exp(-0.5 * eps_mix.square().mean(dim=(1, 2, 3)) + 0.5 * xi.square().mean(dim=(1, 2, 3)))
-            snr = ((1.0 - tau_f) / tau_f.clamp(min=1e-6)).square()
-            w_fake = is_w * torch.minimum(snr, torch.full_like(snr, 5.0))
-        set_role(student_net, fake_net, "fake")
+    for opt_step in pbar:
+        lr_now = apply_warmup(opt_step)
+        # Accumulation window: zero once, run `accum_steps` micro-batches,
+        # step once. Losses are scaled by 1/accum so the accumulated grad
+        # equals the mean over the effective (B*accum) batch.
         zero_all(student_net, fake_net)
-        if use_ckpt:
-            dit.train()  # AnimaBlock gates checkpointing on self.training
-        with torch.autocast(**autocast_kw):
-            v_fake_train = dit_predict_v(dit, x_tau_f.to(weight_dtype), tau_f, cond, weight_dtype,
-                                         ckpt_input_grad=use_ckpt).float()
-        ta4 = tau_f.view(B, 1, 1, 1)
-        x0_fake_pred = x_tau_f - ta4 * v_fake_train
-        loss_d = (((x0_fake_pred - x0_hat_f).square().mean(dim=(1, 2, 3))) * w_fake).mean()
-        loss_d.backward()
+        loss_g_sum, loss_d_sum = 0.0, 0.0
+        for _micro in range(accum_steps):
+            batch_caps = random.choices(prompts, k=B)
+            if neg_prompts is not None:
+                neg_caps = random.choices(neg_prompts, k=B)
+            else:
+                neg_caps = [neg_single] * B
+
+            with torch.no_grad():
+                with torch.autocast(**autocast_kw):
+                    cond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, batch_caps, weight_dtype)
+                    # The </s>+mask patch inside encode_cond(uncond=True) is the cached-dropout
+                    # empty-anchor convention: keep it only for blank negatives so a real
+                    # negative prompt's first T5 token is not clobbered.
+                    use_blank_anchor = all(not s.strip() for s in neg_caps)
+                    uncond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, neg_caps, weight_dtype, uncond=use_blank_anchor)
+
+            x = torch.randn(B, latent_ch, lat_h, lat_w, device=device, dtype=weight_dtype)
+
+            # 1. student rollout (no grad): K Euler steps, save inputs + x0/eps preds
+            xs, x0s, epss = [], [], []
+            with torch.no_grad():
+                dit.eval()  # ensure eval (grad-ckpt train mode is only for WITH-grad forwards)
+                set_role(student_net, fake_net, "student")
+                for k in range(K):
+                    t_vec = torch.full((B,), ts[k].item(), dtype=torch.float32, device=device)
+                    with torch.autocast(**autocast_kw):
+                        v = dit_predict_v(dit, x, t_vec, cond, weight_dtype).float()
+                    xf = x.float()
+                    xs.append(x)
+                    x0s.append(xf - ts[k].item() * v)
+                    epss.append(xf + (1.0 - ts[k].item()) * v)
+                    x = (xf + (ts[k + 1].item() - ts[k].item()) * v).to(weight_dtype)
+
+            def draw_segment():
+                """Random segment per sample + flow renoise of its ODE point to tau."""
+                m = torch.randint(0, K, (B,), device=device)
+                t_m = ts[m]
+                t_next = ts[m + 1]
+                idx = m.view(1, B, 1, 1, 1).expand(1, B, latent_ch, lat_h, lat_w)
+                x_tm = torch.stack(xs).gather(0, idx)[0]
+                x0_hat = torch.stack(x0s).gather(0, idx)[0].float()
+                eps_hat = torch.stack(epss).gather(0, idx)[0].float()
+                t_mid = t_next.clone()
+                if args.tdm_randmid:
+                    u = torch.rand(B, device=device)
+                    t_mid = t_next + u * (0.975 * t_m - t_next).clamp(min=0.0)
+                tm4 = t_mid.view(B, 1, 1, 1)
+                x_mid = (1.0 - tm4) * x0_hat + tm4 * eps_hat
+                lo = torch.maximum(t_mid, torch.full_like(t_mid, args.tdm_tau_min))
+                if args.tdm_no_separate_intervals:
+                    hi = torch.full_like(t_m, args.tdm_tau_max)
+                else:
+                    hi = t_m - args.tdm_tau_gap
+                hi = torch.maximum(hi, lo + 1e-4)
+                tau = lo + torch.rand(B, device=device) * (hi - lo)
+                ta4 = tau.view(B, 1, 1, 1)
+                c = (1.0 - ta4) / (1.0 - tm4).clamp(min=1e-6)
+                beta = (ta4.square() - (c * tm4).square()).clamp(min=0.0).sqrt()
+                xi = torch.randn_like(x_mid)
+                x_tau = c * x_mid + beta * xi
+                eps_mix = (c * tm4 * eps_hat + beta * xi) / ta4.clamp(min=1e-6)
+                return t_m, x_tm, x0_hat, tau, x_tau, eps_mix, xi
+
+            # 2. fake-score forward: denoise x_tau -> sg(x0hat). Grad accumulates;
+            #    optimizer steps once per window after the micro loop.
+            with torch.no_grad():
+                _, _, x0_hat_f, tau_f, x_tau_f, eps_mix, xi = draw_segment()
+                is_w = torch.exp(-0.5 * eps_mix.square().mean(dim=(1, 2, 3)) + 0.5 * xi.square().mean(dim=(1, 2, 3)))
+                snr = ((1.0 - tau_f) / tau_f.clamp(min=1e-6)).square()
+                w_fake = is_w * torch.minimum(snr, torch.full_like(snr, 5.0))
+            set_role(student_net, fake_net, "fake")
+            if use_ckpt:
+                dit.train()  # AnimaBlock gates checkpointing on self.training
+            with torch.autocast(**autocast_kw):
+                v_fake_train = dit_predict_v(dit, x_tau_f.to(weight_dtype), tau_f, cond, weight_dtype,
+                                             ckpt_input_grad=use_ckpt).float()
+            ta4 = tau_f.view(B, 1, 1, 1)
+            x0_fake_pred = x_tau_f - ta4 * v_fake_train
+            loss_d = (((x0_fake_pred - x0_hat_f).square().mean(dim=(1, 2, 3))) * w_fake).mean()
+            (loss_d / accum_steps).backward()
+            if use_ckpt:
+                dit.eval()  # back to deterministic eval for no-grad scores
+            loss_d_sum += loss_d.item()
+
+            # 3a. scores (no grad): teacher cond/uncond + fake at fresh (x_tau, tau)
+            with torch.no_grad():
+                dit.eval()
+                t_m, x_tm, x0_hat, tau, x_tau, _, _ = draw_segment()
+                x_tau_b = x_tau.to(weight_dtype)
+                set_role(student_net, fake_net, "teacher")
+                with torch.autocast(**autocast_kw):
+                    v_real = dit_predict_v(dit, x_tau_b, tau, cond, weight_dtype).float()
+                    v_unc = dit_predict_v(dit, x_tau_b, tau, uncond, weight_dtype).float()
+                set_role(student_net, fake_net, "fake")
+                with torch.autocast(**autocast_kw):
+                    v_fake = dit_predict_v(dit, x_tau_b, tau, cond, weight_dtype).float()
+                ta4 = tau.view(B, 1, 1, 1)
+                x0_real = x_tau - ta4 * v_real
+                x0_unc = x_tau - ta4 * v_unc
+                x0_fake = x_tau - ta4 * v_fake
+                x0_real_cfg = x0_real + (args.tdm_cfg - 1.0) * (x0_real - x0_unc)
+                coop = (x0_hat + (x0_real_cfg - x0_fake)).detach()
+                norm = (x0_hat - x0_real_cfg).abs().mean(dim=(1, 2, 3)).clamp(min=1e-6)
+                w_gen = 1.0 / norm
+
+            # 3b. one student step WITH grad toward sg(coop)
+            set_role(student_net, fake_net, "student")
+            if use_ckpt:
+                dit.train()  # AnimaBlock gates checkpointing on self.training
+            t_m_vec = t_m.to(dtype=torch.float32)
+            with torch.autocast(**autocast_kw):
+                v_stu = dit_predict_v(dit, x_tm, t_m_vec, cond, weight_dtype, ckpt_input_grad=use_ckpt).float()
+            tm4 = t_m.view(B, 1, 1, 1)
+            x0_stu = x_tm.float() - tm4 * v_stu
+            diff = x0_stu - coop
+            if huber_c is None:
+                el = diff.square()
+            else:
+                el = torch.sqrt(diff.square() + huber_c * huber_c) - huber_c
+            loss_g = (el.mean(dim=(1, 2, 3)) * w_gen).mean()
+            (loss_g / accum_steps).backward()
+            if use_ckpt:
+                dit.eval()  # back to deterministic eval for next rollout
+            loss_g_sum += loss_g.item()
+
+        # End of accumulation window: single clip + step per optimizer.
         torch.nn.utils.clip_grad_norm_(fake_net.parameters(), args.tdm_max_grad_norm)
         opt_f.step()
-        if use_ckpt:
-            dit.eval()  # back to deterministic eval for no-grad scores
-        loss_d_v = loss_d.item()
-
-        # 3a. scores (no grad): teacher cond/uncond + fake at fresh (x_tau, tau)
-        with torch.no_grad():
-            dit.eval()
-            t_m, x_tm, x0_hat, tau, x_tau, _, _ = draw_segment()
-            x_tau_b = x_tau.to(weight_dtype)
-            set_role(student_net, fake_net, "teacher")
-            with torch.autocast(**autocast_kw):
-                v_real = dit_predict_v(dit, x_tau_b, tau, cond, weight_dtype).float()
-                v_unc = dit_predict_v(dit, x_tau_b, tau, uncond, weight_dtype).float()
-            set_role(student_net, fake_net, "fake")
-            with torch.autocast(**autocast_kw):
-                v_fake = dit_predict_v(dit, x_tau_b, tau, cond, weight_dtype).float()
-            ta4 = tau.view(B, 1, 1, 1)
-            x0_real = x_tau - ta4 * v_real
-            x0_unc = x_tau - ta4 * v_unc
-            x0_fake = x_tau - ta4 * v_fake
-            x0_real_cfg = x0_real + (args.tdm_cfg - 1.0) * (x0_real - x0_unc)
-            coop = (x0_hat + (x0_real_cfg - x0_fake)).detach()
-            norm = (x0_hat - x0_real_cfg).abs().mean(dim=(1, 2, 3)).clamp(min=1e-6)
-            w_gen = 1.0 / norm
-
-        # 3b. one student step WITH grad toward sg(coop)
-        set_role(student_net, fake_net, "student")
-        zero_all(student_net, fake_net)
-        if use_ckpt:
-            dit.train()  # AnimaBlock gates checkpointing on self.training
-        t_m_vec = t_m.to(dtype=torch.float32)
-        with torch.autocast(**autocast_kw):
-            v_stu = dit_predict_v(dit, x_tm, t_m_vec, cond, weight_dtype, ckpt_input_grad=use_ckpt).float()
-        tm4 = t_m.view(B, 1, 1, 1)
-        x0_stu = x_tm.float() - tm4 * v_stu
-        diff = x0_stu - coop
-        if huber_c is None:
-            el = diff.square()
-        else:
-            el = torch.sqrt(diff.square() + huber_c * huber_c) - huber_c
-        loss_g = (el.mean(dim=(1, 2, 3)) * w_gen).mean()
-        loss_g.backward()
         torch.nn.utils.clip_grad_norm_(student_net.parameters(), args.tdm_max_grad_norm)
         opt_s.step()
-        if use_ckpt:
-            dit.eval()  # back to deterministic eval for next rollout
-        loss_g_v = loss_g.item()
+        loss_d_v = loss_d_sum / accum_steps
+        loss_g_v = loss_g_sum / accum_steps
 
-        csv_writer.writerow([step, f"{loss_g_v:.6f}", f"{loss_d_v:.6f}", f"{lr_now:.2e}", f"{time.time() - t0:.1f}"])
+        csv_writer.writerow([opt_step, f"{loss_g_v:.6f}", f"{loss_d_v:.6f}", f"{lr_now:.2e}", f"{time.time() - t0:.1f}"])
         pbar.set_postfix(loss_g=f"{loss_g_v:.4f}", loss_d=f"{loss_d_v:.4f}", lr=f"{lr_now:.2e}")
         if len(accelerator.trackers) > 0:
-            accelerator.log({"loss_g": loss_g_v, "loss_d": loss_d_v, "lr": lr_now}, step=step)
-        if step % 10 == 0:
+            accelerator.log({"loss_g": loss_g_v, "loss_d": loss_d_v, "lr": lr_now}, step=opt_step)
+        if opt_step % 10 == 0:
             csv_file.flush()
 
-        if args.tdm_save_every > 0 and step > 0 and step % args.tdm_save_every == 0:
-            save_all(step)
-        if args.tdm_eval_every > 0 and step % args.tdm_eval_every == 0:
-            preview(step)
+        if args.tdm_save_every > 0 and opt_step > 0 and opt_step % args.tdm_save_every == 0:
+            save_all(opt_step)
+        if args.tdm_eval_every > 0 and opt_step % args.tdm_eval_every == 0:
+            preview(opt_step)
 
     logger.info(f"Reached max_steps={args.tdm_max_steps}. Saving final checkpoint.")
     save_all(max_steps)

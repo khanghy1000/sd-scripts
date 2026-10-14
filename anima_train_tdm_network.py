@@ -79,6 +79,7 @@ from library import (
 )
 import library.accelerator_setup as accelerator_setup
 import library.args as args_util
+import library.logging_util as logging_util
 import library.model_io as model_io
 import train_network
 from library.utils import setup_logging
@@ -312,6 +313,7 @@ def main(args):
     random.seed(seed)
 
     accelerator = accelerator_setup.prepare_accelerator(args)
+    logging_util.init_trackers(accelerator, args, "anima-tdm")
     device = accelerator.device
     weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
     logger.info(f"device={device}, weight_dtype={weight_dtype}, save_dtype={save_dtype}")
@@ -527,6 +529,14 @@ def main(args):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         grid.save(path)
         logger.info(f"[preview] K={K}-step student samples -> {path}")
+        # Log preview grid to wandb (mirrors library/anima_train_utils.py sample logging).
+        if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+            wandb_tracker = accelerator.get_tracker("wandb")
+            import wandb
+
+            wandb_tracker.log({f"preview_step_{step}": wandb.Image(grid)}, commit=False)
+            # Commit the pending preview image (same pattern as train_network.py).
+            accelerator.log({}, step=step)
         try:
             vae.to(vae_device)
         except Exception:
@@ -670,6 +680,8 @@ def main(args):
 
         csv_writer.writerow([step, f"{loss_g_v:.6f}", f"{loss_d_v:.6f}", f"{lr_now:.2e}", f"{time.time() - t0:.1f}"])
         pbar.set_postfix(loss_g=f"{loss_g_v:.4f}", loss_d=f"{loss_d_v:.4f}", lr=f"{lr_now:.2e}")
+        if len(accelerator.trackers) > 0:
+            accelerator.log({"loss_g": loss_g_v, "loss_d": loss_d_v, "lr": lr_now}, step=step)
         if step % 10 == 0:
             csv_file.flush()
 
@@ -683,11 +695,13 @@ def main(args):
     if args.tdm_eval_every > 0:
         preview(max_steps)
     csv_file.close()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
     parser = setup_parser()
     args = parser.parse_args()
+    args_util.verify_command_line_training_args(args)
     args = args_util.read_config_from_file(args, parser)
 
     if args.attn_mode == "sdpa":

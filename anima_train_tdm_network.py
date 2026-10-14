@@ -627,7 +627,7 @@ def main(args):
         # 3a. scores (no grad): teacher cond/uncond + fake at fresh (x_tau, tau)
         with torch.no_grad():
             dit.eval()
-            _, t_m, x_tm, x0_hat, tau, x_tau, _, _ = draw_segment()
+            t_m, x_tm, x0_hat, tau, x_tau, _, _ = draw_segment()
             x_tau_b = x_tau.to(weight_dtype)
             set_role(student_net, fake_net, "teacher")
             with torch.autocast(**autocast_kw):

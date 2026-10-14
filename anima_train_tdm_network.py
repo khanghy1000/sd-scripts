@@ -46,7 +46,14 @@ Run (single GPU, data-free -- prompts file only, one caption per line)::
       --pretrained_model_name_or_path anima-base.safetensors \
       --qwen3 /path/to/qwen3-0.6b.safetensors --vae /path/to/vae.safetensors \
       --tdm_prompts_file prompts.txt --resolution 512,512 \
-      --tdm_batch_size 8 --tdm_steps 4 --output_dir output/anima-tdm-4step
+      --train_batch_size 8 --tdm_steps 4 --output_dir output/anima-tdm-4step
+
+Optimizer/LR/scheduler flags are shared with ``anima_train_network.py``:
+``--learning_rate`` (student), ``--tdm_fake_lr`` (fake score),
+``--optimizer_type``/``--optimizer_args``, ``--lr_scheduler`` /
+``--lr_warmup_steps`` / ``--lr_decay_steps`` / ..., ``--max_train_steps``,
+``--train_batch_size``, ``--max_grad_norm``, ``--save_every_n_steps``,
+``--seed``.
 
 Outputs: ``tdm_student_step_<n>.safetensors`` (student LoRA only, same key
 layout as ``anima_train_network.py`` -- directly usable for inference /
@@ -101,14 +108,15 @@ logger = logging.getLogger(__name__)
 def add_tdm_arguments(parser: argparse.ArgumentParser):
     g = parser.add_argument_group(
         "TDM distillation",
-        "Trajectory Distribution Matching few-step distillation (arXiv:2503.06674). Data-free: training needs only --tdm_prompts_file.",
+        "Trajectory Distribution Matching few-step distillation (arXiv:2503.06674). Data-free: training needs only --tdm_prompts_file. "
+        "Optimizer/LR/scheduler/batch/steps/clipping flags are shared with anima_train_network.py "
+        "(--learning_rate, --optimizer_type/--optimizer_args, --lr_scheduler/--lr_warmup_steps, "
+        "--train_batch_size, --max_train_steps, --max_grad_norm, --save_every_n_steps, --seed).",
     )
     g.add_argument("--tdm_prompts_file", type=str, default=None,
                    help="Text file with one caption per line. REQUIRED (data-free distillation uses captions only).")
     g.add_argument("--tdm_steps", type=int, default=4,
                    help="K: number of deterministic student steps to distill (default: 4).")
-    g.add_argument("--tdm_batch_size", type=int, default=8,
-                   help="Prompts per iteration (default: 8).")
     g.add_argument("--tdm_cfg", type=float, default=3.5,
                    help="Teacher CFG scale for the revised target (paper default: 3.5).")
     g.add_argument("--tdm_neg_prompt", type=str, default="",
@@ -117,14 +125,9 @@ def add_tdm_arguments(parser: argparse.ArgumentParser):
                    help="Optional text file with one negative prompt per line, sampled per batch. Overrides --tdm_neg_prompt when given.")
     g.add_argument("--tdm_shift", type=float, default=3.0,
                    help="Flow shift for the K-step student schedule (Anima sampling default: 3.0).")
-    g.add_argument("--tdm_lr", type=float, default=2e-6, help="Student AdamW LR (paper default: 2e-6).")
-    g.add_argument("--tdm_fake_lr", type=float, default=1e-5, help="Fake-score AdamW LR (paper default: 2e-5 for PixArt; 1e-5 here).")
-    g.add_argument("--tdm_betas", type=float, nargs=2, default=[0.0, 0.999],
-                   help="Adam betas for both optimizers (paper default: 0 0.999).")
-    g.add_argument("--tdm_weight_decay", type=float, default=1e-4, help="AdamW weight decay.")
-    g.add_argument("--tdm_max_grad_norm", type=float, default=1.0, help="Gradient clip norm for both optimizers.")
-    g.add_argument("--tdm_warmup_steps", type=int, default=100, help="Linear LR warmup steps (then constant).")
-    g.add_argument("--tdm_max_steps", type=int, default=2000, help="Total distillation iterations.")
+    g.add_argument("--tdm_fake_lr", type=float, default=1e-5,
+                   help="Fake-score optimizer LR. Student uses shared --learning_rate (default: 2e-6). "
+                   "Paper default for PixArt was 2e-5; 1e-5 here (default: 1e-5).")
     g.add_argument("--tdm_no_huber", action="store_true",
                    help="Use plain MSE for the student loss instead of the Pseudo-Huber surrogate.")
     g.add_argument("--tdm_huber_c", type=float, default=1e-3,
@@ -136,18 +139,14 @@ def add_tdm_arguments(parser: argparse.ArgumentParser):
     g.add_argument("--tdm_tau_min", type=float, default=0.025)
     g.add_argument("--tdm_tau_gap", type=float, default=0.0125)
     g.add_argument("--tdm_tau_max", type=float, default=0.9875)
-    g.add_argument("--tdm_train_llm_adapter", action="store_true",
-                   help="Include LLM-adapter Linears in both LoRA adapters (default: DiT blocks only).")
     g.add_argument("--tdm_fake_weights", type=str, default=None,
                    help="Init fake adapter from a LoRA file (student init uses --network_weights).")
     g.add_argument("--tdm_resume_state", type=str, default=None,
                    help="Resume both adapters from a tdm_state_*.safetensors file.")
     g.add_argument("--tdm_resume_optim", type=str, default=None,
-                   help="Resume both optimizer states from a tdm_optim_*.pt file.")
-    g.add_argument("--tdm_save_every", type=int, default=500, help="Save adapters + optim state every N steps.")
+                   help="Resume both optimizer (+scheduler) states from a tdm_optim_*.pt file.")
     g.add_argument("--tdm_eval_every", type=int, default=0, help="Render K-step student previews every N steps (0 = disabled, default).")
     g.add_argument("--tdm_preview_n", type=int, default=4, help="Preview images per eval.")
-    g.add_argument("--tdm_seed", type=int, default=None, help="Preview noise seed (default: fixed 42 for comparability).")
     g.add_argument("--tdm_no_ema", action="store_true",
                    help="Disable the student EMA shadow (by default an EMA of the student LoRA is kept for previews/saving).")
     g.add_argument("--tdm_ema_decay", type=float, default=0.999,
@@ -171,6 +170,13 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing. Implies --gradient_checkpointing.",
+    )
+    parser.set_defaults(
+        train_batch_size=8,
+        max_train_steps=1000,
+        save_every_n_steps=50,
+        lr_warmup_steps=100,
+        lr_scheduler="constant_with_warmup",
     )
     return parser
 
@@ -428,7 +434,6 @@ def main(args):
     else:
         alpha = args.network_alpha if args.network_alpha is not None else float(rank)
     lora_kw = dict(
-        train_llm_adapter="true" if args.tdm_train_llm_adapter else "false",
         verbose="true" if getattr(args, "verbose", False) else "false",
     )
     if getattr(args, "network_args", None):
@@ -436,7 +441,8 @@ def main(args):
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 lora_kw[k.strip()] = v.strip()
-    logger.info(f"Creating student/fake LoRA adapters (rank={rank}, alpha={alpha}, llm_adapter={args.tdm_train_llm_adapter})...")
+    llm_adapter_on = str(lora_kw.get("train_llm_adapter", "false")).lower() == "true"
+    logger.info(f"Creating student/fake LoRA adapters (rank={rank}, alpha={alpha}, llm_adapter={llm_adapter_on})...")
     student_net = lora_anima.create_network(1.0, rank, alpha, None, None, dit, neuron_dropout=args.network_dropout, **lora_kw)
     fake_net = lora_anima.create_network(1.0, rank, alpha, None, None, dit, neuron_dropout=args.network_dropout, **lora_kw)
     # Student first so the fake wraps it: out = base + ms*student + mf*fake.
@@ -502,28 +508,48 @@ def main(args):
     else:
         logger.info("Student EMA disabled (--tdm_no_ema).")
 
-    betas = tuple(args.tdm_betas)
-    opt_s = torch.optim.AdamW(student_net.parameters(), lr=args.tdm_lr, betas=betas, weight_decay=args.tdm_weight_decay)
-    opt_f = torch.optim.AdamW(fake_net.parameters(), lr=args.tdm_fake_lr, betas=betas, weight_decay=args.tdm_weight_decay)
-    logger.info(f"Optimizers: student lr={args.tdm_lr:g}, fake lr={args.tdm_fake_lr:g}, betas={betas}.")
+    from library import optimizer as optimizer_util
+
+    # Optimizer factory shared with anima_train_network.py (same
+    # --optimizer_type/--optimizer_args handling via get_optimizer).
+    # Two adapters need two LRs: the student uses --learning_rate directly,
+    # while the fake score carries its own --tdm_fake_lr as an explicit param
+    # group -- the same pattern train_network.py uses for --unet_lr /
+    # --text_encoder_lr (per-group "lr" overrides the constructor default).
+    student_lr = float(args.learning_rate)
+    fake_lr = float(args.tdm_fake_lr)
+    _, _, opt_s = optimizer_util.get_optimizer(args, student_net.parameters())
+    _, _, opt_f = optimizer_util.get_optimizer(
+        args, [{"params": list(fake_net.parameters()), "lr": fake_lr}]
+    )
+    logger.info(f"Optimizers: student lr={student_lr:g}, fake lr={fake_lr:g}, "
+                f"type={args.optimizer_type or 'AdamW'}, optimizer_args={args.optimizer_args}.")
+    opt_s_train_fn, opt_s_eval_fn = optimizer_util.get_optimizer_train_eval_fn(opt_s, args)
+    opt_f_train_fn, opt_f_eval_fn = optimizer_util.get_optimizer_train_eval_fn(opt_f, args)
+
+    # Shared LR schedulers (same --lr_scheduler/--lr_warmup_steps/--lr_decay_steps/
+    # --lr_scheduler_num_cycles/--lr_scheduler_power/... as the regular trainer).
+    # One scheduler per optimizer; both stepped once per optimizer step (not per
+    # grad-accumulation micro-step). get_scheduler_fix derives total steps from
+    # --max_train_steps.
+    sched_s = optimizer_util.get_scheduler_fix(args, opt_s, accelerator.num_processes)
+    sched_f = optimizer_util.get_scheduler_fix(args, opt_f, accelerator.num_processes)
+    logger.info(f"LR schedulers: {args.lr_scheduler} (warmup={args.lr_warmup_steps}, "
+                f"max_train_steps={args.max_train_steps}).")
     if args.tdm_resume_optim:
-        logger.info(f"Resume optimizers from {args.tdm_resume_optim}")
-        o = torch.load(args.tdm_resume_optim, map_location="cpu", weights_only=True)
+        logger.info(f"Resume optimizers (+schedulers) from {args.tdm_resume_optim}")
+        o = torch.load(args.tdm_resume_optim, map_location="cpu", weights_only=False)
         opt_s.load_state_dict(o["student"])
         opt_f.load_state_dict(o["fake"])
+        for sched, key in ((sched_s, "sched_student"), (sched_f, "sched_fake")):
+            if key in o and hasattr(sched, "load_state_dict"):
+                try:
+                    sched.load_state_dict(o[key])
+                except Exception as e:
+                    logger.warning(f"Could not load {key} state (old checkpoint?): {e}")
         global_step = int(o.get("step", 0))
     else:
         global_step = 0
-
-    warmup = max(1, args.tdm_warmup_steps)
-
-    def apply_warmup(step: int):
-        mult = min(1.0, (step + 1) / warmup)
-        for pg in opt_s.param_groups:
-            pg["lr"] = args.tdm_lr * mult
-        for pg in opt_f.param_groups:
-            pg["lr"] = args.tdm_fake_lr * mult
-        return args.tdm_lr * mult
 
     # ---- geometry / schedule ----
     img_h, img_w = parse_resolution(args.resolution)
@@ -547,7 +573,7 @@ def main(args):
     csv_file = open(csv_path, "a", newline="")
     csv_writer = csv.writer(csv_file)
     if new_csv:
-        csv_writer.writerow(["step", "loss_g", "loss_d", "lr", "time"])
+        csv_writer.writerow(["step", "loss_g", "loss_d", "lr_student", "lr_fake", "time"])
 
     autocast_kw = dict(device_type=device.type if isinstance(device, torch.device) else str(device),
                        dtype=weight_dtype)
@@ -556,6 +582,17 @@ def main(args):
     t0 = time.time()
 
     def save_all(step: int):
+        # Schedule-free optimizers must be in eval mode for checkpointing
+        # (mirrors train_network.py); no-ops for all other optimizer types.
+        opt_s_eval_fn()
+        opt_f_eval_fn()
+        try:
+            _save_all(step)
+        finally:
+            opt_s_train_fn()
+            opt_f_train_fn()
+
+    def _save_all(step: int):
         s_sd = {f"student.{k}": v.detach().cpu().contiguous() for k, v in student_net.state_dict().items()}
         f_sd = {f"fake.{k}": v.detach().cpu().contiguous() for k, v in fake_net.state_dict().items()}
         state_dict = {**s_sd, **f_sd}
@@ -583,12 +620,21 @@ def main(args):
                 logger.info(f"[ckpt] student EMA LoRA -> {ema_path}")
             finally:
                 student_net.load_state_dict(backup_sd, strict=True)
-        torch.save({"student": opt_s.state_dict(), "fake": opt_f.state_dict(), "step": step + 1},
+        optim_state = {"student": opt_s.state_dict(), "fake": opt_f.state_dict(), "step": step + 1}
+        for sched, key in ((sched_s, "sched_student"), (sched_f, "sched_fake")):
+            try:
+                if hasattr(sched, "state_dict"):
+                    optim_state[key] = sched.state_dict()
+            except Exception as e:
+                logger.warning(f"Could not save {key} state: {e}")
+        torch.save(optim_state,
                    os.path.join(args.output_dir, f"tdm_optim_step_{step}.pt"))
 
     @torch.no_grad()
     def preview(step: int):
         dit.eval()
+        opt_s_eval_fn()
+        opt_f_eval_fn()
         # Previews render with EMA weights when available (restored afterwards);
         # the training rollout always uses the raw student.
         backup_sd = None
@@ -600,6 +646,8 @@ def main(args):
         finally:
             if backup_sd is not None:
                 student_net.load_state_dict(backup_sd, strict=True)
+            opt_s_train_fn()
+            opt_f_train_fn()
 
     @torch.no_grad()
     def _preview_rollout(step: int):
@@ -612,6 +660,7 @@ def main(args):
             pass
         shots = prompts[: min(args.tdm_preview_n, len(prompts))]
         imgs = []
+        preview_base_seed = seed  # shared --seed drives training RNG and preview base seed
         for i, cap in enumerate(shots):
             with torch.autocast(**autocast_kw):
                 cond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, [cap], weight_dtype)
@@ -623,7 +672,7 @@ def main(args):
                 else:
                     cross = pe
                 lat = anima_train_utils.do_sample(
-                    img_h, img_w, 42 + i, dit, cross, K, weight_dtype, device,
+                    img_h, img_w, preview_base_seed + i, dit, cross, K, weight_dtype, device,
                     guidance_scale=1.0, flow_shift=args.tdm_shift,
                 )
             decoded = vae.decode_to_pixels(lat).float()
@@ -655,20 +704,23 @@ def main(args):
         clean_memory_on_device(device)
 
     # ---- data-free loop: random caption batches; images never used ----
-    B = args.tdm_batch_size
-    max_steps = args.tdm_max_steps
+    # Shared flags: --train_batch_size, --max_train_steps, --max_grad_norm,
+    # --save_every_n_steps (same semantics as anima_train_network.py).
+    B = args.train_batch_size
+    max_steps = args.max_train_steps
+    max_grad_norm = float(args.max_grad_norm)
+    save_every = int(args.save_every_n_steps) if args.save_every_n_steps else 0
     accum_steps = max(1, int(getattr(args, "gradient_accumulation_steps", 1) or 1))
     if accum_steps > 1:
         logger.info(
             f"gradient accumulation ENABLED: {accum_steps} micro-steps x batch {B} "
             f"= effective batch {B * accum_steps} per optimizer step. "
-            f"--tdm_max_steps={max_steps} counts optimizer steps."
+            f"--max_train_steps={max_steps} counts optimizer steps."
         )
     else:
         logger.info("gradient accumulation disabled (gradient_accumulation_steps=1).")
     pbar = tqdm(range(global_step, max_steps), initial=global_step, total=max_steps, desc="TDM")
     for opt_step in pbar:
-        lr_now = apply_warmup(opt_step)
         # Accumulation window: zero once, run `accum_steps` micro-batches,
         # step once. Losses are scaled by 1/accum so the accumulated grad
         # equals the mean over the effective (B*accum) batch.
@@ -799,11 +851,17 @@ def main(args):
                 dit.eval()  # back to deterministic eval for next rollout
             loss_g_sum += loss_g.item()
 
-        # End of accumulation window: single clip + step per optimizer.
-        torch.nn.utils.clip_grad_norm_(fake_net.parameters(), args.tdm_max_grad_norm)
+        # End of accumulation window: single clip + step per optimizer, then
+        # step both shared LR schedulers once per optimizer step.
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(fake_net.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(student_net.parameters(), max_grad_norm)
         opt_f.step()
-        torch.nn.utils.clip_grad_norm_(student_net.parameters(), args.tdm_max_grad_norm)
         opt_s.step()
+        sched_f.step()
+        sched_s.step()
+        lr_s_now = opt_s.param_groups[0]["lr"]
+        lr_f_now = opt_f.param_groups[0]["lr"]
         if use_ema and ema_state is not None:
             if opt_step < ema_warmup:
                 pass  # keep init until warmup elapses
@@ -820,19 +878,19 @@ def main(args):
         loss_d_v = loss_d_sum / accum_steps
         loss_g_v = loss_g_sum / accum_steps
 
-        csv_writer.writerow([opt_step, f"{loss_g_v:.6f}", f"{loss_d_v:.6f}", f"{lr_now:.2e}", f"{time.time() - t0:.1f}"])
-        pbar.set_postfix(loss_g=f"{loss_g_v:.4f}", loss_d=f"{loss_d_v:.4f}", lr=f"{lr_now:.2e}")
+        csv_writer.writerow([opt_step, f"{loss_g_v:.6f}", f"{loss_d_v:.6f}", f"{lr_s_now:.2e}", f"{lr_f_now:.2e}", f"{time.time() - t0:.1f}"])
+        pbar.set_postfix(loss_g=f"{loss_g_v:.4f}", loss_d=f"{loss_d_v:.4f}", lr=f"{lr_s_now:.2e}/{lr_f_now:.2e}")
         if len(accelerator.trackers) > 0:
-            accelerator.log({"loss_g": loss_g_v, "loss_d": loss_d_v, "lr": lr_now}, step=opt_step)
+            accelerator.log({"loss_g": loss_g_v, "loss_d": loss_d_v, "lr_student": lr_s_now, "lr_fake": lr_f_now}, step=opt_step)
         if opt_step % 10 == 0:
             csv_file.flush()
 
-        if args.tdm_save_every > 0 and opt_step > 0 and opt_step % args.tdm_save_every == 0:
+        if save_every > 0 and opt_step > 0 and opt_step % save_every == 0:
             save_all(opt_step)
         if args.tdm_eval_every > 0 and opt_step % args.tdm_eval_every == 0:
             preview(opt_step)
 
-    logger.info(f"Reached max_steps={args.tdm_max_steps}. Saving final checkpoint.")
+    logger.info(f"Reached max_train_steps={max_steps}. Saving final checkpoint.")
     save_all(max_steps)
     if args.tdm_eval_every > 0:
         preview(max_steps)

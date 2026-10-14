@@ -311,6 +311,10 @@ def main(args):
     dit = anima_utils.load_anima_model(
         device, args.pretrained_model_name_or_path, attn_mode, args.split_attn, device, weight_dtype,
     )
+    # Buffers not stored in the checkpoint (RoPE seq/dim ranges, adapter
+    # inv_freq) are created on CPU; move the whole module so they land on the
+    # training device (params are already there). Mirrors anima_train.py.
+    dit.to(device)
     dit.eval()
 
     # ---- two LoRA adapters nested on the same frozen base ----

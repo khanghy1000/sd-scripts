@@ -505,6 +505,15 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
     def seq_dim(self) -> int:
         return 0
 
+    def forward(self, x_B_T_H_W_C: torch.Tensor, fps: Optional[torch.Tensor]) -> torch.Tensor:
+        # Defensive: seq/dim-range buffers are not stored in the checkpoint
+        # (see load_anima_model's expected-missing list) and are created on
+        # CPU, while the model may run on CUDA. Keep them with the input.
+        target = x_B_T_H_W_C.device
+        if self.seq.device != target or self.dim_spatial_range.device != target or self.dim_temporal_range.device != target:
+            self.to(target)
+        return super().forward(x_B_T_H_W_C, fps)
+
 
 class LearnablePosEmbAxis(VideoPositionEmb):
     """Learnable axis-decomposed positional embeddings."""

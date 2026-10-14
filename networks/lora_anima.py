@@ -84,7 +84,13 @@ class LoRAModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        lx = self.lora_down(x)
+        # Keep the LoRA branch dtype-safe: the AdaLN t-embedding can arrive as
+        # float32 while base + LoRA weights are bf16 (or vice versa). Compute
+        # the low-rank delta in the LoRA weight dtype, then cast back so the
+        # residual add never hits float-vs-bf16 mismatches, with or without
+        # an active autocast context.
+        lora_dtype = self.lora_down.weight.dtype
+        lx = self.lora_down(x.to(lora_dtype))
 
         # normal dropout
         if self.dropout is not None and self.training:
@@ -110,6 +116,8 @@ class LoRAModule(torch.nn.Module):
 
         lx = self.lora_up(lx)
 
+        if lx.dtype != org_forwarded.dtype:
+            lx = lx.to(org_forwarded.dtype)
         return org_forwarded + lx * self.multiplier * scale
 
     @property
@@ -212,9 +220,12 @@ class LoRAInfModule(LoRAModule):
 
     def default_forward(self, x):
         # logger.info(f"default_forward {self.lora_name} {x.size()}")
-        lx = self.lora_down(x)
+        org_forwarded = self.org_forward(x)
+        lx = self.lora_down(x.to(self.lora_down.weight.dtype))
         lx = self.lora_up(lx)
-        return self.org_forward(x) + lx * self.multiplier * self.scale
+        if lx.dtype != org_forwarded.dtype:
+            lx = lx.to(org_forwarded.dtype)
+        return org_forwarded + lx * self.multiplier * self.scale
 
     def forward(self, x):
         if not self.enabled:

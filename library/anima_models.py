@@ -1,6 +1,7 @@
 # Anima Model Architecture
 # Original code: NVIDIA CORPORATION & AFFILIATES, licensed under Apache-2.0
 
+import contextlib
 import math
 from typing import Any, Optional, Tuple, Union
 
@@ -740,8 +741,26 @@ class FinalLayer(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         use_fp32: bool = False,
     ):
-        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
-        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+        # Align modulation inputs with the block dtype so bf16 runs do not hit
+        # float-vs-bf16 Linear mismatches (t-embeddings arrive as float32 when
+        # use_adaln_lora returns the raw sinusoidal sample). fp16 keeps the
+        # float32 autocast path for numerical stability.
+        if not use_fp32:
+            if emb_B_T_D.dtype != x_B_T_H_W_D.dtype:
+                emb_B_T_D = emb_B_T_D.to(x_B_T_H_W_D.dtype)
+            if adaln_lora_B_T_3D is not None and adaln_lora_B_T_3D.dtype != x_B_T_H_W_D.dtype:
+                adaln_lora_B_T_3D = adaln_lora_B_T_3D.to(x_B_T_H_W_D.dtype)
+        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers).
+        # NOTE: do not enter a disabled autocast context when use_fp32 is False:
+        # `torch.autocast(enabled=False)` would switch OFF an active outer
+        # (e.g. bf16) autocast and expose float/bf16 mismatches. Use nullcontext
+        # instead so the outer autocast stays in effect.
+        mod_ctx = (
+            torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=True)
+            if use_fp32
+            else contextlib.nullcontext()
+        )
+        with mod_ctx:
             if self.use_adaln_lora:
                 assert adaln_lora_B_T_3D is not None
                 shift_B_T_D, scale_B_T_D = (
@@ -875,8 +894,25 @@ class Block(nn.Module):
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
-        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+        # Align modulation inputs with the block dtype so bf16 runs do not hit
+        # float-vs-bf16 Linear mismatches (t-embeddings arrive as float32 when
+        # use_adaln_lora returns the raw sinusoidal sample).
+        if not use_fp32:
+            if emb_B_T_D.dtype != x_B_T_H_W_D.dtype:
+                emb_B_T_D = emb_B_T_D.to(x_B_T_H_W_D.dtype)
+            if adaln_lora_B_T_3D is not None and adaln_lora_B_T_3D.dtype != x_B_T_H_W_D.dtype:
+                adaln_lora_B_T_3D = adaln_lora_B_T_3D.to(x_B_T_H_W_D.dtype)
+
+        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers).
+        # NOTE: do not enter a disabled autocast context when use_fp32 is False:
+        # it would switch OFF an active outer (e.g. bf16) autocast. Use
+        # nullcontext instead so the outer autocast stays in effect.
+        mod_ctx = (
+            torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=True)
+            if use_fp32
+            else contextlib.nullcontext()
+        )
+        with mod_ctx:
             if self.use_adaln_lora:
                 shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
                     self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D

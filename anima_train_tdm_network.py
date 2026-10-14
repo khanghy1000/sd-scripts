@@ -150,6 +150,15 @@ def setup_parser() -> argparse.ArgumentParser:
     args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
     add_tdm_arguments(parser)
+    # --gradient_checkpointing / --cpu_offload_checkpointing are inherited
+    # from train_network.setup_parser(); add the unsloth variant for parity
+    # with anima_train.py / anima_train_network.py.
+    parser.add_argument(
+        "--unsloth_offload_checkpointing",
+        action="store_true",
+        help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
+        "Cannot be used with --cpu_offload_checkpointing. Implies --gradient_checkpointing.",
+    )
     return parser
 
 
@@ -202,9 +211,18 @@ def encode_cond(
     return prompt_embeds, attn_mask, t5_ids, t5_am
 
 
-def dit_predict_v(dit, x_4d: torch.Tensor, t_vec: torch.Tensor, cond, weight_dtype) -> torch.Tensor:
+def dit_predict_v(dit, x_4d: torch.Tensor, t_vec: torch.Tensor, cond, weight_dtype,
+                  ckpt_input_grad: bool = False) -> torch.Tensor:
     """One DiT forward. x_4d: [B, C, H, W] latent; t_vec: [B] in [0, 1].
-    Returns v-prediction [B, C, H, W] (caller's dtype)."""
+    Returns v-prediction [B, C, H, W] (caller's dtype).
+
+    ckpt_input_grad: when gradient checkpointing is enabled, mark the latent
+    input as requiring grad (mirrors the anima_train_network.py workaround so
+    torch checkpointing keeps a grad path on the frozen-base + LoRA graph).
+    Only takes effect when grad is enabled (no-op under torch.no_grad()).
+    """
+    if ckpt_input_grad and torch.is_grad_enabled() and x_4d.dtype.is_floating_point:
+        x_4d.requires_grad_(True)
     B = x_4d.shape[0]
     device = x_4d.device
     x_5d = x_4d.unsqueeze(2)  # [B, C, 1, H, W]
@@ -276,6 +294,19 @@ def main(args):
         args.fp8_base = False
         args.fp8_base_unet = False
 
+    # Gradient checkpointing flags (--gradient_checkpointing /
+    # --cpu_offload_checkpointing come from train_network.setup_parser()).
+    if getattr(args, "cpu_offload_checkpointing", False) and not getattr(args, "gradient_checkpointing", False):
+        logger.warning("cpu_offload_checkpointing is enabled, so gradient_checkpointing is also enabled.")
+        args.gradient_checkpointing = True
+    if getattr(args, "unsloth_offload_checkpointing", False):
+        if not getattr(args, "gradient_checkpointing", False):
+            logger.warning("unsloth_offload_checkpointing is enabled, so gradient_checkpointing is also enabled.")
+            args.gradient_checkpointing = True
+        assert not getattr(args, "cpu_offload_checkpointing", False), \
+            "Cannot use both --unsloth_offload_checkpointing and --cpu_offload_checkpointing."
+    use_ckpt = bool(getattr(args, "gradient_checkpointing", False))
+
     seed = args.seed if args.seed is not None else 42
     set_seed(seed)
     random.seed(seed)
@@ -316,6 +347,21 @@ def main(args):
     # training device (params are already there). Mirrors anima_train.py.
     dit.to(device)
     dit.eval()
+
+    if use_ckpt:
+        dit.enable_gradient_checkpointing(
+            cpu_offload=bool(getattr(args, "cpu_offload_checkpointing", False)),
+            unsloth_offload=bool(getattr(args, "unsloth_offload_checkpointing", False)),
+        )
+        logger.info(
+            "gradient checkpointing ENABLED "
+            f"(cpu_offload={bool(getattr(args, 'cpu_offload_checkpointing', False))}, "
+            f"unsloth_offload={bool(getattr(args, 'unsloth_offload_checkpointing', False))}). "
+            "DiT blocks are recomputed on backward; DiT runs in train() mode for the "
+            "two WITH-grad forwards and eval() everywhere else."
+        )
+    else:
+        logger.info("gradient checkpointing disabled (pass --gradient_checkpointing to reduce activation VRAM).")
 
     # ---- two LoRA adapters nested on the same frozen base ----
     from networks import lora_anima
@@ -513,6 +559,7 @@ def main(args):
         # 1. student rollout (no grad): K Euler steps, save inputs + x0/eps preds
         xs, x0s, epss = [], [], []
         with torch.no_grad():
+            dit.eval()  # ensure eval (grad-ckpt train mode is only for WITH-grad forwards)
             set_role(student_net, fake_net, "student")
             for k in range(K):
                 t_vec = torch.full((B,), ts[k].item(), dtype=torch.float32, device=device)
@@ -562,18 +609,24 @@ def main(args):
             w_fake = is_w * torch.minimum(snr, torch.full_like(snr, 5.0))
         set_role(student_net, fake_net, "fake")
         zero_all(student_net, fake_net)
+        if use_ckpt:
+            dit.train()  # AnimaBlock gates checkpointing on self.training
         with torch.autocast(**autocast_kw):
-            v_fake_train = dit_predict_v(dit, x_tau_f.to(weight_dtype), tau_f, cond, weight_dtype).float()
+            v_fake_train = dit_predict_v(dit, x_tau_f.to(weight_dtype), tau_f, cond, weight_dtype,
+                                         ckpt_input_grad=use_ckpt).float()
         ta4 = tau_f.view(B, 1, 1, 1)
         x0_fake_pred = x_tau_f - ta4 * v_fake_train
         loss_d = (((x0_fake_pred - x0_hat_f).square().mean(dim=(1, 2, 3))) * w_fake).mean()
         loss_d.backward()
         torch.nn.utils.clip_grad_norm_(fake_net.parameters(), args.tdm_max_grad_norm)
         opt_f.step()
+        if use_ckpt:
+            dit.eval()  # back to deterministic eval for no-grad scores
         loss_d_v = loss_d.item()
 
         # 3a. scores (no grad): teacher cond/uncond + fake at fresh (x_tau, tau)
         with torch.no_grad():
+            dit.eval()
             _, t_m, x_tm, x0_hat, tau, x_tau, _, _ = draw_segment()
             x_tau_b = x_tau.to(weight_dtype)
             set_role(student_net, fake_net, "teacher")
@@ -595,9 +648,11 @@ def main(args):
         # 3b. one student step WITH grad toward sg(coop)
         set_role(student_net, fake_net, "student")
         zero_all(student_net, fake_net)
+        if use_ckpt:
+            dit.train()  # AnimaBlock gates checkpointing on self.training
         t_m_vec = t_m.to(dtype=torch.float32)
         with torch.autocast(**autocast_kw):
-            v_stu = dit_predict_v(dit, x_tm, t_m_vec, cond, weight_dtype).float()
+            v_stu = dit_predict_v(dit, x_tm, t_m_vec, cond, weight_dtype, ckpt_input_grad=use_ckpt).float()
         tm4 = t_m.view(B, 1, 1, 1)
         x0_stu = x_tm.float() - tm4 * v_stu
         diff = x0_stu - coop
@@ -609,6 +664,8 @@ def main(args):
         loss_g.backward()
         torch.nn.utils.clip_grad_norm_(student_net.parameters(), args.tdm_max_grad_norm)
         opt_s.step()
+        if use_ckpt:
+            dit.eval()  # back to deterministic eval for next rollout
         loss_g_v = loss_g.item()
 
         csv_writer.writerow([step, f"{loss_g_v:.6f}", f"{loss_d_v:.6f}", f"{lr_now:.2e}", f"{time.time() - t0:.1f}"])

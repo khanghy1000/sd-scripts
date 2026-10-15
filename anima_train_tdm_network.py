@@ -67,6 +67,7 @@ and previews render with the EMA weights.
 
 import argparse
 import csv
+import json
 import os
 import random
 import time
@@ -319,11 +320,174 @@ def ema_casted_state_dict(ema: dict, student_net) -> dict:
     return out
 
 
+def build_tdm_metadata(
+    args,
+    *,
+    session_id: int,
+    training_started_at: float,
+    rank: int,
+    alpha: float,
+    lora_kw: dict,
+    optimizer_name: str,
+    optimizer_args_str: str,
+    student_lr: float,
+    fake_lr: float,
+    num_prompts: int,
+    batch_size_per_device: int,
+    total_batch_size: int,
+    accum_steps: int,
+    seed: int,
+    use_ckpt: bool,
+    use_ema: bool,
+    ema_decay: float,
+    ema_warmup: int,
+    ema_update_every: int,
+    huber_c,
+    neg_single: str = "",
+):
+    """Build the ``ss_*`` metadata dict for TDM LoRA outputs.
+
+    Same standard keys as ``anima_train_network.py`` (via
+    ``train_network._build_metadata``: session, LR, optimizer, batch size,
+    network rank/alpha/args, scheduler, seed, model hashes, ...) plus the
+    Anima trainer keys (``ss_weighting_scheme`` etc.) and ``ss_tdm_*`` keys
+    for every TDM-specific argument.
+
+    Returns ``(metadata, minimum_metadata)`` with all values stringified,
+    like the regular trainer.
+    """
+    g = lambda k, d=None: getattr(args, k, d)  # noqa: E731
+
+    metadata = {
+        "ss_session_id": session_id,
+        "ss_training_started_at": training_started_at,
+        "ss_output_name": g("output_name"),
+        "ss_learning_rate": student_lr,
+        "ss_tdm_fake_lr": fake_lr,
+        "ss_text_encoder_lr": g("text_encoder_lr"),
+        "ss_unet_lr": g("unet_lr"),
+        "ss_gradient_checkpointing": use_ckpt,
+        "ss_gradient_accumulation_steps": accum_steps,
+        "ss_max_train_steps": g("max_train_steps"),
+        "ss_lr_warmup_steps": g("lr_warmup_steps"),
+        "ss_lr_scheduler": g("lr_scheduler"),
+        "ss_network_module": "networks.lora_anima",
+        "ss_network_dim": rank,
+        "ss_network_alpha": alpha,
+        "ss_network_dropout": g("network_dropout"),
+        "ss_mixed_precision": g("mixed_precision"),
+        "ss_full_fp16": bool(g("full_fp16", False)),
+        "ss_v2": bool(g("v2", False)),
+        "ss_base_model_version": "anima",
+        "ss_clip_skip": g("clip_skip"),
+        "ss_max_token_length": g("qwen3_max_token_length", g("max_token_length")),
+        "ss_cache_latents": bool(g("cache_latents", False)),
+        "ss_seed": seed,
+        "ss_lowram": g("lowram"),
+        "ss_noise_offset": g("noise_offset"),
+        "ss_multires_noise_iterations": g("multires_noise_iterations"),
+        "ss_multires_noise_discount": g("multires_noise_discount"),
+        "ss_adaptive_noise_scale": g("adaptive_noise_scale"),
+        "ss_zero_terminal_snr": g("zero_terminal_snr"),
+        "ss_training_comment": g("training_comment"),
+        "ss_sd_scripts_commit_hash": model_io.get_git_revision_hash(),
+        "ss_optimizer": optimizer_name + (f"({optimizer_args_str})" if optimizer_args_str else ""),
+        "ss_max_grad_norm": g("max_grad_norm"),
+        "ss_min_snr_gamma": g("min_snr_gamma"),
+        "ss_scale_weight_norms": g("scale_weight_norms"),
+        "ss_ip_noise_gamma": g("ip_noise_gamma"),
+        "ss_debiased_estimation": bool(g("debiased_estimation_loss", False)),
+        "ss_noise_offset_random_strength": g("noise_offset_random_strength"),
+        "ss_ip_noise_gamma_random_strength": g("ip_noise_gamma_random_strength"),
+        "ss_loss_type": "tdm_pseudo_huber" if huber_c is not None else "tdm_mse",
+        "ss_huber_schedule": g("huber_schedule"),
+        "ss_huber_scale": g("huber_scale"),
+        "ss_huber_c": g("huber_c"),
+        "ss_fp8_base": bool(g("fp8_base", False)),
+        "ss_fp8_base_unet": bool(g("fp8_base_unet", False)),
+        # Anima trainer keys (AnimaNetworkTrainer.update_metadata)
+        "ss_weighting_scheme": g("weighting_scheme"),
+        "ss_logit_mean": g("logit_mean"),
+        "ss_logit_std": g("logit_std"),
+        "ss_mode_scale": g("mode_scale"),
+        "ss_timestep_sampling": g("timestep_sampling"),
+        "ss_sigmoid_scale": g("sigmoid_scale"),
+        "ss_discrete_flow_shift": g("discrete_flow_shift"),
+        # Batch / data-free dataset keys (regular-trainer non-user-config branch)
+        "ss_batch_size_per_device": batch_size_per_device,
+        "ss_total_batch_size": total_batch_size,
+        "ss_resolution": g("resolution"),
+    }
+
+    if lora_kw:
+        metadata["ss_network_args"] = json.dumps(lora_kw)
+
+    # Base model / VAE / text-encoder names + hashes (regular-trainer style)
+    sd_model_name = g("pretrained_model_name_or_path")
+    if sd_model_name is not None:
+        if os.path.exists(sd_model_name):
+            metadata["ss_sd_model_hash"] = model_io.model_hash(sd_model_name)
+            metadata["ss_new_sd_model_hash"] = model_io.calculate_sha256(sd_model_name)
+            sd_model_name = os.path.basename(sd_model_name)
+        metadata["ss_sd_model_name"] = sd_model_name
+    vae_name = g("vae")
+    if vae_name is not None:
+        if os.path.exists(vae_name):
+            metadata["ss_vae_hash"] = model_io.model_hash(vae_name)
+            metadata["ss_new_vae_hash"] = model_io.calculate_sha256(vae_name)
+            vae_name = os.path.basename(vae_name)
+        metadata["ss_vae_name"] = vae_name
+    qwen3_name = g("qwen3")
+    if qwen3_name is not None:
+        metadata["ss_tdm_qwen3_name"] = (
+            os.path.basename(qwen3_name) if os.path.exists(qwen3_name) else qwen3_name
+        )
+
+    # TDM-specific args
+    neg_file = g("tdm_neg_file")
+    metadata.update(
+        {
+            "ss_tdm_prompts_file": os.path.basename(g("tdm_prompts_file") or ""),
+            "ss_tdm_num_prompts": num_prompts,
+            "ss_tdm_steps": g("tdm_steps"),
+            "ss_tdm_cfg": g("tdm_cfg"),
+            "ss_tdm_neg_prompt": neg_single,
+            "ss_tdm_neg_file": os.path.basename(neg_file) if neg_file else None,
+            "ss_tdm_shift": g("tdm_shift"),
+            "ss_tdm_no_huber": bool(g("tdm_no_huber", False)),
+            "ss_tdm_huber_c": huber_c,
+            "ss_tdm_separate_intervals": not bool(g("tdm_no_separate_intervals", False)),
+            "ss_tdm_randmid": bool(g("tdm_randmid", False)),
+            "ss_tdm_tau_min": g("tdm_tau_min"),
+            "ss_tdm_tau_gap": g("tdm_tau_gap"),
+            "ss_tdm_tau_max": g("tdm_tau_max"),
+            "ss_tdm_fake_weights": g("tdm_fake_weights"),
+            "ss_tdm_ema": bool(use_ema),
+            "ss_tdm_ema_decay": ema_decay if use_ema else None,
+            "ss_tdm_ema_warmup": ema_warmup if use_ema else None,
+            "ss_tdm_ema_update_every": ema_update_every if use_ema else None,
+            "ss_tdm_eval_every": g("tdm_eval_every"),
+            "ss_tdm_preview_n": g("tdm_preview_n"),
+        }
+    )
+
+    metadata = {k: str(v) for k, v in metadata.items()}
+
+    minimum_metadata = {}
+    for key in model_io.SS_METADATA_MINIMUM_KEYS:
+        if key in metadata:
+            minimum_metadata[key] = metadata[key]
+
+    return metadata, minimum_metadata
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main(args):
+    session_id = random.randint(0, 2**32)
+    training_started_at = time.time()
     if not args.tdm_prompts_file or not os.path.isfile(args.tdm_prompts_file):
         raise ValueError("--tdm_prompts_file is required (data-free distillation uses captions only).")
     with open(args.tdm_prompts_file, encoding="utf-8") as f:
@@ -518,7 +682,7 @@ def main(args):
     # --text_encoder_lr (per-group "lr" overrides the constructor default).
     student_lr = float(args.learning_rate)
     fake_lr = float(args.tdm_fake_lr)
-    _, _, opt_s = optimizer_util.get_optimizer(args, student_net.parameters())
+    optimizer_name, optimizer_args_str, opt_s = optimizer_util.get_optimizer(args, student_net.parameters())
     _, _, opt_f = optimizer_util.get_optimizer(
         args, [{"params": list(fake_net.parameters()), "lr": fake_lr}]
     )
@@ -593,6 +757,44 @@ def main(args):
             opt_f_train_fn()
 
     def _save_all(step: int):
+        # Full ss_* metadata like anima_train_network.py (standard keys +
+        # Anima keys + ss_tdm_*), merged with the SAI ModelSpec block. The
+        # regular trainer lets the ModelSpec block win on conflicts; same here.
+        # Honors --no_metadata (minimum subset only).
+        metadata, minimum_metadata = build_tdm_metadata(
+            args,
+            session_id=session_id,
+            training_started_at=training_started_at,
+            rank=rank,
+            alpha=alpha,
+            lora_kw=lora_kw,
+            optimizer_name=optimizer_name,
+            optimizer_args_str=optimizer_args_str,
+            student_lr=student_lr,
+            fake_lr=fake_lr,
+            num_prompts=len(prompts),
+            batch_size_per_device=B,
+            total_batch_size=B * accelerator.num_processes * accum_steps,
+            accum_steps=accum_steps,
+            seed=seed,
+            use_ckpt=use_ckpt,
+            use_ema=bool(use_ema and ema_state is not None),
+            ema_decay=ema_decay,
+            ema_warmup=ema_warmup,
+            ema_update_every=ema_update_every,
+            huber_c=huber_c,
+            neg_single=neg_single,
+        )
+        metadata["ss_training_finished_at"] = str(time.time())
+        metadata["ss_steps"] = str(step)
+        metadata["ss_epoch"] = "1"  # data-free streaming: one virtual epoch spans the run
+        metadata["ss_tdm_step"] = str(step)
+        minimum_metadata = dict(minimum_metadata)
+        minimum_metadata["ss_tdm_step"] = str(step)
+        metadata_to_save = dict(minimum_metadata) if getattr(args, "no_metadata", False) else dict(metadata)
+        sai_metadata = model_io.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
+        metadata_to_save.update(sai_metadata)
+        metadata_to_save = {str(k): str(v) for k, v in metadata_to_save.items()}
         s_sd = {f"student.{k}": v.detach().cpu().contiguous() for k, v in student_net.state_dict().items()}
         f_sd = {f"fake.{k}": v.detach().cpu().contiguous() for k, v in fake_net.state_dict().items()}
         state_dict = {**s_sd, **f_sd}
@@ -600,12 +802,10 @@ def main(args):
             for k, e in ema_state.items():
                 state_dict[f"ema.{k}"] = e.detach().cpu().contiguous()
         state_path = os.path.join(args.output_dir, f"tdm_state_step_{step}.safetensors")
-        save_file(state_dict, state_path)
+        save_file(state_dict, state_path, metadata=metadata_to_save)
         logger.info(f"[ckpt] both adapters{' + EMA' if use_ema else ''} -> {state_path}")
         student_path = os.path.join(args.output_dir, f"{out_name}_step_{step}.safetensors")
-        meta = model_io.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
-        meta["ss_tdm_step"] = str(step)
-        student_net.save_weights(student_path, save_dtype, meta)
+        student_net.save_weights(student_path, save_dtype, dict(metadata_to_save))
         logger.info(f"[ckpt] student LoRA -> {student_path}")
         if use_ema and ema_state is not None:
             # Save the EMA student via a temporary swap so hashing/metadata
@@ -613,7 +813,7 @@ def main(args):
             backup_sd = {k: v.detach().clone() for k, v in student_net.state_dict().items()}
             try:
                 student_net.load_state_dict(ema_casted_state_dict(ema_state, student_net), strict=True)
-                ema_meta = dict(meta)
+                ema_meta = dict(metadata_to_save)
                 ema_meta["ss_tdm_ema"] = f"decay={ema_decay:g}"
                 ema_path = os.path.join(args.output_dir, f"{out_name}_ema_step_{step}.safetensors")
                 student_net.save_weights(ema_path, save_dtype, ema_meta)

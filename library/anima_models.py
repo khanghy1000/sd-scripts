@@ -1301,6 +1301,7 @@ class Anima(nn.Module):
         source_attention_mask: Optional[torch.Tensor] = None,
         t5_input_ids: Optional[torch.Tensor] = None,
         t5_attn_mask: Optional[torch.Tensor] = None,
+        features: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -1354,6 +1355,11 @@ class Anima(nn.Module):
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks(self.blocks, block_idx)
+
+        if features:
+            # DMAD discriminator path: the image tokens after the last block,
+            # before the output head (MOSS-style ``features=True``)
+            return x_B_T_H_W_D
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)

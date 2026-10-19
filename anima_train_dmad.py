@@ -1,62 +1,80 @@
 # Anima DMAD (Distribution Matching as Adversarial Distillation) training script.
 #
-# Based on ``DMAD/train/image`` (SDXL: ``main/train_sd.py`` + ``main/sd_guidance.py``,
-# paper arXiv:2610.02188) ported to the Anima rectified-flow DiT, and integrated
-# with this repo's dataset / accelerator / caching / sampling infrastructure
-# (like ``anima_train.py``) plus LoRA support (like ``anima_train_network.py``).
+# This is a port of the MOSS implementation (``RamTorchRun/moss/train_dmad.py``,
+# paper arXiv 2610.02188) to the Anima rectified-flow DiT, integrated with this
+# repo's dataset / accelerator / caching / sampling infrastructure (like
+# ``anima_train.py``), with teacher-sample caching support and kohya LoRA exports.
 #
-# What it does per iteration (same as DMAD):
-#   generator turn: student DiT renders latents G (1-step or multi-step Euler,
-#     optionally with backward simulation), critic is frozen, generator minimizes
-#     ``-d_teacher(G) * teacher_loss_weight - d_real(G) * real_loss_weight``.
-#   critic turn:    critic (DiT copy reading final-block tokens + real/teacher
-#     MLP heads) minimizes ``BCE(T=1, G=0) + BCE(Q=1, G=0)`` on real latents T,
-#     generated G (detached) and teacher samples Q.
+# ONE frozen DiT backbone carries the three LoRA roles of the moss trainer
+# (``library.anima_dmad``):
 #
-# Teacher samples Q come from a pre-generated LMDB cache (--teacher_latent_path,
-# built by anima_dmad_generate_teacher.py; no online teacher evaluation, as in
-# the paper) or, as a fallback, from on-the-fly multi-step Euler sampling with
-# the frozen teacher DiT (--teacher_model_path, --teacher_steps, --teacher_cfg).
-# The generator trains full-finetune by default or LoRA (--network_module
-# networks.lora_anima ...); the critic trains fully or with LoRA on its backbone
-# (--dmad_critic_lora_dim) plus full heads.
-# Memory (full, on-the-fly): generator + teacher + critic + VAE + Qwen3.
-# Cached-Q mode drops the teacher DiT; LoRA modes shrink the trainable state.
-# Use --gradient_checkpointing / --blocks_to_swap / smaller batch sizes on small GPUs.
+#   None     teacher : frozen base (+ optional frozen always-on teacher LoRA,
+#             ``--teacher_lora_path`` -- e.g. a DMD LoRA, applied unmerged in
+#             fp32); ``teacher_steps`` Euler on the shift-``dmad_flow_shift``
+#             grid, no CFG, sampled online for every caption (except with
+#             ``--teacher_latent_path``, which supplies Q from cache)
+#   default  student: same backbone + new LoRA (zero-init B: starts AT the
+#             teacher); ``student_steps``-step re-noise sampler (predict
+#             x0 = x - t v, renew the noise at the next t); k ~ U{0..steps-1}
+#             no-grad re-noise steps, then one step with grad -> x0_G; noise to
+#             t = shift(u); L_G = -mean(lambda_T w(u) h_T + lambda_R h_R), the
+#             disc frozen (gradients flow through its input).
+#   disc     discriminator: same backbone + disc LoRA; the final block's image
+#             tokens go through a non-affine RMSNorm into two heads (teacher,
+#             real), each Linear-SiLU-Linear to a per-token logit, token mean.
+#
+# discriminator turn: balanced BCE per head on noisy (target, x0_G.detach())
+# pairs; the teacher head scores teacher samples, the real head scores the
+# real images; t = shift(u), u ~ U(disc_u_range). Gap reweighting: per u band an
+# EMA of mean h_R(real) - mean h_R(teacher), gathered over ranks;
+# w = sigmoid((median - gap) / tau), normalized over the measured bands.
+#
+# Exports (on every save / at the end, like moss): ``*_student_*.safetensors``
+# (student LoRA, kohya anima format, applied ON TOP of the teacher LoRA),
+# ``*_data_lora_<steps>step_*.safetensors`` (one exact-rank kohya LoRA =
+# strength * teacher + student, used at strength 1 on the stock model; only
+# with --teacher_lora_path), ``*_disc_*.safetensors`` + ``*_disc_heads_*.safetensors``.
+#
+# Memory: backbone (frozen) + student/disc role LoRAs + heads + VAE + Qwen3.
+# The old separate-critic copy, full-finetune mode, spectral norm and the
+# per-band routing args are gone; the moss algorithm needs LoRA roles.
+# Use --gradient_checkpointing / --blocks_to_swap / smaller batch sizes on
+# small GPUs.
 
 import argparse
-import copy
 import gc
-import importlib
 import math
 import os
-import sys
+import time
 from multiprocessing import Value
 
 import toml
-from tqdm import tqdm
-
 import torch
-import torch.nn.functional as F
+import torch.distributed as dist
+from tqdm import tqdm
 
 from library import flux_train_utils
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 
 init_ipex()
 
 from accelerate.utils import set_seed
-from library import anima_models, anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec
-from library.anima_dmad import AnimaDMADCritic, AnimaTeacherLatentDataset, apply_scaled_spectral_norm, euler_sample_x0, velocity_to_x0
+from library import anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec
+from library.anima_dmad import (
+    AnimaDmad,
+    AnimaTeacherLatentDataset,
+    PowerEMA,
+    broadcast_params,
+    clip_step,
+    enable_dmad_block_checkpointing,
+    set_lora_role,
+)
 
 import library.accelerator_setup as accelerator_setup
 import library.args as args_util
-import library.checkpoint_io as checkpoint_io
 import library.dataset as dataset_util
 import library.deepspeed_utils as deepspeed_utils
 import library.logging_util as logging_util
-import library.loss as loss_util  # noqa: F401 (kept for parity with anima_train.py)
-import library.optimizer as optimizer_util
 import library.sampling as sampling
 
 from library.utils import setup_logging, add_logging_arguments
@@ -72,198 +90,120 @@ from library.custom_train_functions import add_custom_train_arguments
 
 
 def add_dmad_arguments(parser: argparse.ArgumentParser):
-    g = parser.add_argument_group("DMAD arguments")
+    g = parser.add_argument_group("DMAD arguments (method of moss/train_dmad.py)")
+    # teacher
     g.add_argument("--teacher_model_path", type=str, default=None,
-                   help="Frozen teacher Anima checkpoint for on-the-fly Q samples. Default: same as --pretrained_model_name_or_path")
+                   help="Frozen teacher Anima checkpoint; its weights also INITIALIZE the shared backbone "
+                        "(the student LoRA starts at the teacher). Default: --pretrained_model_name_or_path")
+    g.add_argument("--teacher_lora_path", type=str, default=None,
+                   help="Frozen, always-on teacher LoRA (kohya anima format) on the block projections; the "
+                        "teacher = backbone + strength * this LoRA (moss teacher-style). Student and disc "
+                        "roles start at the teacher automatically (zero-init LoRA B)")
+    g.add_argument("--teacher_lora_strength", type=float, default=1.0,
+                   help="Strength of the frozen teacher LoRA")
+    g.add_argument("--teacher_lora_alpha", type=float, default=None,
+                   help="Alpha of the frozen teacher LoRA (default: the alpha stored in the file, else the rank)")
     g.add_argument("--teacher_latent_path", type=str, default=None,
                    help="LMDB of pre-generated teacher latents (Q) built by anima_dmad_generate_teacher.py. "
-                   "When set, Q is read from cache (no online teacher evaluation, as in the paper) and no teacher DiT is loaded")
+                        "When set, Q is read from cache (no online teacher evaluation) and the disc's teacher "
+                        "chunk uses the cached sample's own prompt")
     g.add_argument("--dmad_teacher_batch_size", type=int, default=8,
                    help="Batch size for cached teacher latents (exact match with the train batch is not required)")
-    g.add_argument("--conditioning_sigma", type=float, default=1.0,
-                   help="Noise level of the one-step generator (1.0 = pure noise)")
-    g.add_argument("--num_denoising_steps", type=int, default=1,
-                   help="Generator steps at inference. 1 = one-step; >1 = multi-step Euler")
-    g.add_argument("--dmad_flow_shift", type=float, default=3.0,
-                   help="Flow shift of the multi-step generator sigma grid")
-    g.add_argument("--backward_simulation", action="store_true",
-                   help="Multi-step generator: run the student's own sampler no-grad, then one grad forward (like DMAD-SDXL)")
-    g.add_argument("--teacher_steps", type=int, default=20,
-                   help="Euler steps for on-the-fly teacher (Q) sampling (ignored with --teacher_latent_path)")
-    g.add_argument("--teacher_flow_shift", type=float, default=3.0,
-                   help="Flow shift for on-the-fly teacher sampling")
+    g.add_argument("--teacher_steps", type=int, default=8,
+                   help="Euler steps for the online teacher samples (moss default: 8; ignored with --teacher_latent_path)")
+    g.add_argument("--teacher_flow_shift", type=float, default=None,
+                   help="Flow shift of the teacher Euler grid (default: --dmad_flow_shift)")
     g.add_argument("--teacher_cfg", type=float, default=1.0,
-                   help="CFG scale for on-the-fly teacher sampling (bakes guidance into Q; ignored with --teacher_latent_path)")
-    g.add_argument("--teacher_negative_prompt", type=str, default="",
-                   help="Negative prompt for on-the-fly teacher CFG")
-    g.add_argument("--critic_num_blocks", type=int, default=None,
-                   help="Critic backbone depth (DiT blocks). Default: full DiT depth (paper's DiT discriminators read final-block tokens)")
-    g.add_argument("--critic_max_sigma", type=float, default=1.0,
-                   help="Critic noise levels are uniform in [0, this)")
-    g.add_argument("--critic_spectral_norm", action="store_true",
-                   help="Frozen-gain spectral norm on the critic")
-    g.add_argument("--generator_spectral_norm", action="store_true",
-                   help="Frozen-gain spectral norm on the generator encoder (patch embed + first-half blocks)")
-    g.add_argument("--critic_freeze_backbone", action="store_true",
-                   help="Freeze the critic backbone (heads train)")
-    g.add_argument("--teacher_gap_route", action="store_true",
-                   help="Weight the teacher loss per noise band by the online gap E[d_real(T)] - E[d_real(Q)]")
-    g.add_argument("--gap_tau", type=float, default=2.0,
-                   help="Gap-routing temperature (paper: 0.5 for ImageNet/SDXL, 2 for Wan/MiniMax-H3 DiTs)")
-    g.add_argument("--gap_num_bands", type=int, default=10,
-                   help="Number of equal-width gap-routing bands over [0, 1). Default: 10 (paper H3/Wan); "
-                   "ImageNet-style setups use fewer (e.g. 6)")
-    g.add_argument("--teacher_loss_weight", type=float, default=5e-3)
-    g.add_argument("--real_loss_weight", type=float, default=5e-3)
-    g.add_argument("--critic_loss_weight", type=float, default=1e-2)
-    g.add_argument("--guidance_lr", type=float, default=5e-7, help="Learning rate for the critic")
+                   help="CFG scale for online teacher sampling, baked into Q (> 1 needs --teacher_negative_prompt; "
+                        "the moss teacher runs without CFG; ignored with --teacher_latent_path)")
+    g.add_argument("--teacher_negative_prompt", type=str, default="", help="Negative prompt for on-the-fly teacher CFG")
+    # student / student grid
+    g.add_argument("--student_steps", "--num_denoising_steps", dest="student_steps", type=int, default=1,
+                   help="Generator steps at inference (re-noise sampler). 1 = one-step (t = 1 pure noise); "
+                        ">1 = multi-step (moss: 4)")
+    g.add_argument("--dmad_flow_shift", type=float, default=3.0,
+                   help="Flow shift of the student / teacher sigma grids (moss uses its model's shift)")
+    g.add_argument("--dmad_lora_rank", type=int, default=128,
+                   help="Rank of BOTH the student and the disc role LoRAs (moss default)")
+    g.add_argument("--dmad_lora_alpha", type=float, default=128.0,
+                   help="Alpha of both role LoRAs (moss default)")
+    g.add_argument("--dmad_head_hidden", type=int, default=1024,
+                   help="Hidden width of the two discriminator heads (Linear-SiLU-Linear; moss default)")
+    g.add_argument("--disc_u_range", type=float, nargs=2, default=[0.001, 0.999],
+                   help="Uniform base-time u range for the generator and disc noising (0 < lo < hi < 1)")
+    # losses / gap routing
+    g.add_argument("--lambda_teacher", type=float, default=1.0, help="Teacher-head weight in the generator loss")
+    g.add_argument("--lambda_real", type=float, default=1.0, help="Real-head weight in the generator loss")
+    g.add_argument("--gap_bands", type=int, default=10, help="Number of equal-width gap-routing bands over [0, 1)")
+    g.add_argument("--gap_beta", type=float, default=0.99, help="Gap EMA coefficient")
+    g.add_argument("--gap_tau", type=float, default=2.0, help="Gap-routing temperature (paper: 0.5 ImageNet/SDXL, 2 for Wan/H3 DiTs)")
+    g.add_argument("--gap_floor", type=float, default=1e-4, help="Floor for the band-weight normalization")
+    # optimizers (moss-style plain AdamW + warmup ramps for both roles)
+    g.add_argument("--disc_lr", type=float, default=4e-5,
+                   help="Learning rate for the disc role + heads (moss default; the generator uses --learning_rate)")
     g.add_argument("--dmad_adam_beta1", type=float, default=0.0)
     g.add_argument("--dmad_adam_beta2", type=float, default=0.99)
-    g.add_argument("--dmad_warmup_steps", type=int, default=500)
-    g.add_argument("--generator_ema_kimg", type=float, default=1000, help="Generator EMA half-life in thousand images")
-    g.add_argument("--generator_ema_rampup", type=float, default=0.05)
-    # LoRA (generator). Mirrors train_network.py; LoRA trains the student, base DiT stays frozen.
-    g.add_argument("--network_module", type=str, default=None,
-                   help="LoRA network module for the generator (e.g. networks.lora_anima). Unset = full finetune")
-    g.add_argument("--network_dim", type=int, default=None, help="LoRA rank (paper H3: 128)")
-    g.add_argument("--network_alpha", type=float, default=1, help="LoRA alpha (paper H3: 128)")
-    g.add_argument("--network_dropout", type=float, default=None, help="LoRA neuron dropout")
-    g.add_argument("--network_args", type=str, default=None, nargs="*",
-                   help="additional network arguments (key=value), e.g. train_llm_adapter=true")
-    g.add_argument("--network_weights", type=str, default=None, help="resume generator LoRA from this file")
-    g.add_argument("--dim_from_weights", action="store_true",
-                   help="determine LoRA rank from --network_weights")
-    # LoRA (critic backbone). Heads always train fully.
-    g.add_argument("--dmad_critic_lora_dim", type=int, default=None,
-                   help="LoRA rank on the critic backbone (paper H3: 128). Unset = train critic fully")
-    g.add_argument("--dmad_critic_lora_alpha", type=float, default=None,
-                   help="LoRA alpha for the critic backbone (default: same as rank)")
+    g.add_argument("--dmad_weight_decay", type=float, default=0.0, help="Weight decay for both optimizers (moss default: 0)")
+    g.add_argument("--dmad_warmup_steps", type=int, default=0, help="LR ramp warmup for both optimizers (moss warmup)")
+    g.add_argument("--disc_warmup_steps", type=int, default=0, help="Updates where only the disc trains (moss disc_warmup)")
+    g.add_argument("--dmad_ema_sigma_rel", type=float, default=0.1,
+                   help="Power-EMA relative std for the student role (moss ema_sigma_rel)")
 
 
-def constant_with_warmup(optimizer, warmup_steps):
-    def lr_lambda(step):
-        if warmup_steps <= 0:
-            return 1.0
-        return min(1.0, (step + 1) / warmup_steps)
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+def ramp(n, warmup):
+    """Linear warmup factor (moss): min(1, (n + 1) / warmup) when warmup > 0."""
+    return min(1.0, (n + 1) / warmup) if warmup else 1.0
 
 
-def create_lora_network(args, target, dim, alpha, log_name):
-    """Import the network module and build a LoRA network on ``target``.
+def lora_metadata(args, step, epoch_no):
+    """SAI-style metadata for the exported kohya LoRA files."""
+    from library import model_io
 
-    ``target`` is the generator DiT or the critic's ``blocks`` ModuleList
-    (module selection is by class name, so both work). Text-encoder LoRAs are
-    skipped: the Qwen3 encoder stays frozen in DMAD training.
-    """
-    sys.path.append(os.path.dirname(__file__))
-    accelerator_print = logger.info
-    accelerator_print(f"import network module: {args.network_module}")
-    network_module = importlib.import_module(args.network_module)
-
-    net_kwargs = {}
-    if args.network_args is not None:
-        for net_arg in args.network_args:
-            key, value = net_arg.split("=", 1)
-            net_kwargs[key] = value
-    if "dropout" not in net_kwargs:
-        net_kwargs["dropout"] = args.network_dropout
-
-    if args.dim_from_weights:
-        assert args.network_weights, "--network_weights is required with --dim_from_weights"
-        network, _ = network_module.create_network_from_weights(1, args.network_weights, None, [], target, **net_kwargs)
-    else:
-        network = network_module.create_network(
-            1.0, dim, alpha, None, [], target,
-            neuron_dropout=args.network_dropout, **net_kwargs)
-    logger.info(f"created LoRA network for {log_name}: dim={dim}, alpha={alpha}")
-    return network_module, network
+    meta = {
+        "ss_network_module": "dmad_patch_lora (student/disc role LoRA, moss/train_dmad.py)",
+        "ss_network_dim": str(args.dmad_lora_rank),
+        "ss_network_alpha": str(args.dmad_lora_alpha),
+        "ss_steps": str(step),
+        "ss_epoch": str(epoch_no),
+    }
+    try:
+        sai = model_io.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
+        meta.update(sai)
+    except Exception as e:
+        logger.warning(f"sai model spec metadata failed: {e}")
+    return meta
 
 
-@torch.no_grad()
-def sample_backward_simulation(dit, noise4d, prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask,
-                               num_steps, flow_shift, dtype):
-    """Run the student's own sampler no-grad for a random number of steps.
+def save_dmad(args, accelerator, dmad, step, epoch_no):
+    """Write the moss-style exports: student LoRA (+ EMA), combined teacher+student
+    LoRA, disc LoRA and heads (kohya anima format, ``lora_unet_`` keys)."""
+    from safetensors.torch import save_file as safetensors_save
 
-    Returns (clean_estimate_4D, sigma_k) mirroring SDUniModel.sample_backward.
-    """
-    device = noise4d.device
-    b = noise4d.shape[0]
-    sigmas = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=torch.float32)
-    if float(flow_shift) != 1.0:
-        fs = float(flow_shift)
-        sigmas = (sigmas * fs) / (1 + (fs - 1) * sigmas)
-    k = int(torch.randint(0, num_steps, (1,), device=device).item())
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        kk = torch.tensor([k], device=device, dtype=torch.long)
-        torch.distributed.broadcast(kk, src=0)
-        k = int(kk.item())
-    x = noise4d.unsqueeze(2).float()
-    _, _, _, h, w = x.shape
-    padding_mask = torch.zeros(b, 1, h, w, dtype=torch.float32, device=device)
-    clean = noise4d.float()
-    for j in range(k):
-        s = float(sigmas[j])
-        t = torch.full((b,), s, device=device, dtype=noise4d.dtype)
-        v = dit(x.to(dtype), t, prompt_embeds.to(dtype) if torch.is_tensor(prompt_embeds) else prompt_embeds,
-                padding_mask=padding_mask.to(dtype), source_attention_mask=attn_mask,
-                target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask).float()
-        clean = (x.squeeze(2) - s * v.squeeze(2))
-        s_next = float(sigmas[j + 1])
-        clean_full = clean.unsqueeze(2)
-        clean_full = (1.0 - s_next) * clean_full + s_next * torch.randn_like(clean_full)
-        x = clean_full
-        clean = clean_full.squeeze(2)
-    return clean.to(dtype), float(sigmas[k])
+    accelerator.wait_for_everyone()
+    if not accelerator.is_main_process:
+        return
+    os.makedirs(args.output_dir, exist_ok=True)
+    base = args.output_name or "anima-dmad"
+    metadata = lora_metadata(args, step, epoch_no)
 
-
-def student_forward(dit, noise4d, cond, args, real_latents=None, dtype=None):
-    """Render G latents (4D) with the student. Returns (G, sigma_info)."""
-    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = cond
-    b = noise4d.shape[0]
-    device = noise4d.device
-    steps = max(1, int(args.num_denoising_steps))
-    if steps <= 1:
-        s = float(args.conditioning_sigma)
-        # timesteps must match the DiT dtype (float32 t vs bf16 weights errors)
-        t = torch.full((b,), s, device=device, dtype=noise4d.dtype)
-        x = noise4d.unsqueeze(2)
-        _, _, _, h, w = x.shape
-        padding_mask = torch.zeros(b, 1, h, w, dtype=dtype, device=device)
-        v = dit(x, t, prompt_embeds, padding_mask=padding_mask, source_attention_mask=attn_mask,
-                target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask)
-        g = velocity_to_x0(noise4d, v.squeeze(2), torch.full((b,), s, device=device, dtype=v.dtype))
-        return g, t
-    if args.backward_simulation:
-        with torch.no_grad():
-            clean, s_k = sample_backward_simulation(dit, noise4d, prompt_embeds, attn_mask,
-                                                    t5_input_ids, t5_attn_mask, steps, args.dmad_flow_shift, dtype)
-        s = torch.full((b,), s_k, device=device, dtype=noise4d.dtype)
-        noised = (1.0 - s.reshape(-1, 1, 1, 1)) * clean + s.reshape(-1, 1, 1, 1) * noise4d
-        x = noised.unsqueeze(2)
-        _, _, _, h, w = x.shape
-        padding_mask = torch.zeros(b, 1, h, w, dtype=dtype, device=device)
-        t = s.to(noise4d.dtype)
-        v = dit(x, t, prompt_embeds, padding_mask=padding_mask, source_attention_mask=attn_mask,
-                target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask)
-        g = velocity_to_x0(noised, v.squeeze(2), s.to(v.dtype))
-        return g, t
-    # no backward simulation: noise real latents to a random grid step, one forward
-    assert real_latents is not None, "multi-step without backward simulation needs real latents"
-    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
-    if float(args.dmad_flow_shift) != 1.0:
-        fs = float(args.dmad_flow_shift)
-        sigmas = (sigmas * fs) / (1 + (fs - 1) * sigmas)
-    idx = torch.randint(0, steps, (b,), device=device)
-    s = sigmas[idx].to(noise4d.dtype)
-    noised = (1.0 - s.reshape(-1, 1, 1, 1)) * real_latents + s.reshape(-1, 1, 1, 1) * noise4d
-    x = noised.unsqueeze(2)
-    _, _, _, h, w = x.shape
-    padding_mask = torch.zeros(b, 1, h, w, dtype=dtype, device=device)
-    t = s.to(noise4d.dtype)
-    v = dit(x, t, prompt_embeds, padding_mask=padding_mask, source_attention_mask=attn_mask,
-            target_input_ids=t5_input_ids, target_attention_mask=t5_attn_mask)
-    g = velocity_to_x0(noised, v.squeeze(2), s.to(v.dtype))
-    return g, t
+    # moss naming -> per-step output files
+    stem_map = {
+        "student_lora.safetensors": f"{base}_student_{step:06d}.safetensors",
+        "student_ema.safetensors": f"{base}_student_ema_{step:06d}.safetensors",
+        f"data_lora_{dmad.steps}step.safetensors": f"{base}_data_lora_{dmad.steps}step_{step:06d}.safetensors",
+        "disc_lora.safetensors": f"{base}_disc_{step:06d}.safetensors",
+        "disc_heads.safetensors": f"{base}_disc_heads_{step:06d}.safetensors",
+    }
+    lora_stems = {stag for stag in stem_map if "lora" in stag and "heads" not in stag}
+    try:
+        rows = dmad.exports(dmad.ema.shadow)  # keyed by file stem: {stem: {key: tensor}}
+        for stem, tensors in rows.items():
+            payload = {k: v.detach().float().contiguous().cpu() if torch.is_tensor(v) else v for k, v in tensors.items()}
+            meta = dict(metadata) if stem in lora_stems else {"format": "pt"}
+            safetensors_save(payload, os.path.join(args.output_dir, stem_map[stem]), metadata=meta)
+        logger.info(f"DMAD exports written at step {step}")
+    except Exception as e:
+        logger.warning(f"DMAD export save failed: {e}")
 
 
 def train(args):
@@ -274,14 +214,17 @@ def train(args):
 
     assert not getattr(args, "fused_backward_pass", False), "fused_backward_pass is not supported with the DMAD script"
     assert not getattr(args, "deepspeed", False), "deepspeed is not supported yet with the DMAD script"
+    assert 0 < args.disc_u_range[0] < args.disc_u_range[1] < 1, "--disc_u_range must satisfy 0 < lo < hi < 1"
+    assert args.dmad_lora_rank >= 1 and args.student_steps >= 1 and args.teacher_steps >= 1
+    if args.optimizer_type is not None and args.optimizer_type.lower() not in ("adamw", "adamw_with_warmup"):
+        logger.warning(f"--optimizer_type {args.optimizer_type} is ignored: DMAD always uses plain AdamW "
+                       f"(betas {args.dmad_adam_beta1}, {args.dmad_adam_beta2}) for the generator and disc roles")
+    if args.teacher_flow_shift is None:
+        args.teacher_flow_shift = args.dmad_flow_shift
+    if getattr(args, "resume", None) and str(args.resume) not in ("none", ""):
+        logger.warning("--resume is not supported by the DMAD script (moss-style role LoRA state); ignoring it")
 
     use_teacher_cache = args.teacher_latent_path is not None
-    use_gen_lora = args.network_module is not None
-    use_critic_lora = args.dmad_critic_lora_dim is not None and args.dmad_critic_lora_dim > 0
-    if use_gen_lora and args.generator_spectral_norm:
-        raise ValueError("generator_spectral_norm is not supported with generator LoRA")
-    if use_critic_lora and args.critic_spectral_norm:
-        logger.warning("critic_spectral_norm with critic LoRA applies to heads only")
     # Qwen3 must stay resident when teacher prompts are encoded live: cached-Q
     # mode (Q prompts) or on-the-fly CFG (negative prompt).
     need_qwen3_live = use_teacher_cache or (not use_teacher_cache and float(args.teacher_cfg) > 1.0)
@@ -294,11 +237,6 @@ def train(args):
     if args.cpu_offload_checkpointing and not args.gradient_checkpointing:
         logger.warning("cpu_offload_checkpointing is enabled, so gradient_checkpointing is also enabled")
         args.gradient_checkpointing = True
-    if args.unsloth_offload_checkpointing:
-        if not args.gradient_checkpointing:
-            logger.warning("unsloth_offload_checkpointing is enabled, so gradient_checkpointing is also enabled")
-            args.gradient_checkpointing = True
-        assert not args.cpu_offload_checkpointing, "Cannot use both --unsloth_offload_checkpointing and --cpu_offload_checkpointing"
     assert (args.blocks_to_swap is None or args.blocks_to_swap == 0) or not args.cpu_offload_checkpointing, \
         "blocks_to_swap is not supported with cpu_offload_checkpointing"
 
@@ -398,115 +336,64 @@ def train(args):
         clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
 
-    logger.info("Loading Anima DiT (%s)...", "generator base for LoRA" if use_gen_lora else "generator")
-    dit = anima_utils.load_anima_model("cpu", args.pretrained_model_name_or_path, args.attn_mode,
-                                       args.split_attn, "cpu", dit_weight_dtype=None)
-    if args.gradient_checkpointing:
-        dit.enable_gradient_checkpointing(cpu_offload=args.cpu_offload_checkpointing,
-                                           unsloth_offload=args.unsloth_offload_checkpointing)
-    if use_gen_lora:
-        dit.requires_grad_(False)  # base frozen; LoRA trains
-    else:
-        dit.requires_grad_(True)
+    # Shared frozen backbone: the teacher checkpoint when given (the student LoRA
+    # then starts AT the teacher), otherwise the base checkpoint.
+    backbone_path = args.teacher_model_path or args.pretrained_model_name_or_path
+    logger.info(f"Loading frozen DiT backbone from {backbone_path} "
+                f"({'teacher checkpoint (student starts AT the teacher)' if args.teacher_model_path else 'base checkpoint'})")
+    dit = anima_utils.load_anima_model("cpu", backbone_path, args.attn_mode, args.split_attn,
+                                       "cpu", dit_weight_dtype=None)
+    dit.requires_grad_(False)
 
-    teacher_dit = None
-    if use_teacher_cache:
-        logger.info(f"Using cached teacher latents from {args.teacher_latent_path}; no teacher DiT loaded")
+    # cast the backbone to its master dtype (fp32 unless --full_fp16/--full_bf16)
+    dit_weight_dtype = weight_dtype
+    if args.full_fp16:
+        assert args.mixed_precision == "fp16"
+        dit_weight_dtype = torch.float16
+    elif args.full_bf16:
+        assert args.mixed_precision == "bf16"
+        dit_weight_dtype = torch.bfloat16
     else:
-        teacher_path = args.teacher_model_path or args.pretrained_model_name_or_path
-        logger.info(f"Loading frozen teacher DiT from {teacher_path}...")
-        teacher_dit = anima_utils.load_anima_model("cpu", teacher_path, args.attn_mode, args.split_attn,
-                                                   "cpu", dit_weight_dtype=None)
-        teacher_dit.requires_grad_(False)
-        teacher_dit.eval()
-
-    is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
-    if is_swapping_blocks:
-        logger.info(f"Enable block swap on generator: blocks_to_swap={args.blocks_to_swap}")
-        dit.enable_block_swap(args.blocks_to_swap, accelerator.device)
-        logger.warning("block swap applies to the generator only; teacher and critic stay resident")
+        dit_weight_dtype = torch.float32
+    dit.to(device=accelerator.device, dtype=dit_weight_dtype)
 
     if not cache_latents:
         vae.requires_grad_(False)
         vae.eval()
         vae.to(accelerator.device, dtype=weight_dtype)
 
-    if args.generator_spectral_norm:
-        n = apply_scaled_spectral_norm(dit.x_embedder) + apply_scaled_spectral_norm(
-            torch.nn.ModuleList(list(dit.blocks[:len(dit.blocks) // 2])))
-        logger.info(f"generator spectral norm: {n} layers")
+    if args.gradient_checkpointing:
+        enable_dmad_block_checkpointing(dit, cpu_offload=args.cpu_offload_checkpointing)
 
-    logger.info("Building DMAD critic (from base weights, pre-LoRA)...")
-    critic = AnimaDMADCritic(
-        dit,
-        critic_num_blocks=args.critic_num_blocks,
-        freeze_backbone=args.critic_freeze_backbone or use_critic_lora,
-        spectral_norm=args.critic_spectral_norm and not use_critic_lora,
-        teacher_gap_route=args.teacher_gap_route,
-        gap_tau=args.gap_tau,
-        gap_num_bands=args.gap_num_bands,
-        critic_max_sigma=args.critic_max_sigma,
-    )
-    if args.critic_spectral_norm and use_critic_lora:
-        # heads only; backbone trains via LoRA
-        n = apply_scaled_spectral_norm(critic.head_real) + apply_scaled_spectral_norm(critic.head_teacher)
-        logger.info(f"critic head spectral norm: {n} layers")
+    is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
+    if is_swapping_blocks:
+        logger.info(f"Enable block swap on the shared backbone: blocks_to_swap={args.blocks_to_swap}")
+        dit.enable_block_swap(args.blocks_to_swap, accelerator.device)
+        dit.move_to_device_except_swap_blocks(accelerator.device)
 
-    # LoRA networks (created after critic init so the critic starts from base weights)
-    network = None
-    if use_gen_lora:
-        _, network = create_lora_network(args, dit, args.network_dim, args.network_alpha, "generator")
-        network.apply_to([], dit, False, True)
-        if args.network_weights is not None:
-            info = network.load_weights(args.network_weights)
-            accelerator.print(f"load generator LoRA weights from {args.network_weights}: {info}")
+    # Role LoRAs are injected on the device-resident backbone, AFTER all casts.
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    dmad = AnimaDmad(args, dit, accelerator.device, rank=rank, world=world, autocast_ctx=accelerator.autocast)
+    logger.info(f"DMAD roles: student {sum(p.numel() for p in dmad.gen_named.values()):,} params, "
+                f"disc {sum(p.numel() for p in dmad.disc_named.values()):,} params; student sigmas "
+                f"{[round(s, 4) for s in dmad.student_sigmas]}; teacher sigmas "
+                f"{[round(s, 4) for s in dmad.teacher_sigmas]}")
+    accelerator.print(f"teacher: {'cached LMDB' if use_teacher_cache else 'backbone (role None)'} "
+                      f"+ {'frozen LoRA ' + str(args.teacher_lora_path) if args.teacher_lora_path else 'no teacher LoRA'}; "
+                      f"teacher steps {args.teacher_steps}, shift {args.dmad_flow_shift}")
 
-    critic_network = None
-    if use_critic_lora:
-        _, critic_network = create_lora_network(
-            args, critic.blocks,
-            args.dmad_critic_lora_dim,
-            args.dmad_critic_lora_alpha if args.dmad_critic_lora_alpha is not None else args.dmad_critic_lora_dim,
-            "critic backbone",
-        )
-        critic_network.apply_to([], critic.blocks, False, True)
+    # identical replicas across ranks (moss does the same after inject)
+    broadcast_params(list(dmad.gen_named.values()) + list(dmad.disc_named.values()))
+    dmad.ema = PowerEMA(dmad.gen_named, args.dmad_ema_sigma_rel)
 
-    # requires_grad mask of the critic backbone/heads (frozen backbone stays
-    # frozen when the turn flips it back on; LoRA params live on critic_network)
-    critic_grad_mask = {n: p.requires_grad for n, p in critic.named_parameters()}
-
-    def set_critic_requires_grad(mod, flag: bool):
-        if not flag:
-            mod.requires_grad_(False)
-        else:
-            for n, p in mod.named_parameters():
-                p.requires_grad_(critic_grad_mask.get(n, True))
-
-    if network is None:
-        param_groups = anima_train_utils.get_anima_param_groups(
-            dit, base_lr=args.learning_rate, self_attn_lr=args.self_attn_lr, cross_attn_lr=args.cross_attn_lr,
-            mlp_lr=args.mlp_lr, mod_lr=args.mod_lr, llm_adapter_lr=args.llm_adapter_lr)
-        n_gen_trainable = sum(p.numel() for group in param_groups for p in group["params"])
-    else:
-        param_groups, lr_descriptions = network.prepare_optimizer_params_with_multiple_te_lrs(
-            None, args.learning_rate, args.learning_rate)
-        accelerator.print(f"generator LoRA groups: {lr_descriptions}")
-        n_gen_trainable = sum(p.numel() for group in param_groups for p in group["params"])
-    accelerator.print(f"number of trainable generator parameters: {n_gen_trainable:,}")
-    n_critic_trainable = sum(p.numel() for p in critic.parameters() if p.requires_grad)
-    if critic_network is not None:
-        n_critic_trainable += sum(p.numel() for p in critic_network.parameters() if p.requires_grad)
-    accelerator.print(f"number of trainable critic parameters: {n_critic_trainable:,}")
-
-    _, _, optimizer_gen = optimizer_util.get_optimizer(args, trainable_params=param_groups)
-    optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer_gen, args)
-    critic_train_params = [p for p in critic.parameters() if p.requires_grad]
-    if critic_network is not None:
-        critic_train_params += [p for p in critic_network.parameters() if p.requires_grad]
-    optimizer_critic = torch.optim.AdamW(
-        critic_train_params,
-        lr=args.guidance_lr, betas=(args.dmad_adam_beta1, args.dmad_adam_beta2), weight_decay=0.01)
-    scheduler_critic = constant_with_warmup(optimizer_critic, args.dmad_warmup_steps)
+    gen_params = list(dmad.gen_named.values())
+    disc_params = list(dmad.disc_named.values())
+    betas = (args.dmad_adam_beta1, args.dmad_adam_beta2)
+    gen_opt = torch.optim.AdamW([{"params": gen_params, "base_lr": args.learning_rate}],
+                                lr=args.learning_rate, betas=betas, weight_decay=args.dmad_weight_decay)
+    disc_opt = torch.optim.AdamW([{"params": disc_params, "base_lr": args.disc_lr}],
+                                 lr=args.disc_lr, betas=betas, weight_decay=args.dmad_weight_decay)
 
     train_dataset_group.set_current_strategies()
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())
@@ -517,54 +404,9 @@ def train(args):
         args.max_train_steps = args.max_train_epochs * math.ceil(
             len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps)
     train_dataset_group.set_max_train_steps(args.max_train_steps)
-    lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer_gen, accelerator.num_processes)
-
-    dit_weight_dtype = weight_dtype
-    if args.full_fp16:
-        assert args.mixed_precision == "fp16"
-    elif args.full_bf16:
-        assert args.mixed_precision == "bf16"
-    else:
-        dit_weight_dtype = torch.float32
-    dit.to(dit_weight_dtype)
-    if teacher_dit is not None:
-        teacher_dit.to(accelerator.device, dtype=weight_dtype)
-    critic.to(dit_weight_dtype)
-
-    if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
-        qwen3_text_encoder.to(accelerator.device)
-    clean_memory_on_device(accelerator.device)
-
-    dit = accelerator.prepare(dit, device_placement=[not is_swapping_blocks])
-    if is_swapping_blocks:
-        accelerator.unwrap_model(dit).move_to_device_except_swap_blocks(accelerator.device)
-    critic = accelerator.prepare(critic)
-    if network is not None:
-        network = accelerator.prepare(network)
-    if critic_network is not None:
-        critic_network = accelerator.prepare(critic_network)
-    optimizer_gen, optimizer_critic, train_dataloader, lr_scheduler, scheduler_critic = accelerator.prepare(
-        optimizer_gen, optimizer_critic, train_dataloader, lr_scheduler, scheduler_critic)
-
-    if args.full_fp16:
-        accelerator_setup.patch_accelerator_for_fp16_training(accelerator)
-    args_util.resume_from_local_or_hf_if_specified(accelerator, args)
-
-    # Trainable generator params live on the LoRA network (LoRA mode) or the DiT.
-    gen_holder = network if network is not None else dit
-    gen_ema_params = [p.detach().clone() for p in accelerator.unwrap_model(gen_holder).parameters()
-                      if p.requires_grad]
-
-    def gen_clip_params():
-        if network is not None:
-            return [p for p in accelerator.unwrap_model(network).parameters() if p.requires_grad]
-        return accelerator.unwrap_model(dit).parameters()
-
-    def critic_clip_params():
-        params = [p for p in accelerator.unwrap_model(critic).parameters() if p.requires_grad]
-        if critic_network is not None:
-            params += [p for p in accelerator.unwrap_model(critic_network).parameters() if p.requires_grad]
-        return params
+    accelerator.print(f"number of trainable generator (student role) parameters: {sum(p.numel() for p in gen_params):,}")
+    accelerator.print(f"number of trainable discriminator (disc role + heads) parameters: {sum(p.numel() for p in disc_params):,}")
+    train_dataloader = accelerator.prepare(train_dataloader)
 
     # Cached teacher latents (Q): independent cycling loader.
     teacher_iter = None
@@ -602,8 +444,6 @@ def train(args):
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0,
                         disable=not accelerator.is_local_main_process, desc="steps")
     global_step = 0
-    noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
     if accelerator.is_main_process:
         init_kwargs = {}
@@ -615,251 +455,192 @@ def train(args):
                                   config=args_util.get_sanitized_config_or_none(args), init_kwargs=init_kwargs)
 
     if is_swapping_blocks:
-        accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
-
-    optimizer_eval_fn()
-    anima_train_utils.sample_images(accelerator, args, 0, global_step, dit, vae, qwen3_text_encoder,
-                                    tokenize_strategy, text_encoding_strategy, sample_prompts_te_outputs)
-    optimizer_train_fn()
-
-    unwrapped_dit = accelerator.unwrap_model(dit)
-    logger.info(f"dit device: {unwrapped_dit.device}, dtype: {unwrapped_dit.dtype}")
+        dit.prepare_block_swap_before_forward()
 
     loss_recorder = logging_util.LossRecorder()
 
-    def lora_metadata(step, epoch_no):
-        from library import model_io
+    def render_samples(epoch_no, steps_no):
+        """Sample previews with the EMA student (moss-style swap), live at step 0."""
+        set_lora_role(dit, "default")
+        dmad.set_model_mode(train=False)
+        swapped = False
+        if dmad.ema.count > 0:
+            dmad.swap_ema()
+            swapped = True
+        anima_train_utils.sample_images(accelerator, args, epoch_no, steps_no, dit, vae, qwen3_text_encoder,
+                                        tokenize_strategy, text_encoding_strategy, sample_prompts_te_outputs)
+        if swapped:
+            dmad.swap_ema()
+        dmad.set_model_mode(train=True)
 
-        meta = {
-            "ss_network_module": args.network_module,
-            "ss_network_dim": str(args.network_dim),
-            "ss_network_alpha": str(args.network_alpha),
-            "ss_steps": str(step),
-            "ss_epoch": str(epoch_no),
-        }
+    render_samples(0, global_step)
+
+    # micro-batch iteration with epoch bookkeeping
+    it = iter(train_dataloader)
+    epoch_no = 0
+    epoch_end_pending = False
+
+    def next_batch():
+        nonlocal it, epoch_no, epoch_end_pending
         try:
-            sai = model_io.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
-            meta.update(sai)
-        except Exception as e:
-            logger.warning(f"sai model spec metadata failed: {e}")
-        return meta
+            return next(it)
+        except StopIteration:
+            epoch_end_pending = True
+            epoch_no += 1
+            it = iter(train_dataloader)
+            return next(it)
 
-    def save_ema_lora(nw, ema_params, ckpt_file, metadata):
-        from safetensors.torch import save_file as safetensors_save
-
-        live_sd = nw.state_dict()
-        ema_sd = dict(live_sd)
-        for (name, _), s in zip([(n, p) for n, p in nw.named_parameters() if p.requires_grad], ema_params):
-            if name in ema_sd:
-                ema_sd[name] = s.cpu()
-        for k, v in list(ema_sd.items()):
-            if torch.is_tensor(v) and v.is_floating_point():
-                ema_sd[k] = v.detach().clone().to("cpu").to(save_dtype).contiguous()
-        safetensors_save(ema_sd, ckpt_file, metadata=dict(metadata))
-
-    def save_dmad(step, epoch, is_epoch_end):
-        accelerator.wait_for_everyone()
-        if not accelerator.is_main_process:
-            return
-        os.makedirs(args.output_dir, exist_ok=True)
-        base = args.output_name or "anima-dmad"
-        if network is None:
-            anima_train_utils.save_anima_model_on_epoch_end_or_stepwise(
-                args, is_epoch_end, accelerator, save_dtype, epoch, num_train_epochs, step,
-                accelerator.unwrap_model(dit))
-            # extra: EMA generator + critic weights next to the main checkpoint
-            try:
-                from safetensors.torch import save_file as safetensors_save
-                live = {k: v.detach().cpu() for k, v in accelerator.unwrap_model(dit).state_dict().items()}
-                ema_sd = dict(live)
-                for (name, _), s in zip([(n, p) for n, p in accelerator.unwrap_model(dit).named_parameters() if p.requires_grad],
-                                        gen_ema_params):
-                    if name in ema_sd:
-                        ema_sd[name] = s.cpu()
-                meta = {"format": "pt"}
-                safetensors_save({("net." + k): v.contiguous().to(save_dtype) for k, v in ema_sd.items()},
-                                 os.path.join(args.output_dir, f"{base}_ema_{step:06d}.safetensors"), metadata=meta)
-            except Exception as e:
-                logger.warning(f"extra DMAD EMA checkpoint save failed: {e}")
+    def encode_cond(batch):
+        """latents (4D), cond tuple."""
+        if "latents" in batch and batch["latents"] is not None:
+            latents = batch["latents"].to(accelerator.device, dtype=dit_weight_dtype)
+            if latents.ndim == 5:
+                latents = latents.squeeze(2)
         else:
-            metadata = lora_metadata(step, epoch)
-            accelerator.unwrap_model(network).save_weights(
-                os.path.join(args.output_dir, f"{base}_{step:06d}.safetensors"), save_dtype, dict(metadata))
-            save_ema_lora(accelerator.unwrap_model(network), gen_ema_params,
-                          os.path.join(args.output_dir, f"{base}_ema_{step:06d}.safetensors"), metadata)
-        # critic weights next to the main checkpoint
-        try:
-            from safetensors.torch import save_file as safetensors_save
-            safetensors_save({k: v.detach().cpu().contiguous() for k, v in
-                              accelerator.unwrap_model(critic).state_dict().items()},
-                             os.path.join(args.output_dir, f"{base}_critic_{step:06d}.safetensors"),
-                             metadata={"format": "pt"})
-            if critic_network is not None:
-                accelerator.unwrap_model(critic_network).save_weights(
-                    os.path.join(args.output_dir, f"{base}_critic_lora_{step:06d}.safetensors"),
-                    save_dtype, {"format": "pt", "ss_network_module": args.network_module,
-                                 "ss_network_dim": str(args.dmad_critic_lora_dim),
-                                 "ss_network_alpha": str(args.dmad_critic_lora_alpha
-                                                         if args.dmad_critic_lora_alpha is not None
-                                                         else args.dmad_critic_lora_dim)})
-        except Exception as e:
-            logger.warning(f"extra DMAD critic checkpoint save failed: {e}")
+            with torch.no_grad():
+                images = batch["images"].to(accelerator.device, dtype=weight_dtype)
+                latents = vae.encode_pixels_to_latents(images).to(accelerator.device, dtype=dit_weight_dtype)
+            if torch.any(torch.isnan(latents)):
+                latents = torch.nan_to_num(latents, 0, out=latents)
+        te_list = batch.get("text_encoder_outputs_list", None)
+        if te_list is not None:
+            dropout_rates = te_list[-1]
+            te_list = te_list[:-1]
+            te_list = text_encoding_strategy.drop_cached_text_encoder_outputs(*te_list, caption_dropout_rates=dropout_rates)
+            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = te_list
+        else:
+            input_ids_list = batch["input_ids_list"]
+            with torch.no_grad():
+                prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
+                    tokenize_strategy, [qwen3_text_encoder], input_ids_list)
+        prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype)
+        attn_mask = attn_mask.to(accelerator.device)
+        t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
+        t5_attn_mask = t5_attn_mask.to(accelerator.device)
+        return latents, (prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask)
 
-    for epoch in range(num_train_epochs):
-        accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
-        current_epoch.value = epoch + 1
-        accelerator.unwrap_model(dit).train()
-        accelerator.unwrap_model(critic).train()
+    accum = args.gradient_accumulation_steps
+    warmup_eval = lambda n: ramp(n, args.dmad_warmup_steps)
 
-        for step, batch in enumerate(train_dataloader):
-            current_step.value = global_step
-            with accelerator.accumulate(dit):
-                if "latents" in batch and batch["latents"] is not None:
-                    latents = batch["latents"].to(accelerator.device, dtype=dit_weight_dtype)
-                    if latents.ndim == 5:
-                        latents = latents.squeeze(2)
-                else:
-                    with torch.no_grad():
-                        images = batch["images"].to(accelerator.device, dtype=weight_dtype)
-                        latents = vae.encode_pixels_to_latents(images).to(accelerator.device, dtype=dit_weight_dtype)
-                    if torch.any(torch.isnan(latents)):
-                        latents = torch.nan_to_num(latents, 0, out=latents)
+    dit.train()
 
-                te_list = batch.get("text_encoder_outputs_list", None)
-                if te_list is not None:
-                    dropout_rates = te_list[-1]
-                    te_list = te_list[:-1]
-                    te_list = text_encoding_strategy.drop_cached_text_encoder_outputs(*te_list, caption_dropout_rates=dropout_rates)
-                    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = te_list
-                else:
-                    input_ids_list = batch["input_ids_list"]
-                    with torch.no_grad():
-                        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
-                            tokenize_strategy, [qwen3_text_encoder], input_ids_list)
+    for _step in range(args.max_train_steps):
+        step_started = time.monotonic()
+        train_gen = global_step >= args.disc_warmup_steps
+        scale = warmup_eval(dmad.ema.count) if train_gen else 0.0
+        for group in gen_opt.param_groups:
+            group["lr"] = group["base_lr"] * scale
+        for group in disc_opt.param_groups:
+            group["lr"] = group["base_lr"] * warmup_eval(global_step)
 
-                prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype)
+        stats, items, teacher_seconds = [], [], 0.0
+        gen_opt.zero_grad(set_to_none=True)
+
+        # ---- generator turn (micro-batches accumulated) ----
+        for _ in range(accum):
+            batch = next_batch()
+            latents, cond = encode_cond(batch)
+            noise = torch.randn_like(latents)
+            if use_teacher_cache:
+                t_batch = next(teacher_iter)
+                teacher_q = t_batch["latents"].to(accelerator.device, dtype=dit_weight_dtype)
+                with torch.no_grad():
+                    t_tokens = tokenize_strategy.tokenize(t_batch["prompt"])
+                    tm, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
+                        tokenize_strategy, [qwen3_text_encoder], t_tokens)
+                tm = tm.to(accelerator.device, dtype=dit_weight_dtype)
                 attn_mask = attn_mask.to(accelerator.device)
                 t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
                 t5_attn_mask = t5_attn_mask.to(accelerator.device)
-                cond = (prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask)
+                teacher_cond = (tm, attn_mask, t5_input_ids, t5_attn_mask)
+            else:
+                mark = time.monotonic()
+                teacher_q = dmad.teacher_sample(cond, torch.randn_like(latents), neg_cond=neg_cond)
+                teacher_seconds += time.monotonic() - mark
+                teacher_cond = cond
 
-                noise = torch.randn_like(latents)
-                critic_mod = accelerator.unwrap_model(critic)
+            item, record = dmad.generator_step(cond, teacher_cond, noise, latents, teacher_q, accum, train_gen)
+            items.append(item)
+            stats.append(record)
 
-                # ---- generator turn (critic frozen) ----
-                set_critic_requires_grad(critic_mod, False)
-                with accelerator.autocast():
-                    gen_latents, _ = student_forward(accelerator.unwrap_model(dit), noise, cond, args,
-                                                     real_latents=latents, dtype=dit_weight_dtype)
-                    gen_losses = critic_mod.compute_generator_loss(gen_latents, *cond)
-                    gen_loss = (gen_losses["gen_teacher_loss"] * args.teacher_loss_weight
-                                + gen_losses["gen_real_loss"] * args.real_loss_weight)
-                accelerator.backward(gen_loss)
-                if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                    accelerator.clip_grad_norm_(gen_clip_params(), args.max_grad_norm)
-                optimizer_gen.step()
-                lr_scheduler.step()
-                optimizer_gen.zero_grad(set_to_none=True)
-                optimizer_critic.zero_grad(set_to_none=True)
+        gen_norm = torch.zeros((), device=accelerator.device)
+        if train_gen:
+            gen_norm = clip_step(gen_params, gen_opt, args.max_grad_norm, "generator")
+            dmad.ema.update(dmad.gen_named)
 
-                # EMA update
-                if accelerator.sync_gradients:
-                    total_batch = gen_latents.shape[0] * accelerator.num_processes
-                    cur_nimg = (global_step + 1) * total_batch
-                    ema_nimg = args.generator_ema_kimg * 1000
-                    if args.generator_ema_rampup > 0:
-                        ema_nimg = min(ema_nimg, cur_nimg * args.generator_ema_rampup)
-                    decay = 0.5 ** (total_batch / max(ema_nimg, 1e-8))
-                    with torch.no_grad():
-                        live_params = [p for p in accelerator.unwrap_model(gen_holder).parameters() if p.requires_grad]
-                        for s, p in zip(gen_ema_params, live_params):
-                            s.lerp_(p.detach(), 1.0 - decay)
+        # ---- discriminator turn ----
+        disc_opt.zero_grad(set_to_none=True)
+        gap_stats = []
+        disc_norm = torch.zeros((), device=accelerator.device)
+        for item in items:
+            record, gap_part = dmad.disc_step(item, accum)
+            stats.append(record)
+            gap_stats.append(gap_part)
+        disc_norm = clip_step(disc_params, disc_opt, args.max_grad_norm, "discriminator")
+        dmad.set_trainable(gen=False, disc=False)
+        dmad.update_gap(torch.cat(gap_stats, 1))
+        del items
 
-                # ---- critic turn ----
-                set_critic_requires_grad(critic_mod, True)
-                if use_teacher_cache:
-                    t_batch = next(teacher_iter)
-                    teacher_q = t_batch["latents"].to(accelerator.device, dtype=dit_weight_dtype)
-                    with torch.no_grad():
-                        t_tokens = tokenize_strategy.tokenize(t_batch["prompt"])
-                        t_enc = text_encoding_strategy.encode_tokens(
-                            tokenize_strategy, [qwen3_text_encoder], t_tokens)
-                    teacher_cond = (t_enc[0].to(accelerator.device, dtype=dit_weight_dtype),
-                                    t_enc[1].to(accelerator.device),
-                                    t_enc[2].to(accelerator.device, dtype=torch.long),
-                                    t_enc[3].to(accelerator.device))
-                else:
-                    with torch.no_grad():
-                        teacher_noise = torch.randn_like(latents)
-                        teacher_q = euler_sample_x0(
-                            teacher_dit, teacher_noise, prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask,
-                            steps=max(1, int(args.teacher_steps)), flow_shift=float(args.teacher_flow_shift),
-                            guidance_scale=float(args.teacher_cfg), neg_cond=neg_cond)
-                        teacher_q = teacher_q.to(dtype=dit_weight_dtype)
-                    teacher_cond = cond
-                with accelerator.autocast():
-                    critic_losses, critic_logs = critic_mod.compute_critic_loss(
-                        gen_latents.detach(), prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask,
-                        latents, cond, teacher_q, teacher_cond)
-                    critic_loss = critic_losses["critic_loss"] * args.critic_loss_weight
-                accelerator.backward(critic_loss)
-                if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                    accelerator.clip_grad_norm_(critic_clip_params(), args.max_grad_norm)
-                optimizer_critic.step()
-                scheduler_critic.step()
-                optimizer_critic.zero_grad(set_to_none=True)
-                optimizer_gen.zero_grad(set_to_none=True)
+        # ---- stats / logging ----
+        keys = sorted({k for s in stats for k in s})
+        values = [sum(s.get(k, 0.0) for s in stats) / len(stats) for k in keys]
+        if world > 1:
+            reduced = torch.tensor(values, device=accelerator.device)
+            dist.all_reduce(reduced, op=dist.ReduceOp.AVG)
+            values = reduced.tolist()
+        metrics = dict(zip(keys, values))
+        current_loss = metrics.get("loss_g", 0.0) + metrics.get("loss_d", 0.0)
+        loss_recorder.add(epoch=epoch_no, step=global_step, loss=current_loss)
 
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-                optimizer_eval_fn()
-                anima_train_utils.sample_images(accelerator, args, None, global_step, dit, vae, qwen3_text_encoder,
-                                                tokenize_strategy, text_encoding_strategy, sample_prompts_te_outputs)
-                if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
-                    save_dmad(global_step, epoch, False)
-                optimizer_train_fn()
+        peak_gpu = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+        seconds = time.monotonic() - step_started
 
-            current_loss = gen_loss.detach().item() + critic_loss.detach().item()
-            if len(accelerator.trackers) > 0:
-                logs = {"loss": current_loss,
-                        "gen_teacher_loss": gen_losses["gen_teacher_loss"].detach().item(),
-                        "gen_real_loss": gen_losses["gen_real_loss"].detach().item(),
-                        "critic_loss": critic_losses["critic_loss"].detach().item()}
-                for k, v in critic_logs.items():
-                    logs[k] = v.item() if torch.is_tensor(v) else v
-                accelerator.log(logs, step=global_step)
-            loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-            progress_bar.set_postfix(**{"avr_loss": loss_recorder.moving_average})
-            if global_step >= args.max_train_steps:
-                break
-
+        progress_bar.update(1)
+        global_step += 1
         if len(accelerator.trackers) > 0:
-            accelerator.log({"loss/epoch": loss_recorder.moving_average, "epoch": epoch + 1}, step=global_step)
-        accelerator.wait_for_everyone()
-        optimizer_eval_fn()
-        if args.save_every_n_epochs is not None:
-            save_dmad(global_step, epoch, True)
-        anima_train_utils.sample_images(accelerator, args, epoch + 1, global_step, dit, vae, qwen3_text_encoder,
-                                        tokenize_strategy, text_encoding_strategy, sample_prompts_te_outputs)
+            logged = {"loss": current_loss, "gen_grad_norm": gen_norm.item(), "disc_grad_norm": disc_norm.item(),
+                      "lr_scale": scale, "train_gen": train_gen, "peak_gpu_bytes": peak_gpu,
+                      "seconds": seconds, "teacher_seconds": teacher_seconds}
+            logged.update(metrics)
+            logs_gap = dmad.gap.gap.tolist()
+            for b, v in enumerate(logs_gap):
+                if math.isnan(v):
+                    continue
+                logged[f"gap_b{b}"] = v
+            accelerator.log(logged, step=global_step)
+        progress_bar.set_postfix(**{"avr_loss": loss_recorder.moving_average})
+        if accelerator.is_main_process:
+            gen_part = (f"G={metrics.get('loss_g', 0.0):.3f} hT={metrics.get('g_h_teacher', 0.0):.2f} "
+                        f"hR={metrics.get('g_h_real', 0.0):.2f} w={metrics.get('teacher_weight', 0.0):.2f} "
+                        f"k={metrics.get('k', 0)} |g|={gen_norm.item():.3g} " if train_gen else "")
+            accelerator.print(f"[update {global_step}/{args.max_train_steps}] "
+                              f"D={metrics.get('loss_d', 0.0):.3f} (T {metrics.get('loss_d_teacher', 0.0):.3f} "
+                              f"R {metrics.get('loss_d_real', 0.0):.3f}) {gen_part}|d|={disc_norm.item():.3g} "
+                              f"teacher {teacher_seconds:.1f}s {seconds:.1f}s peak={peak_gpu / 2**30:.0f}GiB")
 
-    is_main_process = accelerator.is_main_process
-    dit = accelerator.unwrap_model(dit)
-    if network is not None:
-        network = accelerator.unwrap_model(network)
-    accelerator.end_training()
-    optimizer_eval_fn()
-    if args.save_state or args.save_state_on_train_end:
-        checkpoint_io.save_state_on_train_end(args, accelerator)
-    del accelerator
-    if is_main_process:
-        if network is None:
-            anima_train_utils.save_anima_model_on_train_end(args, save_dtype, epoch, global_step, dit)
-        else:
-            base = args.output_name or "anima-dmad"
-            metadata = lora_metadata(global_step, epoch)
-            network.save_weights(os.path.join(args.output_dir, f"{base}.safetensors"), save_dtype, dict(metadata))
+        if args.sample_every_n_steps is not None and global_step % args.sample_every_n_steps == 0:
+            render_samples(None, global_step)
+        if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+            save_dmad(args, accelerator, dmad, global_step, epoch_no + 1)
+
+        if epoch_end_pending:
+            epoch_end_pending = False
+            accelerator.print(f"\nepoch {epoch_no} complete")
+            accelerator.wait_for_everyone()
+            render_samples(epoch_no, global_step)
+            if args.save_every_n_epochs is not None:
+                save_dmad(args, accelerator, dmad, global_step, epoch_no)
+            if len(accelerator.trackers) > 0:
+                accelerator.log({"loss/epoch": loss_recorder.moving_average, "epoch": epoch_no}, step=global_step)
+
+    # ---- final save ----
+    accelerator.wait_for_everyone()
+    set_lora_role(dit, "default")
+    save_dmad(args, accelerator, dmad, global_step, epoch_no + 1)
+    if accelerator.is_main_process:
         logger.info("model saved.")
+
+    accelerator.end_training()
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -879,7 +660,6 @@ def setup_parser() -> argparse.ArgumentParser:
     sai_model_spec.add_model_spec_arguments(parser)
     add_dmad_arguments(parser)
     parser.add_argument("--cpu_offload_checkpointing", action="store_true")
-    parser.add_argument("--unsloth_offload_checkpointing", action="store_true")
     parser.add_argument("--skip_latents_validity_check", action="store_true", help="[Deprecated] use 'skip_cache_check' instead")
     return parser
 

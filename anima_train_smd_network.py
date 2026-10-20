@@ -1,110 +1,73 @@
 """Anima SMD few-step distillation (data-free, LoRA + training-only Pivot).
 
-Simplified Matching Distillation (arXiv:2610.18472, Microsoft Research)
-distills a pretrained rectified-flow teacher into a K-step deterministic
-student without any images (captions/prompts only). Notably simpler than
-trajectory/DMD-based recipes: entirely regression-based, no fake score
-model, no adversarial loss, no architecture change at inference.
+Simplified Matching Distillation (arXiv:2610.18472) distills the frozen Anima
+rectified-flow DiT into a K-step deterministic student using only captions --
+no images, no fake-score model, no adversarial loss. The teacher is the frozen
+base with the student LoRA multiplier zeroed; the student is one LoRA adapter
+on the shared frozen base (``networks/lora_anima.py``).
 
-Anima convention (same as the regular trainer / TDM script):
-``x_t = (1-t) x0 + t eps``, the DiT predicts ``v = eps - x0`` with ``t`` in
-[0, 1], Euler steps run ``t: 1 -> 0`` as ``x += v * (t_prev - t)``.
+Per transition ``t_i -> t_{i+1}`` (paper Algorithm 2; dt < 0):
 
-Parts of the method (paper Sec. 3):
+  - one with-grad student prediction ``v_th`` at the transition start;
+  - Q teacher queries on the student's own path. With
+    ``--smd_query_sampling raw_t`` (reference default) alpha ~ U(0,1) is
+    sampled in raw-t space and warped to the query sigma; ``sigma``
+    interpolates the warped sigma directly. Queries are sorted per sample
+    (order is irrelevant to the loss);
+  - per-transition loss ``0.5 * smd_w_rescale / K * (imitation - lambda * repulsion)``
+    where the teacher target uses CFG ``--smd_cfg`` and the low-CFG reference
+    ``ev`` uses ``--smd_ref_cfg``;
+  - the rollout continues with the coarse student step (no Pivot, no grad);
+    each transition backprops separately.
 
-  1. Simple on-policy baseline (Sec. 3.1, Algorithm 1). Roll out the current
-     student K steps from noise (no grad across transitions). For EVERY
-     coarse transition ``t_i -> t_{i+1}`` (``dt = t_{i+1} - t_i < 0``) make
-     ONE student prediction with grad, ``v_th = v(x_t, t_i)``, then query the
-     frozen teacher at Q intermediate states on the student's own transition
-     and regress the SAME student prediction against each teacher velocity::
+``--smd_step_granularity segment`` (reference default) takes one optimizer
+step per transition and reuses the batch + rollout state across the K
+transitions, so ``--max_train_steps`` counts segments; ``rollout`` takes one
+step per full K-transition rollout (paper Algorithm 2's mean over transitions).
 
-         for alpha ~ U(0, 1) (paper symbol: tau; Q query points, per transition):
-             s   = t_i + alpha * dt                  # query time
-             x_s = x_t + alpha * dt * v_th           # query state
-             L  += || v_th - v_T(x_s, s) ||_2
+Pivot (Sec. 3.2): a training-only proxy predicts P basis coefficients ``a_m``
+from the features of the ``--smd_pivot_hook_layer``-th block from the end,
+bending the interior query path ``v = v_th + sum_m a_m b_m(alpha)`` while the
+transition endpoints stay untouched (``B_m(0) = B_m(1) = 0``). Architecture:
+copied student tail blocks -> the student's final AdaLN norm/modulation ->
+a zero-initialized expanded output head (reference Pivot; no extra input
+projection). ``--smd_basis polynomial`` is the paper Eq. 16/22 family
+(reference ``taylor_path``, ``sqrt_n`` scaled); ``--smd_basis piecewise`` is
+the Table 15 Qwen-Image / reference ``centered_dx`` family. Never evaluated at
+inference; use ``--smd_no_pivot`` for the plain baseline.
 
-  2. Pivot proxy (Sec. 3.2, Algorithm 2). Within a transition the teacher
-     velocity can curve a lot, so a single student prediction cannot fit all
-     local targets without jitter. Pivot is a TRAINING-ONLY residual proxy
-     predicting P zero-integral basis coefficients ``a_m`` (same shape as the
-     velocity) once per transition from the features of the K-th block from
-     the end of the student (``--smd_pivot_hook_layer``, paper default K=4).
-     It processes those features with M Transformer blocks copied from the
-     final M student blocks (``--smd_pivot_blocks``, paper default M=3) and a
-     zero-initialized output projection, so training starts exactly at the
-     simple baseline. Inside the transition it bends the path::
+The paper's image recipe (Table 15, Qwen-Image row) uses rank/alpha 256 LoRA
+(``--network_dim 256 --network_alpha 256``), a full-rank Pivot with M=3 blocks
+from hook -4, P=4, Q=2, CFG 5.0 / ref 1.0, lambda 0.2, LR 1e-4 (student and
+pivot), and 1000 iterations with 100 warm-up. The shaped defaults here match
+that recipe except the LoRA rank (repo default 32), the basis family (the
+reference's generic ``taylor_path``; pass ``--smd_basis piecewise`` for the
+Qwen-Image row / ``centered_dx``), and the final step size (1.0 for sampler
+compatibility). AdamW comes from the shared optimizer factory, so pass
+``--optimizer_args "weight_decay=0"`` for the paper's zero decay.
 
-         v(alpha) = v_th + sum_m a_m b_m(alpha)                    # velocity
-         x_s    = x_t + alpha*dt*v_th + dt * sum_m a_m B_m(alpha)  # state
-         B_m(u) = u(1-u)(2u-1)^(m-1),  b_m = dB_m/du               # poly basis
+Deployment: CFG-free K Euler steps on the training schedule -- uniform raw
+knots 1 -> 0 with the final segment scaled by ``--smd_final_step_size_scale``
+(1.0 default = do_sample-compatible uniform grid), then the rational shift
+``S(t) = shift*t / (1 + (shift-1)*t)``. Use the same scale + K + shift the
+training used; guidance_scale = 1.0 at inference (CFG is baked in).
 
-     Since B_m(0) = B_m(1) = 0 the transitions endpoints (what the deployed
-     student step is!) are untouched; Pivot only shapes the interior query
-     states/velocities and is never evaluated at inference.
+Run (single GPU; prompts file only)::
 
-  3. Repulsion from a reference prediction (Sec. 3.3). At each query point,
-     besides the guided teacher target ``v`` (CFG ``--smd_cfg``), the teacher
-     ALSO predicts a weaker reference ``ev`` at the same state (CFG
-     ``--smd_ref_cfg``, 1.0 = the plain conditional branch). The student is
-     pulled toward the target and pushed away from the reference::
-
-         L = || v(alpha) - vT ||_2 - lambda * || v(alpha) - evT ||_2  (lambda<1)
-
-Like the TDM script, the teacher is the same frozen DiT with the student LoRA
-multiplier zeroed; the student is one trainable LoRA adapter nested on the frozen
-base (``networks/lora_anima.py``). Unlike TDM there is NO fake-score adapter --
-the only extra trainable module is the Pivot.
-
-Default hyper-parameters follow the paper's image-generation recipe
-(App. B Table 15, Qwen-Image row) -- the closest analog to Anima:
-
-    Student LoRA (rank 256, alpha 256)  -- pass --network_dim 256 --network_alpha 256
-    Pivot full-rank, M=3 blocks, hook K=4, Polynomial basis P=4
-    Queries / transition 2 | target CFG 5.0 / reference CFG 1.0 | lambda 0.2
-    AdamW (zero weight decay), LR 1e-4 student and pivot, 100-iter warm-up,
-    constant schedule thereafter, 1000 iterations, 4-NFE student.
-
-NOTE on --smd_final_step_size_scale: its default is 1.0 (uniform raw grid), NOT
-the paper's 0.5. With 1.0 the trained K-step grid is identical to what the
-standard anima sampler builds (``do_sample``: linspace(1,0,K+1) shifted,
-CFG-free at guidance_scale=1.0), so a trained SMD student runs in the EXISTING
-inference code unmodified. Set 0.5 only if you control the deployment sampler.
-
-Deployment sampler (must match training; used for previews here):
-K Euler steps on the schedule ``raw knots 1 -> 0 with the final step scaled
-by --smd_final_step_size_scale (default 1.0 = uniform; 0.5 = paper recipe,
-requires a matching non-uniform sampler)``, shifted with Anima's rational shift
-``S(ts) = shift*ts / (1 + (shift-1)*ts)`` (--smd_shift), CFG-free.
-
-Run (single GPU, data-free -- prompts file only, one caption per line)::
-
-    python anima_train_smd_network.py \
-      --pretrained_model_name_or_path anima-base.safetensors \
-      --qwen3 /path/to/qwen3-0.6b.safetensors --vae /path/to/vae.safetensors \
-      --smd_prompts_file prompts.txt --resolution 512,512 \
-      --network_dim 256 --network_alpha 256 \
+    python anima_train_smd_network.py \\
+      --pretrained_model_name_or_path anima-base.safetensors \\
+      --qwen3 /path/to/qwen3-0.6b.safetensors --vae /path/to/vae.safetensors \\
+      --smd_prompts_file prompts.txt --resolution 512,512 \\
+      --network_dim 256 --network_alpha 256 \\
       --train_batch_size 8 --max_train_steps 1000 --output_dir output/anima-smd-4step
 
-Optimizer/LR/scheduler flags are shared with ``anima_train_network.py``:
-``--learning_rate`` (student; recommended 1e-4, AdamW zero weight decay e.g.
-``--optimizer_args weight_decay``), ``--smd_pivot_lr`` (default 1e-4),
-``--optimizer_type``/``--optimizer_args``, ``--lr_scheduler`` /
-``--lr_warmup_steps`` / ``--lr_decay_steps`` / ..., ``--max_train_steps``,
-``--train_batch_size``, ``--max_grad_norm``, ``--save_every_n_steps``,
-``--seed``.
-
-Per-step losses (``loss`` = imitation - lambda * repulsion, SMD normalizer
-``0.5 * --smd_w_rescale / K``) are logged to ``smd_loss_log.csv``.
-
-Outputs: ``{output_name}_step_<n>.safetensors`` (student LoRA only, same key
-layout as ``anima_train_network.py`` -- directly usable for inference /
-ComfyUI conversion) and ``smd_state_step_<n>.safetensors`` (student LoRA +
-Pivot, ``student.``/``pivot.`` prefixes -- resume with ``--smd_resume_state``).
-With EMA enabled (default, ``--smd_ema_decay``), an extra
-``{output_name}_ema_step_<n>.safetensors`` holds the EMA student LoRA (the
-recommended inference weight), the state file also carries ``ema.`` entries,
-and previews render with the EMA weights.
+Optimizer/LR/scheduler/batch/seed/save flags are shared with
+``anima_train_network.py``. Outputs: ``{output_name}_step_<n>.safetensors``
+(student LoRA, standard layout), ``{output_name}_ema_*`` (EMA weights,
+recommended for inference), ``smd_state_step_<n>.safetensors`` +
+``smd_optim_step_<n>.pt`` (resume via ``--smd_resume_state`` /
+``--smd_resume_optim``), losses in ``smd_loss_log.csv``, preview grids in
+``sample/`` (with ``--smd_eval_every``).
 """
 
 import argparse
@@ -156,82 +119,98 @@ logger = logging.getLogger(__name__)
 def add_smd_arguments(parser: argparse.ArgumentParser):
     g = parser.add_argument_group(
         "SMD distillation",
-        "Simplified Matching Distillation few-step distillation (arXiv:2610.18472). Data-free: training needs only "
-        "--smd_prompts_file. Optimizer/LR/scheduler/batch/steps/clipping flags are shared with anima_train_network.py "
-        "(--learning_rate student, --smd_pivot_lr pivot, --optimizer_type/--optimizer_args, --lr_scheduler/--lr_warmup_steps, "
-        "--train_batch_size, --max_train_steps, --max_grad_norm, --save_every_n_steps, --seed).",
+        "Simplified Matching Distillation few-step distillation (arXiv:2610.18472). Data-free: needs only "
+        "--smd_prompts_file; optimizer/LR/scheduler/batch flags are shared with anima_train_network.py.",
     )
     g.add_argument("--smd_prompts_file", type=str, default=None,
-                   help="Text file with one caption per line. REQUIRED (data-free distillation uses captions only).")
+                   help="Text file with one caption per line. REQUIRED.")
     g.add_argument("--smd_steps", type=int, default=4,
-                   help="K: number of deterministic student steps (NFE at inference) to distill (default: 4).")
+                   help="K: number of deterministic student steps / NFE (default: 4).")
     g.add_argument("--smd_shift", type=float, default=3.0,
-                   help="Rational flow shift for the K-step student schedule (Anima sampling default: 3.0).")
+                   help="Anima rational flow shift for the K-step schedule (default: 3.0).")
     g.add_argument("--smd_final_step_size_scale", type=float, default=1.0,
-                   help="Scale of the LAST Euler step relative to the others on the student schedule. "
-                        "1.0 (default) = uniform raw grid, byte-for-byte the schedule that "
-                        "library/anima_train_utils.do_sample (and standard uniform+shift samplers) build, "
-                        "so NO inference-code changes are needed. The paper's image recipe uses 0.5, but "
-                        "that requires the deployment sampler to reproduce the non-uniform last segment; "
-                        "whichever value is chosen MUST be mirrored at inference.")
+                   help="Scale of the LAST Euler segment; 1.0 = uniform grid matching the standard sampler. "
+                        "A non-1.0 value must be mirrored in the deployment sampler.")
     g.add_argument("--smd_cfg", type=float, default=5.0,
                    help="Teacher CFG scale for the imitation target (paper image recipe: 5.0).")
     g.add_argument("--smd_neg_prompt", type=str, default="",
-                   help="Teacher CFG negative prompt (uncond branch). Default: empty string (standard). "
-                        "Baked into the student permanently since the student is CFG-free.")
+                   help="Teacher CFG negative prompt (baked into the CFG-free student).")
     g.add_argument("--smd_neg_file", type=str, default=None,
-                   help="Optional text file with one negative prompt per line, sampled per batch. Overrides --smd_neg_prompt when given.")
+                   help="One negative prompt per line; overrides --smd_neg_prompt.")
     g.add_argument("--smd_queries", type=int, default=2,
                    help="Q: teacher query points per transition, alpha ~ U(0,1) (paper image recipe: 2).")
+    g.add_argument("--smd_query_sampling", choices=["raw_t", "sigma"], default="raw_t",
+                   help="How query points are placed inside a transition. raw_t (reference default): sample raw t, "
+                        "warp it, and derive the basis alpha from the warped fraction. sigma: interpolate the warped "
+                        "sigma linearly (basis alpha == sampling alpha).")
+    g.add_argument("--smd_query_alpha_mode", choices=["random", "random_endpoint"], default="random",
+                   help="random: alpha ~ U(0,1) (reference default). random_endpoint: each segment queries only "
+                        "alpha=0 or alpha=1, chosen deterministically from (step, segment); requires Q=1.")
     g.add_argument("--smd_imitation_weight", type=float, default=1.0,
-                   help="Weight of the imitation term (paper: 1.0).")
+                   help="Weight of the imitation term.")
     g.add_argument("--smd_repulsion_lambda", type=float, default=0.2,
-                   help="Repulsion weight lambda in (0, 1). 0 disables the repulsion term (paper image recipe: 0.2).")
+                   help="Repulsion weight lambda in [0, 1); 0 disables (paper image recipe: 0.2).")
+    g.add_argument("--smd_repulsion_adaptive", action="store_true",
+                   help="Reference adaptive repulsion gate: scale each sample's repulsion by "
+                        "clamp((d(v,ev)-d(v,vT))/(d(vT,ev)+eps), 0, 1) (detached).")
     g.add_argument("--smd_ref_cfg", type=float, default=1.0,
-                   help="CFG scale of the negative reference prediction ev at each query state (1.0 = plain conditional "
-                        "branch, paper image recipe; 0.0 = unconditional branch).")
+                   help="CFG scale of the reference prediction ev at query states (1.0 = conditional branch).")
+    g.add_argument("--smd_cfg_norm_rescale", action="store_true",
+                   help="Reference cfg_norm_rescale: rescale the CFG-combined velocity to the conditional "
+                        "velocity's per-token (2x2 patch) norm.")
     g.add_argument("--smd_w_rescale", type=float, default=30.0,
-                   help="SMD loss normalizer multiplier: total loss = 0.5 * this / K * (imitation - lambda * repulsion).")
+                   help="Loss normalizer: total = 0.5 * this / K * (imitation - lambda * repulsion).")
     g.add_argument("--smd_beta", type=float, default=1.0,
-                   help="Per-sample velocity distance beta: distance = per-sample MSE ** (beta / 2). beta=2 is plain MSE; "
-                        "beta=1 (paper default) is a Moment-style smoothed L2.")
+                   help="Velocity distance exponent: per-sample MSE ** (beta/2); 2 = MSE, 1 = smoothed L2.")
     g.add_argument("--smd_eps", type=float, default=1e-6,
-                   help="Epsilon smoothing inside the velocity distance (default: 1e-6).")
+                   help="Epsilon smoothing inside the velocity distance.")
+    g.add_argument("--smd_teacher_window_alpha", type=float, default=0.0,
+                   help="Reference teacher_window_alpha: when > 0 the student velocity matched against the teacher "
+                        "is the average over [alpha, alpha+window] instead of the instantaneous value.")
     g.add_argument("--smd_no_pivot", action="store_true",
-                   help="Disable the Pivot proxy and train the plain on-policy baseline (paper Sec. 3.1 ablation).")
+                   help="Train the plain on-policy baseline without the Pivot proxy (paper Sec. 3.1).")
     g.add_argument("--smd_no_repulsion", action="store_true",
-                   help="Disable the repulsion term entirely (same as --smd_repulsion_lambda 0).")
+                   help="Disable the repulsion term (same as --smd_repulsion_lambda 0).")
     # Pivot
     g.add_argument("--smd_pivot_hook_layer", type=int, default=-4,
-                   help="Index (negative) of the student block whose output features feed the Pivot (paper default: -4, "
-                        "i.e. the 4th block from the end; K=1 would be the final block). Must leave at least the M copied "
-                        "blocks after it.")
+                   help="Block index (negative) whose output features feed the Pivot (default: -4). "
+                        "Must leave the copied M blocks after it.")
     g.add_argument("--smd_pivot_blocks", type=int, default=None,
-                   help="M Pivot transformer blocks, copied from the final M student blocks (paper image recipe: 3). "
-                        "Default: derive from --smd_pivot_hook_layer (all blocks after the hook).")
+                   help="M copied Pivot blocks (paper image recipe: 3). Default: all blocks after the hook.")
     g.add_argument("--smd_p", type=int, default=4,
-                   help="P polynomial basis terms for the Pivot residual (paper image recipe: 4).")
+                   help="P residual basis terms for the Pivot (paper image recipe: 4).")
+    g.add_argument("--smd_basis", choices=["polynomial", "piecewise"], default="polynomial",
+                   help="Pivot residual basis family. polynomial: B_m(t)=t(1-t)(2t-1)^(m-1) (paper Eq. 16/22; "
+                        "reference basis_family='taylor_path'). piecewise: centred nodal velocities on P uniform "
+                        "nodes (paper Table 15 Qwen-Image row; reference residual_basis='centered_dx').")
+    g.add_argument("--smd_basis_scaling", choices=["sqrt_n", "none"], default="sqrt_n",
+                   help="Reference residual_scale_mode for the polynomial basis: sqrt_n divides the coefficients "
+                        "by sqrt(P) (reference default). Ignored by the piecewise basis (centered_dx).")
     g.add_argument("--smd_pivot_lr", type=float, default=1e-4,
-                   help="Pivot optimizer LR. Student uses shared --learning_rate (paper image recipe: 1e-4 for both).")
+                   help="Pivot optimizer LR (student uses --learning_rate).")
     g.add_argument("--smd_pivot_lora_rank", type=int, default=None,
-                   help="If set, train the Pivot blocks with LoRA of this rank instead of full-rank "
-                        "(H3-style recipe). The input projection and the zero-init output projection always "
-                        "stay fully trainable.")
+                   help="If set, train the Pivot blocks via LoRA of this rank (the final norm/modulation and "
+                        "output projection stay full-rank).")
     # Resume / eval / EMA (same conventions as the TDM script)
     g.add_argument("--smd_resume_state", type=str, default=None,
                    help="Resume student LoRA (+Pivot) from a smd_state_*.safetensors file.")
     g.add_argument("--smd_resume_optim", type=str, default=None,
-                   help="Resume both optimizer (+scheduler) states from a smd_optim_*.pt file.")
-    g.add_argument("--smd_eval_every", type=int, default=0, help="Render K-step student previews every N steps (0 = disabled, default).")
+                   help="Resume both optimizers (+schedulers) from a smd_optim_*.pt file.")
+    g.add_argument("--smd_eval_every", type=int, default=0, help="Render K-step student previews every N steps (0 = disabled).")
     g.add_argument("--smd_preview_n", type=int, default=4, help="Preview images per eval.")
+    g.add_argument("--smd_step_granularity", choices=["segment", "rollout"], default="segment",
+                   help="Optimizer-step granularity. segment (reference default): one optimizer step per "
+                        "transition, with the batch/latent reused across the K transitions of a rollout, so "
+                        "--max_train_steps counts segments. rollout: one optimizer step per full K-transition "
+                        "rollout (paper Algorithm 2 returns the mean over all transitions).")
     g.add_argument("--smd_no_ema", action="store_true",
-                   help="Disable the student EMA shadow (by default an EMA of the student LoRA is kept for previews/saving).")
+                   help="Disable the student EMA shadow (default on; EMA drives previews and *_ema_* saves).")
     g.add_argument("--smd_ema_decay", type=float, default=0.999,
-                   help="EMA decay for the student LoRA shadow (default: 0.999). Updated once per optimizer step.")
+                   help="EMA decay for the student LoRA shadow, updated once per optimizer step.")
     g.add_argument("--smd_ema_warmup", type=int, default=0,
-                   help="Optimizer steps before EMA starts tracking. At this step the EMA is re-synced from the student, then decayed (default: 0).")
+                   help="Optimizer steps before the EMA starts tracking.")
     g.add_argument("--smd_ema_update_every", type=int, default=1,
-                   help="Update the EMA every N optimizer steps (default: 1).")
+                   help="Update the EMA every N optimizer steps.")
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -273,14 +252,12 @@ def parse_resolution(resolution: str | None) -> tuple[int, int]:
     return (s, s)
 
 
-def make_smd_schedule(steps: int, shift: float, final_step_size_scale: float, device) -> torch.Tensor:
-    """K+1 shifted sigmas from 1.0 to 0.0 on the SMD grid (paper Sec. 2/3).
+def make_smd_raw_knots(steps: int, final_step_size_scale: float) -> torch.Tensor:
+    """K+1 raw-t knots from 1.0 to 0.0 (SMD ``compute_raw_grid_knots``).
 
-    Knots are uniform except the final Euler segment, which is scaled by
-    ``final_step_size_scale`` (SMD ``compute_raw_grid_knots``), then Anima's
-    rational shift ``S(t) = shift*t / (1 + (shift-1)*t)`` is applied (same as
-    sampling/do_sample). The resulting values are what both the student and
-    the teacher pass as the timestep input to the DiT.
+    Uniform except the last Euler segment, which is scaled by
+    ``final_step_size_scale``. These are the un-warped times; the DiT never
+    sees them directly -- see :func:`make_smd_schedule`.
     """
     fss = max(float(final_step_size_scale), 1e-4)
     base_seg = 1.0 / (steps - 1 + fss)
@@ -289,43 +266,157 @@ def make_smd_schedule(steps: int, shift: float, final_step_size_scale: float, de
         seg = base_seg * (fss if i == steps - 1 else 1.0)
         raw.append(raw[-1] - seg)
     raw[-1] = 0.0
-    raw = torch.tensor(raw, dtype=torch.float32)
-    if shift != 1.0:
-        raw = (raw * shift) / (1.0 + (shift - 1.0) * raw)
-    return raw.to(device)
+    return torch.tensor(raw, dtype=torch.float32)
 
 
-def poly_basis_eval(coeffs: torch.Tensor, alpha: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Polynomial endpoint-preserving Pivot basis (paper App. A.1 Eq. 22).
+def warp_t(raw_t: torch.Tensor, shift: float) -> torch.Tensor:
+    """Anima/rectified-flow rational time shift ``S(t) = shift*t / (1 + (shift-1)*t)``."""
+    if shift == 1.0:
+        return raw_t
+    return (raw_t * shift) / (1.0 + (shift - 1.0) * raw_t)
 
-    B_m(t) = t(1-t)(2t-1)**(m-1);  b_m = dB_m/dt;  q = sum_m a_m B_m;
-    r = sum_m a_m b_m. B_m(0) = B_m(1) = 0 keeps the transition endpoints
-    fixed for a given coarse student prediction.
 
-    coeffs: [B, P, C, H, W]; alpha: [B] in [0, 1).
-    Returns (q, r), each [B, C, H, W].
+def make_smd_schedule(steps: int, shift: float, final_step_size_scale: float, device) -> torch.Tensor:
+    """K+1 shifted sigmas from 1.0 to 0.0 on the SMD grid (paper Sec. 2/3).
+
+    Raw knots are built by :func:`make_smd_raw_knots`, then Anima's rational
+    shift is applied (same as sampling/do_sample). The resulting values are
+    what both the student and the teacher pass as the timestep input to the
+    DiT. ``--smd_query_sampling raw_t`` additionally needs the raw knots, so
+    they are returned by the caller's separate ``make_smd_raw_knots`` call.
     """
-    B, P = coeffs.shape[:2]
-    # a_m = coeffs[:, m-1] is [B, C, H, W], so alpha broadcasts as [B, 1, 1, 1].
-    # This is the within-transition interpolation parameter the paper writes
-    # as tau in Eqs. 9-16 (query time s = t_i + alpha*dt) and the upstream SMD
-    # code calls alpha (query_alphas / "diagnostic/query/alpha"); naming
-    # follows the code, not the paper symbol, since --network_alpha already
-    # owns "alpha" at the CLI level but not in this loss-local scope.
-    alpha = alpha.to(coeffs.dtype).view(B, 1, 1, 1)
-    two_a_m1 = 2.0 * alpha - 1.0
-    factor = alpha * (1.0 - alpha)
-    q = torch.zeros_like(coeffs[:, 0])
-    r = torch.zeros_like(coeffs[:, 0])
-    for m in range(1, P + 1):
-        a_m = coeffs[:, m - 1]
-        pow_ = two_a_m1 ** (m - 1)
-        q = q + a_m * (factor * pow_)
-        b_m = (1.0 - 2.0 * alpha) * pow_
-        if m >= 2:
-            b_m = b_m + 2.0 * (m - 1) * factor * two_a_m1 ** (m - 2)
-        r = r + a_m * b_m
-    return q, r
+    return warp_t(make_smd_raw_knots(steps, final_step_size_scale), shift).to(device)
+
+
+class SMDBasis:
+    """Zero-mean, endpoint-preserving residual basis for the training Pivot.
+
+    Both families are the reference SMD bases evaluated on the Anima latent
+    layout; they return a *unit-dt* path correction ``q`` (``dt`` is applied
+    by the caller) and the instantaneous velocity residual ``r``:
+
+        v(alpha) = v_base + r(alpha)
+        x(alpha) = x_i + alpha*dt*v_base + dt*q(alpha)
+
+    ``polynomial`` (paper Eq. 16/22, reference ``taylor_path``):
+        B_m(t) = t(1-t)(2t-1)^(m-1),  q = sum_m a_m B_m,  r = sum_m a_m B_m'.
+        ``sqrt_n`` scaling divides the coefficients by sqrt(P) (reference
+        ``residual_scale_mode`` default).
+
+    ``piecewise`` (paper Table 15 Qwen-Image row, reference ``centered_dx``):
+        coefficients are residual *node values* on P uniform nodes, projected
+        to zero trapezoidal mean; ``r`` is piecewise linear and ``q`` its exact
+        piecewise-quadratic integral. No extra rescaling (matches reference).
+    """
+
+    def __init__(self, kind: str, p: int, scaling: str):
+        if kind not in ("polynomial", "piecewise"):
+            raise ValueError(f"Unknown --smd_basis={kind!r}; expected 'polynomial' or 'piecewise'.")
+        if kind == "piecewise" and p < 2:
+            raise ValueError(f"--smd_basis piecewise needs --smd_p >= 2, got {p}.")
+        self.kind = kind
+        self.p = int(p)
+        # sqrt_n only applies to the analytic families in the reference.
+        self.scale = (self.p ** -0.5) if (kind == "polynomial" and scaling == "sqrt_n") else 1.0
+        if kind == "piecewise":
+            h = 1.0 / (self.p - 1)
+            w = torch.full((self.p,), h, dtype=torch.float32)
+            w[0] = h / 2.0
+            w[-1] = h / 2.0
+            self._weights = w
+            self._nodes = torch.linspace(0.0, 1.0, self.p, dtype=torch.float32)
+
+    def build(self, flow: torch.Tensor) -> torch.Tensor:
+        """Turn the Pivot's ``[B, P, C, H, W]`` output into basis coefficients."""
+        if self.kind == "polynomial":
+            return flow.float() * self.scale
+        if flow.shape[1] != self.p:
+            raise ValueError(f"Pivot produced {flow.shape[1]} slots, expected P={self.p}.")
+        raw = flow.float()
+        w = self._weights.to(device=raw.device).reshape(1, -1, *([1] * (raw.ndim - 2)))
+        return raw - (w * raw).sum(dim=1, keepdim=True)
+
+    def evaluate(self, coeffs: torch.Tensor, alpha: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(q_unit_dt, r)`` at per-sample ``alpha`` [B]."""
+        if self.kind == "polynomial":
+            return self._eval_polynomial(coeffs, alpha)
+        return self._eval_piecewise(coeffs, alpha)
+
+    def _eval_polynomial(self, coeffs: torch.Tensor, alpha: torch.Tensor):
+        B, P = coeffs.shape[:2]
+        a = alpha.to(coeffs.dtype).view(B, 1, 1, 1)
+        two_a_m1 = 2.0 * a - 1.0
+        factor = a * (1.0 - a)
+        q = torch.zeros_like(coeffs[:, 0])
+        r = torch.zeros_like(coeffs[:, 0])
+        for m in range(1, P + 1):
+            c = coeffs[:, m - 1]
+            pw = two_a_m1 ** (m - 1)
+            q = q + c * (factor * pw)
+            b = (1.0 - 2.0 * a) * pw
+            if m >= 2:
+                b = b + 2.0 * (m - 1) * factor * two_a_m1 ** (m - 2)
+            r = r + c * b
+        return q, r
+
+    @staticmethod
+    def _gather(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return v[torch.arange(v.shape[0], device=v.device), idx]
+
+    def _interval(self, coeffs: torch.Tensor, alpha: torch.Tensor):
+        B, P = coeffs.shape[:2]
+        pos = alpha.to(torch.float32).clamp(0.0, 1.0) * (P - 1)
+        idx = pos.floor().to(torch.long).clamp(0, P - 2)
+        frac = (pos - idx).to(coeffs.dtype).view(B, 1, 1, 1)
+        return idx, frac
+
+    def _eval_piecewise(self, coeffs: torch.Tensor, alpha: torch.Tensor):
+        B, P = coeffs.shape[:2]
+        idx, frac = self._interval(coeffs, alpha)
+        r_lo = self._gather(coeffs, idx)
+        r_hi = self._gather(coeffs, idx + 1)
+        r = r_lo + frac * (r_hi - r_lo)
+
+        h = coeffs.new_tensor(1.0 / (P - 1))
+        areas = 0.5 * h * (coeffs[:, :-1] + coeffs[:, 1:])          # [B, P-1, ...]
+        prefix = torch.cat([torch.zeros_like(areas[:, :1]), areas.cumsum(dim=1)], dim=1)  # [B, P, ...]
+        q = self._gather(prefix, idx) + h * (frac * r_lo + 0.5 * frac.square() * (r_hi - r_lo))
+        # Exact zero at both transition endpoints (reference does the same).
+        endpoint = (alpha <= 0.0) | (alpha >= 1.0)
+        if endpoint.any():
+            q = torch.where(endpoint.view(B, 1, 1, 1), torch.zeros_like(q), q)
+        return q, r
+
+    def windowed_r(self, coeffs: torch.Tensor, alpha0: torch.Tensor, alpha1: torch.Tensor) -> torch.Tensor:
+        """Average ``r`` over ``[alpha0, alpha1]`` (reference ``windowed_velocity``)."""
+        width = (alpha1 - alpha0).clamp(min=0.0)
+        small = width < 1e-6
+        width_safe = width.clamp(min=1e-6).to(coeffs.dtype).view(-1, 1, 1, 1)
+        if self.kind == "polynomial":
+            q1, _ = self._eval_polynomial(coeffs, alpha1)
+            q0, _ = self._eval_polynomial(coeffs, alpha0)
+        else:
+            q1, _ = self._eval_piecewise(coeffs, alpha1)
+            q0, _ = self._eval_piecewise(coeffs, alpha0)
+        avg = (q1 - q0) / width_safe
+        if small.any():
+            _, r0 = self.evaluate(coeffs, alpha0)
+            avg = torch.where(small.view(-1, 1, 1, 1), r0, avg)
+        return avg
+
+
+def sample_query_alphas(mode: str, iteration: int, segment_index: int, batch: int, count: int, device) -> torch.Tensor:
+    """Reference SMD query-alpha sampling, sorted per sample (order is irrelevant to the loss)."""
+    if mode == "random":
+        return torch.rand(batch, count, device=device, dtype=torch.float32).sort(dim=1).values
+    if mode != "random_endpoint":
+        raise ValueError(f"Unknown --smd_query_alpha_mode={mode!r}.")
+    if count != 1:
+        raise ValueError("--smd_query_alpha_mode random_endpoint requires --smd_queries 1.")
+    bucket = (int(iteration) * 2246822519 + int(segment_index) * 3266489917) % 1000
+    endpoint = 1.0 if bucket >= 500 else 0.0
+    return torch.full((batch, 1), endpoint, device=device, dtype=torch.float32)
+
 
 
 def per_sample_velocity_distance(lhs: torch.Tensor, rhs: torch.Tensor, beta: float, eps: float) -> torch.Tensor:
@@ -341,13 +432,40 @@ def per_sample_velocity_distance(lhs: torch.Tensor, rhs: torch.Tensor, beta: flo
     return (mse + eps).pow(beta / 2.0)
 
 
-def cfg_combine(out_cond: torch.Tensor, out_uncond: torch.Tensor, cfg_scale: float) -> torch.Tensor:
-    """Teacher CFG in velocity form (paper Eq. 4). 1.0 = conditional, 0.0 = unconditional."""
+def _pack_patch_tokens(v: torch.Tensor, p: int = 2) -> torch.Tensor:
+    """[B, C, H, W] -> [B, (H/p)*(W/p), C*p*p] (Anima's spatial patch tokens)."""
+    b, c, h, w = v.shape
+    if h % p or w % p:
+        raise ValueError(f"cfg_norm_rescale needs latent H,W divisible by patch_spatial={p}, got {h}x{w}.")
+    return v.reshape(b, c, h // p, p, w // p, p).permute(0, 2, 4, 1, 3, 5).reshape(b, (h // p) * (w // p), c * p * p)
+
+
+def _unpack_patch_tokens(t: torch.Tensor, c: int, h: int, w: int, p: int = 2) -> torch.Tensor:
+    """Inverse of :func:`_pack_patch_tokens`."""
+    b = t.shape[0]
+    return t.reshape(b, h // p, w // p, c, p, p).permute(0, 3, 1, 4, 2, 5).reshape(b, c, h, w)
+
+
+def cfg_combine(out_cond: torch.Tensor, out_uncond: torch.Tensor, cfg_scale: float,
+                norm_rescale: bool = False, patch: int = 2) -> torch.Tensor:
+    """Teacher CFG in velocity form (paper Eq. 4). 1.0 = conditional, 0.0 = unconditional.
+
+    ``norm_rescale`` reproduces the reference ``cfg_norm_rescale``: the CFG
+    combination is rescaled to the conditional prediction's per-token norm
+    (``patch x patch`` tokens, matching Anima's patch layout).
+    """
     if cfg_scale == 1.0:
         return out_cond
     if cfg_scale == 0.0:
         return out_uncond
-    return out_uncond + float(cfg_scale) * (out_cond - out_uncond)
+    comb = out_uncond + float(cfg_scale) * (out_cond - out_uncond)
+    if not norm_rescale:
+        return comb
+    c, h, w = out_cond.shape[1:]
+    cond_p = _pack_patch_tokens(out_cond.float(), patch)
+    comb_p = _pack_patch_tokens(comb.float(), patch)
+    scale = cond_p.norm(dim=-1, keepdim=True) / comb_p.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return _unpack_patch_tokens(comb_p * scale, c, h, w, patch).to(comb.dtype)
 
 
 @torch.no_grad()
@@ -434,12 +552,18 @@ def zero_all(*nets):
 class SMDPivot(nn.Module):
     """Pivot proxy for the Anima DiT.
 
-    Architecture per the paper (Fig. 36): features captured from the student
-    block at ``hook_pos`` are processed by an input Linear, M Transformer
-    blocks copied from the final M student blocks (pretrained init), and a
-    ZERO-INITIALIZED output projection producing P basis coefficient vectors
-    (same shape as the student velocity). With the zero-init output the
-    network starts exactly at the no-Pivot simple baseline.
+    Architecture (paper Fig. 36 / Sec. 3.2): features captured from the
+    student block at ``hook_pos`` are processed by M Transformer blocks copied
+    from the final M student blocks, then by the student's final AdaLN
+    norm + modulation (``final_layer`` prefix) and a ZERO-INITIALIZED output
+    projection producing P residual coefficient vectors. With the zero-init
+    output the network starts exactly at the no-Pivot simple baseline, and no
+    extra randomly-initialized input projection is introduced (reference
+    ``Pivot`` = copied blocks + copied ``norm_out`` + expanded ``proj_out``).
+
+    Anima's ``FinalLayer`` bundles ``layer_norm -> AdaLN -> linear``; we copy
+    it wholesale (pretrained norm + modulation) and replace only ``linear``
+    with the expanded, zero-init Pivot head.
 
     The copied blocks receive the SAME conditioning inputs the student block
     saw at the transition start (t embedding, adaln_lora, rope, cross-attn),
@@ -468,18 +592,17 @@ class SMDPivot(nn.Module):
                 f"--smd_pivot_hook_layer={hook_layer} leaves no student blocks after it to copy into the Pivot; "
                 "use a more negative index (paper: -4)."
             )
-        # Pre-trained init: exact copies of the natural student tail.
+        # Pre-trained init: exact copies of the natural student tail + final norm/modulation.
         self.blocks = nn.ModuleList([copy.deepcopy(blk) for blk in tail])
-        model_channels = dit.model_channels
-        self.proj = nn.Linear(model_channels, model_channels, bias=False)
-        per_token_modes = (
-            self.patch_spatial * self.patch_spatial * self.patch_temporal * (basis_p * self.out_channels)
+        self.final_layer = copy.deepcopy(dit.final_layer)
+        base_out = self.final_layer.linear.out_features  # p*p*t*out_channels
+        self.final_layer.linear = nn.Linear(
+            self.final_layer.linear.in_features, base_out * basis_p, bias=False
         )
-        self.out_proj = nn.Linear(model_channels, per_token_modes, bias=False)
-        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.final_layer.linear.weight)
 
     def trainables(self) -> list:
-        """Trainable Pivot parameters (all in full mode; proj/out_proj only in LoRA mode)."""
+        """Trainable Pivot parameters (all in full mode; head only in LoRA mode)."""
         return [p for p in self.parameters() if p.requires_grad]
 
     def forward(
@@ -493,10 +616,15 @@ class SMDPivot(nn.Module):
     ) -> torch.Tensor:
         """Return coefficient tensor a_m with the shape of the student
         velocity: [B, P, C, H, W] (T == 1 for images)."""
-        h = self.proj(feat_B_T_H_W_D)
+        h = feat_B_T_H_W_D
         for blk in self.blocks:
             h = blk(h, emb_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs)
-        tokens = self.out_proj(h)  # [B, T, H', W', P * p*p*t * C]
+        # Student final AdaLN norm + modulation, then the expanded Pivot head.
+        tokens = self.final_layer(
+            h, emb_B_T_D,
+            adaln_lora_B_T_3D=block_kwargs.get("adaln_lora_B_T_3D"),
+            use_fp32=use_fp32,
+        )  # [B, T, H', W', P * p*p*t * C]
         # Token channel layout mirrors the base DiT's unpatchify order
         # "(p1 p2 t (P C))" (einops forbids nested brackets, so split the
         # channel into (p1*p2*t, P, C) first and merge the patch scales in a
@@ -714,17 +842,25 @@ def build_smd_metadata(
             "ss_smd_neg_prompt": neg_single,
             "ss_smd_neg_file": os.path.basename(neg_file) if neg_file else None,
             "ss_smd_queries": g("smd_queries"),
+            "ss_smd_query_sampling": g("smd_query_sampling"),
+            "ss_smd_query_alpha_mode": g("smd_query_alpha_mode"),
             "ss_smd_imitation_weight": g("smd_imitation_weight"),
             "ss_smd_repulsion_lambda": g("smd_repulsion_lambda"),
+            "ss_smd_repulsion_adaptive": bool(g("smd_repulsion_adaptive", False)),
             "ss_smd_ref_cfg": g("smd_ref_cfg"),
+            "ss_smd_cfg_norm_rescale": bool(g("smd_cfg_norm_rescale", False)),
+            "ss_smd_teacher_window_alpha": g("smd_teacher_window_alpha"),
             "ss_smd_w_rescale": g("smd_w_rescale"),
             "ss_smd_beta": g("smd_beta"),
             "ss_smd_eps": g("smd_eps"),
+            "ss_smd_step_granularity": g("smd_step_granularity"),
             "ss_smd_pivot": bool(use_pivot),
             "ss_smd_pivot_mode": pivot_mode,
             "ss_smd_pivot_hook_layer": g("smd_pivot_hook_layer"),
             "ss_smd_pivot_blocks": g("smd_pivot_blocks"),
             "ss_smd_p": g("smd_p"),
+            "ss_smd_basis": g("smd_basis"),
+            "ss_smd_basis_scaling": g("smd_basis_scaling"),
             "ss_smd_pivot_lora_rank": g("smd_pivot_lora_rank"),
             "ss_smd_ema": bool(use_ema),
             "ss_smd_ema_decay": ema_decay if use_ema else None,
@@ -811,6 +947,18 @@ def main(args):
     teacher_cfg = float(args.smd_cfg)
     ref_cfg = float(args.smd_ref_cfg)
     use_pivot = not bool(args.smd_no_pivot)
+    basis_p = int(args.smd_p)
+    if basis_p < 1:
+        raise ValueError(f"--smd_p must be >= 1, got {basis_p}")
+    if args.smd_basis == "piecewise" and basis_p < 2:
+        raise ValueError("--smd_basis piecewise needs --smd_p >= 2.")
+    if args.smd_query_alpha_mode == "random_endpoint" and Q != 1:
+        raise ValueError("--smd_query_alpha_mode random_endpoint requires --smd_queries 1.")
+    window_alpha = float(args.smd_teacher_window_alpha)
+    if window_alpha < 0.0:
+        raise ValueError(f"--smd_teacher_window_alpha must be >= 0, got {window_alpha}")
+    if window_alpha > 1.0:
+        raise ValueError(f"--smd_teacher_window_alpha must be <= 1, got {window_alpha}")
     # Teacher branches actually needed per query state.
     need_cond = any(abs(sc) > 1e-9 for sc in (teacher_cfg, ref_cfg))
     need_uncond = any(abs(sc - 1.0) > 1e-9 for sc in (teacher_cfg, ref_cfg))
@@ -881,7 +1029,7 @@ def main(args):
         pivot = SMDPivot(
             dit,
             hook_layer=int(args.smd_pivot_hook_layer),
-            basis_p=int(args.smd_p),
+            basis_p=basis_p,
             attn_mode=dit.attn_mode,
             split_attn=bool(dit.split_attn),
         )
@@ -894,21 +1042,24 @@ def main(args):
             )
         logger.info(
             f"Pivot: hook student block {int(args.smd_pivot_hook_layer)} ({pivot.hook_pos}), "
-            f"M={M} copied blocks, P={args.smd_p} polynomial basis, zero-init output projection."
+            f"M={M} copied blocks + copied final norm/modulation, P={basis_p} {args.smd_basis} basis, "
+            f"zero-init output projection."
         )
         if args.smd_pivot_lora_rank:
             rank_p = int(args.smd_pivot_lora_rank)
-            logger.info(f"Pivot blocks train via LoRA rank={rank_p} (bases frozen); proj/out_proj full-rank.")
+            logger.info(
+                f"Pivot blocks train via LoRA rank={rank_p} (bases frozen); "
+                "final norm/modulation + output projection stay full-rank."
+            )
             pivot_lora_net = _lora_anima_mod.create_network(
                 1.0, rank_p, float(rank_p), None, None, pivot, neuron_dropout=args.network_dropout,
                 verbose="false",
             )
             pivot_lora_net.apply_to([], pivot, apply_text_encoder=False, apply_unet=True)
-            # Freeze the copied block bases; proj + out_proj (+ LoRA) train.
+            # Freeze the copied block bases; the copied final norm/modulation and
+            # the expanded output head stay full-rank (reference lora Pivot).
             pivot.requires_grad_(False)
-            for p in pivot.proj.parameters():
-                p.requires_grad_(True)
-            for p in pivot.out_proj.parameters():
+            for p in pivot.final_layer.parameters():
                 p.requires_grad_(True)
             pivot_mode = "lora"
             pivot_params = list(pivot_lora_net.parameters()) + pivot.trainables()
@@ -1076,8 +1227,16 @@ def main(args):
         f"Distilling at {img_w}x{img_h} (latent {lat_w}x{lat_h}x{latent_ch}), K={K} steps, Q={Q} queries/transition."
     )
     ts = make_smd_schedule(K, args.smd_shift, args.smd_final_step_size_scale, device)  # [K+1], 1 -> 0
+    ts_raw = make_smd_raw_knots(K, args.smd_final_step_size_scale).to(device)  # raw t before the shift
+    basis = SMDBasis(args.smd_basis, basis_p, args.smd_basis_scaling)
     logger.info(f"Student schedule (shift={args.smd_shift}, final_step_size_scale={args.smd_final_step_size_scale}): "
                 f"{[round(float(v), 4) for v in ts.cpu().tolist()]}")
+    logger.info(
+        f"Query sampling: {args.smd_query_sampling}, alpha mode={args.smd_query_alpha_mode}, "
+        f"teacher_window_alpha={window_alpha:g}, cfg_norm_rescale={bool(args.smd_cfg_norm_rescale)}, "
+        f"adaptive_repulsion={bool(args.smd_repulsion_adaptive)}; "
+        f"step granularity={args.smd_step_granularity}."
+    )
     normalization = 0.5 * w_rescale / K  # SMD LossWeights normalization
     logger.info(
         f"Loss: imitation(w={w_imitation:g}, beta={beta:g}) - lambda*repulsion(lambda={lam:g}, ref CFG={ref_cfg:g}) "
@@ -1289,6 +1448,140 @@ def main(args):
         )
     else:
         logger.info("gradient accumulation disabled (gradient_accumulation_steps=1).")
+    def run_transition(x, cond, uncond, seg_idx: int, iteration: int):
+        """One training transition ``t_i -> t_{i+1}`` on the given rollout state.
+
+        Returns ``(seg_loss, imitation, repulsion, x_next)``. The loss is
+        backpropagated here (scaled by ``1/accum_steps``) so the autograd graph
+        spans a single transition (reference ``per_segment_backward=True``).
+        """
+        t_start = float(ts[seg_idx].item())
+        dt = float(ts[seg_idx + 1].item()) - t_start  # < 0
+        if dt >= 0:
+            raise RuntimeError(f"Non-decreasing schedule segment at {seg_idx}: dt={dt}")
+        raw_start = float(ts_raw[seg_idx].item())
+        raw_end = float(ts_raw[seg_idx + 1].item())
+        x = x.detach()
+        t_vec = torch.full((B,), t_start, dtype=torch.float32, device=device)
+        alphas = sample_query_alphas(args.smd_query_alpha_mode, iteration, seg_idx, B, Q, device)
+
+        # (a) one student prediction WITH grad at the transition start.
+        # With Pivot, the same forward captures the K-th-block-from-end
+        # features + conditioning args needed by the Pivot branch.
+        set_role(student_net, "student")
+        hook_block = dit.blocks[pivot.hook_pos] if use_pivot else None
+        if use_ckpt:
+            dit.train()  # AnimaBlock gates checkpointing on self.training
+        if use_pivot:
+            with capture_dit_block_features(hook_block) as cap:
+                with torch.autocast(**autocast_kw):
+                    v_theta = dit_predict_v(dit, x, t_vec, cond, weight_dtype, ckpt_input_grad=use_ckpt).float()
+        else:
+            with torch.autocast(**autocast_kw):
+                v_theta = dit_predict_v(dit, x, t_vec, cond, weight_dtype, ckpt_input_grad=use_ckpt).float()
+        if use_ckpt:
+            dit.eval()  # back to deterministic eval for the no-grad scores
+
+        # (b) Pivot coefficients from the captured features
+        # (gradients reach BOTH the Pivot and the student via the features).
+        if use_pivot:
+            use_fp32 = cap["args"][4]
+            bkw = cap["kwargs"]
+            with torch.autocast(**autocast_kw):
+                coeffs = basis.build(pivot(
+                    cap["feat"].to(x.dtype), cap["args"][1], cap["args"][2], attn_params, use_fp32, bkw
+                ))  # [B, P, C, H, W]
+        else:
+            coeffs = None
+
+        # (c) proxy query states + velocities (both carry grad).
+        # Paper Sec. 3.2 (tau there == alpha here):
+        # v(alpha) = v_th + r(alpha);
+        # x_s = x_t + alpha*dt*v_th + dt*q(alpha) with B_m endpoints fixed.
+        v_q_list, x_q_list, s_q_list = [], [], []
+        for k in range(Q):
+            alpha_k = alphas[:, k]  # sampling variable [B]
+            if args.smd_query_sampling == "sigma":
+                basis_alpha = alpha_k
+                sigma_k = t_start + alpha_k * dt
+            else:
+                # Reference raw_t: interpolate raw t, warp it, then express the
+                # query as a fraction of the warped transition.
+                raw_k = raw_start + alpha_k * (raw_end - raw_start)
+                sigma_k = warp_t(raw_k, float(args.smd_shift))
+                basis_alpha = (sigma_k - t_start) / dt
+            if coeffs is not None:
+                q_k, r_k = basis.evaluate(coeffs, basis_alpha)  # [B, C, H, W] each
+                if window_alpha > 0.0:
+                    a1 = (basis_alpha + window_alpha).clamp(max=1.0)
+                    r_k = basis.windowed_r(coeffs, basis_alpha, a1)
+            else:
+                q_k, r_k = torch.zeros(1, device=device), torch.zeros(1, device=device)
+            v_q_k = v_theta + r_k
+            ta4 = basis_alpha.view(B, 1, 1, 1)
+            x_q_k = x.float() + ta4 * dt * v_theta + dt * q_k
+            v_q_list.append(v_q_k)
+            x_q_list.append(x_q_k)
+            s_q_list.append(sigma_k)
+        v_q_all = torch.stack(v_q_list)          # [Q, B, C, H, W] grad
+        x_all = torch.cat(x_q_list, dim=0)       # [B*Q, C, H, W] grad
+        s_all = torch.cat(s_q_list, dim=0)       # [B*Q] no grad
+
+        # (d) frozen teacher queries at the SAME states (targets; teacher
+        # outputs are detached per the paper). Separate cond/uncond branches
+        # are combined with the CFG scales. The student adapter is zeroed so
+        # the teacher is the plain base weights.
+        set_role(student_net, "teacher")
+        with torch.autocast(**autocast_kw), torch.no_grad():
+            v_real_all, v_unc_all = None, None
+            if need_cond:
+                v_real_all = dit_predict_v(dit, x_all.detach(), s_all, cond, weight_dtype).float()
+            if need_uncond:
+                v_unc_all = dit_predict_v(dit, x_all.detach(), s_all, uncond, weight_dtype).float()
+        norm_rescale = bool(args.smd_cfg_norm_rescale)
+        patch = int(dit.patch_spatial)
+        v_target_all = cfg_combine(v_real_all, v_unc_all, teacher_cfg, norm_rescale, patch).view(Q, B, *v_theta.shape[1:])
+        v_ref_all = cfg_combine(v_real_all, v_unc_all, ref_cfg, norm_rescale, patch).view(Q, B, *v_theta.shape[1:])
+
+        # (e) imitation + repulsion over the query points
+        imitation, repulsion = None, None
+        for k in range(Q):
+            if w_imitation > 0:
+                d_t = per_sample_velocity_distance(v_q_all[k], v_target_all[k], beta, eps).mean()
+                imitation = d_t if imitation is None else imitation + d_t
+            if lam > 0:
+                d_r = per_sample_velocity_distance(v_q_all[k], v_ref_all[k], beta, eps)
+                if args.smd_repulsion_adaptive:
+                    # Reference gate: clamp((d(v,ev) - d(v,vT)) / (d(vT,ev)+eps), 0, 1).
+                    d_pos = per_sample_velocity_distance(v_q_all[k], v_target_all[k], 1.0, 0.0)
+                    d_neg = per_sample_velocity_distance(v_q_all[k], v_ref_all[k], 1.0, 0.0)
+                    d_gap = per_sample_velocity_distance(v_target_all[k], v_ref_all[k], 1.0, 0.0)
+                    gate = ((d_neg - d_pos) / (d_gap + eps)).clamp(0.0, 1.0).detach()
+                    d_r = d_r * gate
+                d_r = d_r.mean()
+                repulsion = d_r if repulsion is None else repulsion + d_r
+        imitation = imitation / Q if imitation is not None else torch.zeros((), device=device)
+        repulsion = repulsion / Q if repulsion is not None else torch.zeros((), device=device)
+        seg_loss = normalization * (w_imitation * imitation - lam * repulsion)
+
+        # (f) per-transition backward.
+        (seg_loss / accum_steps).backward()
+
+        # (g) next rollout state follows the COARSE student update (no pivot,
+        # no grad) -- paper Algorithm 2 line 17 / Algorithm 1 line 13.
+        x_next = (x.float() + dt * v_theta.detach()).to(weight_dtype).detach()
+        return seg_loss, imitation, repulsion, x_next
+
+    step_granularity = args.smd_step_granularity
+    if step_granularity == "segment":
+        logger.info(
+            f"Optimizer granularity: SEGMENT (one step per transition). A full rollout spans K={K} "
+            f"optimizer steps and --max_train_steps={max_steps} counts segments."
+        )
+    else:
+        logger.info(f"Optimizer granularity: ROLLOUT (one step per K={K}-transition rollout).")
+    cycle_seg = 0
+    slot_states = None
     pbar = tqdm(range(global_step, max_steps), initial=global_step, total=max_steps, desc="SMD")
     for opt_step in pbar:
         # Accumulation window: zero once, run `accum_steps` micro-batches,
@@ -1296,122 +1589,61 @@ def main(args):
         # equals the mean over the effective (B*accum) batch.
         zero_all(student_net, *( [pivot_lora_net, pivot] if use_pivot else [] ))
         loss_sum, loss_imit_sum, loss_rep_sum = 0.0, 0.0, 0.0
-        for _micro in range(accum_steps):
-            batch_caps = random.choices(prompts, k=B)
-            if neg_prompts is not None:
-                neg_caps = random.choices(neg_prompts, k=B)
-            else:
-                neg_caps = [neg_single] * B
-
-            with torch.no_grad():
-                with torch.autocast(**autocast_kw):
-                    cond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, batch_caps, weight_dtype)
-                    # The </s>+mask patch inside encode_cond(uncond=True) is the cached-dropout
-                    # empty-anchor convention: keep it only for blank negatives so a real
-                    # negative prompt's first T5 token is not clobbered.
-                    use_blank_anchor = all(not s.strip() for s in neg_caps)
-                    uncond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, neg_caps, weight_dtype, uncond=use_blank_anchor) if need_uncond else None
-
-            x = torch.randn(B, latent_ch, lat_h, lat_w, device=device, dtype=weight_dtype)
-
-            # ---- K-transition on-policy rollout (paper Algorithm 2) ----
-            # stopgrad across transitions; per-transition backward keeps graph
-            # memory tight (SMD per_segment_backward=True).
-            for i in range(K):
-                t_start = float(ts[i].item())
-                dt = float(ts[i + 1].item()) - t_start  # < 0
-                x = x.detach()
-                if dt >= 0:
-                    raise RuntimeError(f"Non-decreasing schedule segment at {i}: dt={dt}")
-                t_vec = torch.full((B,), t_start, dtype=torch.float32, device=device)
-                alphas = torch.rand(B, Q, device=device, dtype=torch.float32).sort(dim=1).values
-
-                # (a) one student prediction WITH grad at the transition start.
-                # With Pivot, the same forward captures the K-th-block-from-end
-                # features + conditioning args needed by the Pivot branch.
-                set_role(student_net, "student")
-                hook_block = dit.blocks[pivot.hook_pos] if use_pivot else None
-                if use_ckpt:
-                    dit.train()  # AnimaBlock gates checkpointing on self.training
-                if use_pivot:
-                    with capture_dit_block_features(hook_block) as cap:
-                        with torch.autocast(**autocast_kw):
-                            v_theta = dit_predict_v(dit, x, t_vec, cond, weight_dtype, ckpt_input_grad=use_ckpt).float()
+        if step_granularity == "rollout":
+            # Paper Algorithm 2: one optimizer step per full K-transition rollout.
+            for _micro in range(accum_steps):
+                batch_caps = random.choices(prompts, k=B)
+                if neg_prompts is not None:
+                    neg_caps = random.choices(neg_prompts, k=B)
                 else:
+                    neg_caps = [neg_single] * B
+                with torch.no_grad():
                     with torch.autocast(**autocast_kw):
-                        v_theta = dit_predict_v(dit, x, t_vec, cond, weight_dtype, ckpt_input_grad=use_ckpt).float()
-                if use_ckpt:
-                    dit.eval()  # back to deterministic eval for the no-grad scores
-
-                # (b) Pivot coefficients from the captured features
-                # (gradients reach BOTH the Pivot and the student via the features).
-                if use_pivot:
-                    use_fp32 = cap["args"][4]
-                    bkw = cap["kwargs"]
-                    with torch.autocast(**autocast_kw):
-                        coeffs = pivot(
-                            cap["feat"].to(x.dtype), cap["args"][1], cap["args"][2], attn_params, use_fp32, bkw
-                        ).float()  # [B, P, C, H, W]
-
-                # (c) proxy query states + velocities (both carry grad).
-                # Paper Sec. 3.2 (tau there == alpha here):
-                # v(alpha) = v_th + r(alpha);
-                # x_s = x_t + alpha*dt*v_th + dt*q(alpha) with B_m endpoints fixed.
-                v_q_list, x_q_list, s_q_list = [], [], []
-                for k in range(Q):
-                    alpha_k = alphas[:, k]
-                    if use_pivot:
-                        q_k, r_k = poly_basis_eval(coeffs, alpha_k)  # [B, C, H, W] each
+                        cond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, batch_caps, weight_dtype)
+                        # The </s>+mask patch inside encode_cond(uncond=True) is the cached-dropout
+                        # empty-anchor convention: keep it only for blank negatives so a real
+                        # negative prompt's first T5 token is not clobbered.
+                        use_blank_anchor = all(not s.strip() for s in neg_caps)
+                        uncond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, neg_caps, weight_dtype, uncond=use_blank_anchor) if need_uncond else None
+                x = torch.randn(B, latent_ch, lat_h, lat_w, device=device, dtype=weight_dtype)
+                for i in range(K):
+                    seg_loss, imitation, repulsion, x = run_transition(x, cond, uncond, i, opt_step)
+                    loss_sum += seg_loss.item()
+                    loss_imit_sum += float(imitation.item())
+                    loss_rep_sum += float(repulsion.item())
+        else:
+            # Reference execution: one optimizer step per transition. Each
+            # accumulation slot keeps its own batch + rollout state across the
+            # K transitions, then starts a fresh rollout at cycle_seg == 0.
+            if slot_states is None:
+                slot_states = [None] * accum_steps
+            if cycle_seg == 0:
+                for _micro in range(accum_steps):
+                    batch_caps = random.choices(prompts, k=B)
+                    if neg_prompts is not None:
+                        neg_caps = random.choices(neg_prompts, k=B)
                     else:
-                        q_k, r_k = torch.zeros(1), torch.zeros(1)
-                    v_q_k = v_theta + r_k
-                    ta4 = alpha_k.view(B, 1, 1, 1)
-                    s_k = torch.full((B,), t_start, device=device) + alpha_k * dt
-                    x_q_k = x.float() + ta4 * dt * v_theta + dt * q_k
-                    v_q_list.append(v_q_k)
-                    x_q_list.append(x_q_k)
-                    s_q_list.append(s_k)
-                v_q_all = torch.stack(v_q_list)          # [Q, B, C, H, W] grad
-                x_all = torch.cat(x_q_list, dim=0)       # [B*Q, C, H, W] grad
-                s_all = torch.cat(s_q_list, dim=0)       # [B*Q] no grad
-
-                # (d) frozen teacher queries at the SAME states (targets; teacher
-                # outputs are detached per the paper). Separate cond/uncond
-                # branches are combined with the CFG scales. The student adapter
-                # is zeroed so the teacher is the plain base weights.
-                set_role(student_net, "teacher")
-                with torch.autocast(**autocast_kw), torch.no_grad():
-                    v_real_all, v_unc_all = None, None
-                    if need_cond:
-                        v_real_all = dit_predict_v(dit, x_all.detach(), s_all, cond, weight_dtype).float()
-                    if need_uncond:
-                        v_unc_all = dit_predict_v(dit, x_all.detach(), s_all, uncond, weight_dtype).float()
-                v_target_all = cfg_combine(v_real_all, v_unc_all, teacher_cfg).view(Q, B, *v_theta.shape[1:])
-                v_ref_all = cfg_combine(v_real_all, v_unc_all, ref_cfg).view(Q, B, *v_theta.shape[1:])
-
-                # (e) imitation + repulsion over the query points
-                imitation, repulsion = None, None
-                for k in range(Q):
-                    if w_imitation > 0:
-                        d_t = per_sample_velocity_distance(v_q_all[k], v_target_all[k], beta, eps).mean()
-                        imitation = d_t if imitation is None else imitation + d_t
-                    if lam > 0:
-                        d_r = per_sample_velocity_distance(v_q_all[k], v_ref_all[k], beta, eps).mean()
-                        repulsion = d_r if repulsion is None else repulsion + d_r
-                imitation = imitation / Q if imitation is not None else torch.zeros((), device=device)
-                repulsion = repulsion / Q if repulsion is not None else torch.zeros((), device=device)
-                seg_loss = normalization * (w_imitation * imitation - lam * repulsion)
-
-                # (f) per-transition backward (equivalent to the paper's full
-                # rollout loss since graphs only span one transition each).
-                (seg_loss / accum_steps).backward()
+                        neg_caps = [neg_single] * B
+                    with torch.no_grad():
+                        with torch.autocast(**autocast_kw):
+                            cond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, batch_caps, weight_dtype)
+                            use_blank_anchor = all(not s.strip() for s in neg_caps)
+                            uncond = encode_cond(tokenize_strategy, text_encoding_strategy, qwen3, neg_caps, weight_dtype, uncond=use_blank_anchor) if need_uncond else None
+                    slot_states[_micro] = {
+                        "cond": cond,
+                        "uncond": uncond,
+                        "x": torch.randn(B, latent_ch, lat_h, lat_w, device=device, dtype=weight_dtype),
+                    }
+            for _micro in range(accum_steps):
+                st = slot_states[_micro]
+                seg_loss, imitation, repulsion, st["x"] = run_transition(
+                    st["x"], st["cond"], st["uncond"], cycle_seg, opt_step
+                )
                 loss_sum += seg_loss.item()
                 loss_imit_sum += float(imitation.item())
                 loss_rep_sum += float(repulsion.item())
-
-                # (g) next rollout state follows the COARSE student update (no pivot,
-                # no grad) -- paper Algorithm 2 line 17 / Algorithm 1 line 13.
-                x = (x.float() + dt * v_theta.detach()).to(weight_dtype).detach()
+        if step_granularity == "segment":
+            cycle_seg = (cycle_seg + 1) % K
 
         # End of accumulation window: single clip + step per optimizer, then
         # step both LR schedulers once per optimizer step.
